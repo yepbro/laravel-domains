@@ -106,6 +106,9 @@ func TestDefault(t *testing.T) {
 		{"render.block_tracker_domains", c.Render.BlockTrackerDomains, true},
 		{"render.queue_high_watermark", c.Render.QueueHighWatermark, 10000},
 		{"render.late_select_timeout", c.Render.LateSelectTimeout.D(), 300 * time.Second},
+		// The per-engine URL skip-list (T-285) is empty by default: no
+		// navigation is ever skipped (production runs chromium).
+		{"render.engine_skip_patterns", len(c.Render.EngineSkipPatterns), 0},
 		{"render.fallback.enabled", c.Render.Fallback.Enabled, false},
 		{"render.fallback.worker_rate", c.Render.Fallback.WorkerRate, 100},
 		{"render.fallback.share_percent", c.Render.Fallback.SharePercent, 30.0},
@@ -270,6 +273,13 @@ render:
   requeue_deprioritized_zones:
     - "xn--p1ai"
     - "net"
+  engine_skip_patterns:
+    moli:
+      - "hh.ru"
+      - "hh.ru"
+      - "  "
+    Lightpanda:
+      - "slow.example"
   fallback:
     enabled: true
     worker_rate: 500
@@ -390,6 +400,10 @@ log:
 		{"render.block_tracker_domains", cfg.Render.BlockTrackerDomains, false},
 		{"render.queue_high_watermark", cfg.Render.QueueHighWatermark, 7000},
 		{"render.late_select_timeout", cfg.Render.LateSelectTimeout.D(), 480 * time.Second},
+		// The per-engine URL skip-list (T-285): the key is folded to lower
+		// case, empty patterns are dropped, duplicates collapse (normalize).
+		{"render.engine_skip_patterns", fmt.Sprintf("%v", cfg.Render.EngineSkipPatterns),
+			"map[lightpanda:[slow.example] moli:[hh.ru]]"},
 		{"render.fallback.enabled", cfg.Render.Fallback.Enabled, true},
 		{"render.fallback.worker_rate", cfg.Render.Fallback.WorkerRate, 500},
 		{"render.fallback.share_percent", cfg.Render.Fallback.SharePercent, 12.5},
@@ -691,6 +705,7 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_RENDER_QUEUE_HIGH_WATERMARK":         "7000",
 		"CRAWLER_RENDER_LATE_SELECT_TIMEOUT":          "420s",
 		"CRAWLER_RENDER_REQUEUE_DEPRIORITIZED_ZONES":  "xn--p1ai, org",
+		"CRAWLER_RENDER_ENGINE_SKIP_PATTERNS":         "moli=hh.ru, moli=heavy.example , lightpanda=slow.example",
 		"CRAWLER_RENDER_FALLBACK_ENABLED":             "true",
 		"CRAWLER_RENDER_FALLBACK_WORKER_RATE":         "250",
 		"CRAWLER_RENDER_FALLBACK_SHARE_PERCENT":       "17.5",
@@ -806,6 +821,9 @@ func TestEnvOverrides(t *testing.T) {
 		{"render.block_tracker_domains", cfg.Render.BlockTrackerDomains, false},
 		{"render.queue_high_watermark", cfg.Render.QueueHighWatermark, 7000},
 		{"render.late_select_timeout", cfg.Render.LateSelectTimeout.D(), 420 * time.Second},
+		// The env form accumulates a repeated engine key (setEngineSkipPatterns).
+		{"render.engine_skip_patterns", fmt.Sprintf("%v", cfg.Render.EngineSkipPatterns),
+			"map[lightpanda:[slow.example] moli:[hh.ru heavy.example]]"},
 		{"render.fallback.enabled", cfg.Render.Fallback.Enabled, true},
 		{"render.fallback.worker_rate", cfg.Render.Fallback.WorkerRate, 250},
 		{"render.fallback.share_percent", cfg.Render.Fallback.SharePercent, 17.5},
@@ -918,6 +936,7 @@ func TestEnvBadValues(t *testing.T) {
 		{map[string]string{"CRAWLER_HTTP_PER_IP_OVERRIDES": "195.208.0.0/16"}, "CRAWLER_HTTP_PER_IP_OVERRIDES"},
 		{map[string]string{"CRAWLER_HTTP_PER_IP_OVERRIDES": "195.208.0.0/16=много"}, "CRAWLER_HTTP_PER_IP_OVERRIDES"},
 		{map[string]string{"CRAWLER_DASHBOARD_PROBES": "mon"}, "CRAWLER_DASHBOARD_PROBES"},
+		{map[string]string{"CRAWLER_RENDER_ENGINE_SKIP_PATTERNS": "moli"}, "CRAWLER_RENDER_ENGINE_SKIP_PATTERNS"},
 		{map[string]string{"CRAWLER_DASHBOARD_REFRESH_INTERVAL": "5"}, "CRAWLER_DASHBOARD_REFRESH_INTERVAL"},
 	}
 	for _, tt := range tests {
@@ -1212,6 +1231,16 @@ func TestValidate(t *testing.T) {
 		{"fallback share_percent NaN", func(c *Config) { c.Render.Fallback.SharePercent = math.NaN() }, "render.fallback.share_percent"},
 		{"fallback health_gate_streak 0", func(c *Config) { c.Render.Fallback.HealthGateStreak = 0 }, "render.fallback.health_gate_streak"},
 		{"fallback health_gate_streak too large", func(c *Config) { c.Render.Fallback.HealthGateStreak = 101 }, "render.fallback.health_gate_streak"},
+		{"engine skip-list unknown key", func(c *Config) { c.Render.EngineSkipPatterns = map[string][]string{"webkit": {"hh.ru"}} }, "render.engine_skip_patterns"},
+		{"engine skip-list chromium key", func(c *Config) { c.Render.EngineSkipPatterns = map[string][]string{EngineChromium: {"hh.ru"}} }, "render.engine_skip_patterns"},
+		{"engine skip-list over-broad pattern", func(c *Config) { c.Render.EngineSkipPatterns = map[string][]string{EngineMoli: {"/"}} }, "render.engine_skip_patterns"},
+		{"engine skip-list too many patterns", func(c *Config) {
+			patterns := make([]string, 101)
+			for i := range patterns {
+				patterns[i] = fmt.Sprintf("heavy%d.example", i)
+			}
+			c.Render.EngineSkipPatterns = map[string][]string{EngineMoli: patterns}
+		}, "render.engine_skip_patterns"},
 		{"content.dir empty", func(c *Config) { c.Content.Dir = "" }, "content.dir"},
 		{"pack_size too small", func(c *Config) { c.Content.PackSize = 1 }, "content.pack_size"},
 		{"pack_size too large", func(c *Config) { c.Content.PackSize = ByteSize(16 << 30) }, "content.pack_size"},
@@ -1545,6 +1574,41 @@ func TestRequeueDeprioritizedZonesEnvEmpty(t *testing.T) {
 	cfg := mustLoad(t, "", env)
 	if z := cfg.Render.RequeueDeprioritizedZones; strings.Join(z, ",") != "xn--p1ai,net" {
 		t.Errorf("env after parsing: want [xn--p1ai net] without empty elements, got %v", z)
+	}
+}
+
+// The per-engine URL skip-list (T-285) normalization: the keys fold to the
+// canonical engine names, empty patterns (a trailing comma of the env form,
+// a blank YAML element) are dropped — an empty substring would match EVERY
+// URL — and duplicates collapse (the CORS allowlist style); a key collision
+// after folding resolves deterministically (the zone weights style). The
+// moli list stays valid without render.engine=moli: the lists of other
+// engines are simply inactive (the worker resolves its own engine's slice).
+func TestEngineSkipPatternsNormalize(t *testing.T) {
+	cfg := mustLoad(t, "render:\n  engine_skip_patterns:\n    \" Moli \":\n      - \" hh.ru \"\n      - \"hh.ru\"\n      - \"\"\n    lightpanda:\n      - slow.example\n", validDSN())
+	got := fmt.Sprintf("%v", cfg.Render.EngineSkipPatterns)
+	if want := "map[lightpanda:[slow.example] moli:[hh.ru]]"; got != want {
+		t.Errorf("render.engine_skip_patterns after normalize: want %s, got %s", want, got)
+	}
+
+	// A collision after folding ("Moli" and "moli") resolves
+	// deterministically — the lexicographically greater key wins (the zone
+	// weights rule), regardless of the YAML order.
+	for _, yamlText := range []string{
+		"render:\n  engine_skip_patterns:\n    Moli:\n      - a.example\n    moli:\n      - b.example\n",
+		"render:\n  engine_skip_patterns:\n    moli:\n      - b.example\n    Moli:\n      - a.example\n",
+	} {
+		cfg := mustLoad(t, yamlText, validDSN())
+		if p := cfg.Render.EngineSkipPatterns["moli"]; fmt.Sprintf("%v", p) != "[b.example]" {
+			t.Errorf("a fold collision must be won by the greater key: got %v", p)
+		}
+	}
+
+	// The valid keys with the default engine (chromium): the lists of other
+	// engines are legal with any render.engine — the vocabulary, not the
+	// binding, is checked by validation (the binding is the wiring's).
+	if _, err := loadFrom(t, "render:\n  engine_skip_patterns:\n    moli:\n      - hh.ru\n", validDSN()); err != nil {
+		t.Errorf("a moli list with engine=chromium is valid (inactive): %v", err)
 	}
 }
 

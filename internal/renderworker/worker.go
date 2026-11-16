@@ -100,8 +100,9 @@
 // infrastructure errors".
 //
 // The fallback publication (T-238, spec §4.4): with
-// render.fallback.enabled on (Options.Fallback, T-233/FR-14) the tarpit T-148
-// and the task class T-172 on the last attempt are engine-branched reasons
+// render.fallback.enabled on (Options.Fallback, T-233/FR-14) the tarpit T-148,
+// the task class T-172 on the last attempt and the URL skip-list T-285 are
+// engine-branched reasons
 // (a property of the "site × engine" pair: a page stuck on a light engine
 // may open in chromium, spec §4.4 item 2) — they are not finalized but
 // published to q:render-fallback (publishFallback): the entry stays
@@ -121,7 +122,35 @@
 // .share_percent — suspended until the window boundary, T-239); a decision
 // rejection — finalization as today (the marker), no tasks lost.
 //
-// All four finalizations stamp the "render impossible" marker
+// The per-engine URL skip-list (T-285, the consequence of D-026: the moli
+// v1.1.25 retest — a single CDP navigation to https://hh.ru/
+// deterministically takes the engine to ~2 GiB RSS in 8–18 s and a memcg
+// OOM; no engine-side compensation exists before an upstream fix):
+// before the navigation worker A checks the task's final URL against the
+// patterns of the build's engine (render.engine_skip_patterns
+// [render.engine], a substring match): the lists of the other engines are
+// inactive by construction — the worker receives only its own engine's
+// slice (cmd/render-worker), and a chromium build (worker B or a rollback
+// to chromium) carries no patterns at all and never skips (the engineSkip
+// guard of the matcher — S-P1-1's spirit: chromium is the terminal rework
+// engine). A match — NO navigation at all (the engine does not see the
+// page-killer): the engineSkipError marker leads processDelivery along
+// the engine-branched finalization path of the outcome policy FSM
+// (outcomestate.go, R0) from the FIRST delivery — the match is
+// deterministic on the URL, a retry would repeat it (the cert class T-159
+// determinism argument); with the fallback on the task is published to
+// q:render-fallback (publishFallback, the reason "engine-skip" of the
+// taskFinalizeReason vocabulary) — worker B reworks the page in chromium,
+// the domain is not lost and the engine does not die; a publication
+// rejection (off / the worker B stream, FR-10 / a T-239 gate-budget
+// decision) — the regular finalization without a render (the marker +
+// q:analyze). The stage error counter does not count the skip: there was
+// no render and no failure — a routing decision (the Task/duration
+// histogram and the finalize/publish counters count it).
+//
+// All five finalizations without a render — the tarpit T-148, the cert
+// class T-159, the DNS class T-211, the task class T-172 on the last one
+// and the rejected engine-skip T-285 — stamp the "render impossible" marker
 // subdomain_results.render_failed_at (T-210, migration 000017) — except
 // the fallback paths above: there the primary worker does not set the marker at all,
 // worker B sets it after the fallback is exhausted (FR-10):
@@ -196,8 +225,8 @@
 //	| T3 | E1 (debt) | the rework pass | the queue has room, the domain is not deleted, the verdict over the stored content = SPA | E1 | a q:render publication → the bit removal (−1 of the counter) in one transaction; marked rows (E3) are not published; aliases inherit the original's verdict | httpworker/renderq.go RequeueOnce (T-066; the D3/D4 transitions of the bit FSM, T-258) |
 //	| T4 | E0/E1 | the late re-publisher | the age (checked_at) > 6 h, no render_pending bit, no unconsumed q:render/q:render-fallback messages (a stream snapshot, the pattern of content/retentionpending.go), the verdict over the content = SPA | E1 | a q:render re-publication (the crawler_render_late_republish_total metric); cures MAXLEN truncation of fallback tasks and lost publications — the row's state stops depending on the message's survival; duplicates are bounded and suppressed by the consumer's idempotency (spec 3.4) | httpworker/renderlate.go LateOnce (T-259, FR-5.3) |
 //	| T5 | E1 | worker A: a successful render | the content_hash guard (the row of that very episode whose message it is; a T-058 rewrite has already changed it — 0 rows, the Put reference is removed, XACK) | E2 | the content is replaced by the DOM (Put +1 / SwapRefTx −1 of the old one), render_failed_at = NULL, rules_version = NULL, the rendered:/reanalyze: buckets (T-203/T-204), a q:analyze publication, XACK | renderUpdateSQL (this file) |
-//	| T6 | E1 | worker A: a finalization without a render — an engine-independent reason (the tarpit budget T-148, cert T-159, DNS T-211, the task class T-172 on the last one) OR the fallback is off/another stream/the chromium engine/a T-239 gate-budget rejection | rendered = false, the content_hash guard (coalesce — the first one stamps) | E3 | the render_failed_at marker, a q:analyze publication, XACK; q:dead — only for infrastructure errors | renderFailMarkerSQL, finalizeNoRender |
-//	| T7 | E1 | worker A: an engine-branched reason, the fallback is on, the fallbackPublishDecision is positive | the consumption stream is q:render (fallback recursion is forbidden, FR-10), a candidate engine, no row/rendered — do not publish | E1f | a q:render-fallback publication (no marker, no q:analyze), XACK; a delivery duplicate — the dedup filter by the row key + the episode's checked_at | publishFallback (T-238) |
+//	| T6 | E1 | worker A: a finalization without a render — an engine-independent reason (the tarpit budget T-148, cert T-159, DNS T-211, the task class T-172 on the last one) OR an engine-branched reason with the fallback rejected (off/another stream/the chromium engine/a T-239 gate-budget rejection; the engine skip-list T-285) | rendered = false, the content_hash guard (coalesce — the first one stamps) | E3 | the render_failed_at marker, a q:analyze publication, XACK; q:dead — only for infrastructure errors | renderFailMarkerSQL, finalizeNoRender |
+//	| T7 | E1 | worker A: an engine-branched reason (the tarpit T-148, the task class T-172 on the last attempt, the engine skip-list T-285 — before the navigation), the fallback is on, the fallbackPublishDecision is positive | the consumption stream is q:render (fallback recursion is forbidden, FR-10), a candidate engine, no row/rendered — do not publish | E1f | a q:render-fallback publication (no marker, no q:analyze), XACK; a delivery duplicate — the dedup filter by the row key + the episode's checked_at | publishFallback (T-238) |
 //	| T8 | E1f | worker B: a successful render | as T5 | E2 | as T5 | renderUpdateSQL (the B build, the q:render-fallback stream) |
 //	| T9 | E1f | worker B: the fallback is exhausted | rendered = false, the content_hash guard | E3 | as T6 | finalizeNoRender (the B build, FR-10) |
 //	| T10 | any | the episode is rewritten by a recheck | a new episode of the domain (T-030 → the HTTP stage T-058) | E0 | DELETE + INSERT of rows: rendered = false, the marker NULL (does not take part in the INSERT), a fresh checked_at; live messages of the old episode are extinguished by the T5/T6 guards/the T7 dedup filter | httpworker/record.go |
@@ -249,6 +278,7 @@ import (
 	"os"
 	"runtime/debug"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -312,11 +342,13 @@ var (
 
 	// renderFailMarkerSQL — the "render impossible" marker (T-210):
 	// the finalizations without a render (the tarpit T-148 / the cert class T-159 / the task
-	// class T-172 / the DNS class T-211) stamp the row's render_failed_at —
+	// class T-172 / the DNS class T-211 / the rejected engine skip-list
+	// T-285) stamp the row's render_failed_at —
 	// the rework pass selection (httpworker/renderq.go,
 	// renderPendingRowsSQL) excludes marked rows UNTIL THE
 	// CONTENT CHANGES: the cert class, the DNS class and the task class are permanent
-	// host properties (the T-172/T-207 measurements), the tarpit's render.timeout_attempts budget is exhausted —
+	// host properties (the T-172/T-207 measurements), the tarpit's render.timeout_attempts budget is exhausted,
+	// the skip-list's "URL × engine" pair is deterministic (T-285) —
 	// the pass's repeated publications burn deliveries and slot-time (the
 	// T-207 measurement: a tail of ~180–220 thousand broken rows; the marker stops
 	// exactly the REPEATED publications of the pass — a repeated pass over a domain
@@ -588,8 +620,9 @@ type Options struct {
 	RecoverInterval time.Duration
 	// Fallback — the fallback publication from the finalization paths without a render
 	// (T-238, spec §4.4, FR-8/FR-14): turning it on (render.fallback.enabled,
-	// T-233) switches the tarpit T-148 and the task class T-172 (the last
-	// attempt) from setting render_failed_at to publishing the task to
+	// T-233) switches the tarpit T-148, the task class T-172 (the last
+	// attempt) and the engine skip-list T-285 (a URL page-killer of the
+	// build's engine) from setting render_failed_at to publishing the task to
 	// q:render-fallback. The zero value (the default) — no fallback,
 	// the finalization behavior stays as before.
 	Fallback FallbackOptions
@@ -605,6 +638,18 @@ type Options struct {
 	// config.Validate and render.Options.validate. "" — chromium (like
 	// render.Options.Engine, builds without configuration).
 	Engine string
+	// EngineSkipPatterns — the URL patterns of the build's engine
+	// skip-list (render.engine_skip_patterns[render.engine], T-285):
+	// before the navigation the worker checks the task's final URL
+	// against them (engineSkipMatch — a substring test); a match — no
+	// navigation at all: the engineSkipError marker routes the delivery
+	// along the engine-branched finalization path (a fallback publication
+	// T-238 / a finalization without a render). The list is resolved per
+	// build by the wiring (cmd/render-worker) — the worker sees only its
+	// own engine's patterns, a chromium build (worker B, a rollback) sees
+	// none and never skips; an empty list (the default) — the check is
+	// off, the zero behavior change.
+	EngineSkipPatterns []string
 	// Log — the logger; nil — records suppressed (slog.DiscardHandler).
 	Log *slog.Logger
 	// Metrics — the service's Prometheus registry (T-077, spec 5.9): New
@@ -889,6 +934,58 @@ type dnsError struct {
 func (e *dnsError) Error() string { return e.err.Error() }
 func (e *dnsError) Unwrap() error { return e.err }
 
+// engineSkipReason — the reason label of the engine skip-list finalizations
+// and fallback publications (T-285): a member of the taskFinalizeReason
+// vocabulary alongside the net::ERR_* codes, "timeout" and "other" — the
+// engine never saw the page (no navigation), the class is the "URL ×
+// engine" pair, not a render error code.
+const engineSkipReason = "engine-skip"
+
+// engineSkipMatch — the pure decision of the per-engine URL skip-list
+// (T-285): the patterns of the BUILD's engine (Options.EngineSkipPatterns
+// — render.engine_skip_patterns[render.engine], resolved by the wiring)
+// are matched against the task's final URL by a SUBSTRING test —
+// deterministic, path-capable (a pattern may pin a host "hh.ru" or a path
+// "/heavy/report") and explainable to the operator; a false positive
+// (a superstring host) costs only a chromium rework by worker B, not a
+// correctness change. The engine guard: a chromium build never skips
+// (S-P1-1's spirit) — worker B is chromium and a rollback build is
+// chromium; a skip on the terminal engine would finalize pages that
+// nothing reworks. An empty pattern list — no match (the check is free).
+func engineSkipMatch(patterns []string, engine, url string) (pattern string, ok bool) {
+	if len(patterns) == 0 || engine == config.EngineChromium {
+		return "", false
+	}
+	for _, p := range patterns {
+		if strings.Contains(url, p) {
+			return p, true
+		}
+	}
+	return "", false
+}
+
+// engineSkipError — the URL skip-list marker (T-285, from D-026: one CDP
+// navigation to https://hh.ru/ takes moli v1.1.25 to ~2 GiB RSS in 8–18 s
+// and a memcg OOM — a deterministic page-killer of the "URL × engine"
+// pair, no engine-side compensation before an upstream fix). Set by
+// ProcessResult BEFORE the navigation: the engine must not see the page
+// at all. Unlike certError/dnsError/tarpitError the wrapper carries no
+// underlying render error — there was no render; it serves only as the
+// label by which processDelivery routes the delivery along the
+// engine-branched finalization path (outcomestate.go, R0): a fallback
+// publication (T-238, the reason "engine-skip") or a finalization without
+// a render — from the very first delivery (the match is deterministic on
+// the URL, a retry would repeat it).
+type engineSkipError struct {
+	url     string
+	pattern string
+}
+
+func (e *engineSkipError) Error() string {
+	return fmt.Sprintf("the final URL %q matched the engine skip-list pattern %q (render.engine_skip_patterns)",
+		e.url, e.pattern)
+}
+
 // isTaskRenderError — the task class render error sign (T-172):
 // there is a *render.Error in the chain (a failure of the render itself, not of the DB/storage/
 // publication — those carry no *render.Error, but render.ClassOf silently treats
@@ -911,6 +1008,8 @@ func isTaskRenderError(err error) bool {
 // attempt (T-172, the crawler_render_task_finalized_total metric): the
 // net::ERR_* load error code (structurally, render.LoadErrorCode — a closed
 // Chromium vocabulary, the label's cardinality is bounded by the list itself),
+// "engine-skip" for the URL skip-list (T-285 — the engine never saw the
+// page: the class is the "URL × engine" pair, not a render error code),
 // "timeout" for a timeout not caught by the tarpit limit (the regular
 // case since T-261 — a mixed series: fewer tarpits than TimeoutAttempts, the
 // delivery number grew to max_attempts on infra failures; the config guard
@@ -918,6 +1017,10 @@ func isTaskRenderError(err error) bool {
 // on the last delivery), "other" — the rest (a page failure without a
 // load code).
 func taskFinalizeReason(err error) string {
+	var se *engineSkipError
+	if errors.As(err, &se) {
+		return engineSkipReason
+	}
 	if code := render.LoadErrorCode(err); code != "" {
 		return code
 	}
@@ -931,8 +1034,9 @@ func taskFinalizeReason(err error) string {
 
 // fallbackCandidate — a fallback candidate (FR-7, spec §4.4 items 1–2): a task
 // of the finalization path without a render by an engine-branched reason — a tarpit
-// T-148 (the render.timeout_attempts exhaustion) or the task class T-172 on
-// the last attempt (redis.max_attempts): a property of the "site ×
+// T-148 (the render.timeout_attempts exhaustion), the task class T-172 on
+// the last attempt (redis.max_attempts) or the engine skip-list T-285
+// (a URL that deterministically kills the engine, before the navigation): a property of the "site ×
 // engine" pair — a page stuck on a light engine may open in
 // chromium. reason — the taskFinalizeReason vocabulary (the
 // crawler_render_fallback_published_total metric, spec §4.6 item 2); the
@@ -1313,7 +1417,14 @@ func (w *Worker) fbConsume(result string) {
 // path — false, an error. An error — a failure of any step (including the publication
 // after the committed transaction): the q:render delivery is not acknowledged
 // and will return with a re-delivery (Processing, T-025); repeated processing
-// is idempotent (the rewrite, see the package comment).
+// is idempotent (the rewrite, see the package comment). The labeled classes
+// are the exception: the marker errors of the outcome policy FSM
+// (outcomestate.go — certError T-159, dnsError T-211, tarpitError T-148,
+// engineSkipError T-285) are not failures of the steps but finalization
+// labels: processDelivery decides by them (a finalization without a render /
+// a fallback publication) and acknowledges the delivery; engineSkipError —
+// the only one born BEFORE the navigation (no render happened at all, a
+// routing decision of the skip-list, T-285).
 func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, error) {
 	target, found, err := w.selectTarget(ctx, task)
 	if err != nil {
@@ -1328,6 +1439,19 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 		return false, nil
 	}
 	name := renderLogName(task, target.finalURL)
+
+	// The per-engine URL skip-list (T-285): the check BEFORE the
+	// navigation — a matched URL is a deterministic page-killer of the
+	// build's engine (D-026: one https://hh.ru/ navigation takes moli
+	// v1.1.25 to ~2 GiB RSS in 8–18 s and a memcg OOM; no engine-side
+	// compensation exists before an upstream fix), the engine must not
+	// see the page at all. The match is an engine-branched outcome (the
+	// same page opens in chromium) — the engineSkipError marker below
+	// routes processDelivery: a fallback publication (T-238) or a
+	// finalization without a render, from the very first delivery.
+	if p, skip := engineSkipMatch(w.opt.EngineSkipPatterns, w.opt.Engine, target.finalURL); skip {
+		return false, fmt.Errorf("renderworker: %s: render: %w", name, &engineSkipError{url: target.finalURL, pattern: p})
+	}
 
 	out, err := w.renderer.Run(ctx, render.RenderTask{URL: target.finalURL})
 	if err != nil {
@@ -2080,12 +2204,15 @@ func (w *Worker) tarpitsExhausted(ctx context.Context, task queue.Result, del qu
 // A successful processing goes into the stage metrics (T-077): the task counter and
 // the duration, processed=true — the entry processed entirely (the DOM written
 // and q:analyze published, T-225); an error — into the
-// render class counter (the delivery will return with a re-delivery, spec 3.4),
+// render class counter (the delivery will return with a re-delivery, spec 3.4;
+// the labeled finalization classes — cert/dns/tarpit/engineSkip — do not get
+// here: they are acknowledged below instead, the first branch of the ladder),
 // a finalization without a render — into crawler_render_tarpit_finalized_total /
 // crawler_render_cert_finalized_total /
 // crawler_render_dns_finalized_total /
-// crawler_render_task_finalized_total{reason}, a fallback publication
-// (T-238, instead of the tarpit/task class finalization) — into
+// crawler_render_task_finalized_total{reason} (including reason=engine-skip —
+// the skip-list T-285, without a navigation), a fallback publication
+// (T-238, instead of the tarpit/task class/skip-list finalization) — into
 // crawler_render_fallback_published_total{reason} (the
 // taskFinalizeReason vocabulary; the metric does not grow on a delivery duplicate — no
 // publication happened), the fallback suspension events (T-239) — into
@@ -2123,6 +2250,37 @@ func (w *Worker) processDelivery(ctx context.Context, del queue.Delivery, attemp
 	// streak.
 	w.fbObserveOutcome(err, processed)
 	if err != nil {
+		var se *engineSkipError
+		if errors.As(err, &se) {
+			// The engine skip-list (T-285): the URL is a known page-killer
+			// of the build's engine — an engine-branched candidate by
+			// definition (the same page opens in chromium; NOT the
+			// DNS/cert engine-independent case, FR-7), and the match is
+			// deterministic on the URL — from the very first delivery (a
+			// retry would match again, the cert class T-159 determinism
+			// argument). With the fallback on the task is published to
+			// q:render-fallback (worker B reworks it in chromium, no
+			// marker — FR-10); a rejection (off/another stream/the
+			// T-239 gate-budget) — the finalization without a render, as
+			// today. The stage error counter does not grow: there was no
+			// render and no failure — a routing decision (the Task/
+			// duration and finalize/publish counters count it).
+			fb, ferr := w.publishFallback(ctx, task, se)
+			if ferr != nil {
+				return fmt.Errorf("renderworker: domain %s: %w", task.Name, ferr)
+			}
+			if fb {
+				w.met.Task(time.Since(start))
+				return nil // in the fallback: no navigation, no marker, no q:analyze (worker B)
+			}
+			if ferr := w.finalizeEngineSkip(ctx, task, se); ferr != nil {
+				return fmt.Errorf("renderworker: domain %s: %w", task.Name, ferr)
+			}
+			w.met.Task(time.Since(start))
+			w.met.TaskFinalized(taskFinalizeReason(se))
+			w.fbConsume(fbResultFinalized)
+			return nil
+		}
 		var ce *certError
 		if errors.As(err, &ce) {
 			// The cert class is finalized from the very first delivery (T-159): a
@@ -2349,6 +2507,32 @@ func (w *Worker) finalizeDNSError(ctx context.Context, task queue.Result, cause 
 		"err", cause.Error())
 }
 
+// finalizeEngineSkip — the finalization of an entry without a render by the
+// engine URL skip-list (T-285, the fixed decision): called from
+// processDelivery after publishFallback (T-238) rejected — the fallback is
+// off, another consumption stream (worker B — a recursive fallback is
+// forbidden, FR-10), rendered=true or a T-239 gate/budget decision
+// rejection: the task's final URL deterministically kills the build's
+// engine (D-026: https://hh.ru/ takes moli to ~2 GiB RSS and a memcg OOM),
+// waiting for attempts is pointless — every delivery of the episode would
+// match the same pattern again. The entry's result is the raw HTML of the
+// HTTP phase (rendered = false), the "render impossible" marker
+// render_failed_at (T-210 — until the content changes the rework pass
+// does not re-publish it), the entry goes to q:analyze — the pipeline
+// finishes it with analysis, the work is not lost (the domain is not
+// lost: it stays checked by the HTTP phase; what is lost is only the
+// moli render, deliberately). The marker lives until the row's content
+// changes: the next recheck episode (T-030) rewrites the row and
+// publishes a new q:render task — with the engine fixed upstream or the
+// pattern removed, the render will pass. The delivery is acknowledged
+// (nil to the calling processDelivery) — the entry does not reach q:dead.
+// The mechanics and idempotency — finalizeNoRender.
+func (w *Worker) finalizeEngineSkip(ctx context.Context, task queue.Result, cause *engineSkipError) error {
+	return w.finalizeNoRender(ctx, task,
+		"render skipped: the final URL is in the engine skip-list — the record finalized without render (the outcome is the raw HTML of the HTTP phase)",
+		"pattern", cause.pattern, "final_url", cause.url)
+}
+
 // finalizeTaskError — the finalization of an entry without a render by a task class
 // error on the last attempt (T-172, the fixed decision):
 // called from processDelivery after publishFallback (T-238)
@@ -2383,8 +2567,8 @@ func (w *Worker) finalizeTaskError(ctx context.Context, task queue.Result, cause
 
 // publishFallback — an attempt to send the task to q:render-fallback instead of
 // finalizing the entry without a render (T-238, spec §4.4 items 1/5, FR-7/8/10):
-// the engine-branched candidate (the tarpit T-148 or the task class T-172 on
-// the last attempt — their common sign "the render would be finalized without
+// the engine-branched candidate (the tarpit T-148, the task class T-172 on
+// the last attempt or the engine skip-list T-285 — their common sign "the render would be finalized without
 // a result", FR-7) is reworked by the chromium worker B (spec §4.5), and
 // the primary worker does NOT set the render_failed_at marker and does NOT publish
 // q:analyze — worker B does both (a success — renderUpdateSQL

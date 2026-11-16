@@ -724,6 +724,7 @@ T-163 criterion measured with the sampler: the unit's anon /
 | `queue_high_watermark` | `CRAWLER_RENDER_QUEUE_HIGH_WATERMARK` | integer | `10000` (0 — the shared `scheduler.queue_high_watermark`) |
 | `late_select_timeout` | `CRAWLER_RENDER_LATE_SELECT_TIMEOUT` | duration | `300s`, range 1m..24h, `0` — the code default (T-274) |
 | `requeue_deprioritized_zones` | `CRAWLER_RENDER_REQUEUE_DEPRIORITIZED_ZONES` | list of zone names | `[]` (replaced in full; the names in lowercase punycode, as in the zones reference table) |
+| `engine_skip_patterns` | `CRAWLER_RENDER_ENGINE_SKIP_PATTERNS` | map engine→patterns | `{}` (T-285; the keys — only `moli`\|`lightpanda`, a pattern is a substring of the task's final URL, at least 3 characters and at most 100 per engine, case-sensitive as written; the list of an engine acts only with that `render.engine`, a chromium build never skips — below and in [`render.md`](render.md)) |
 | `fallback.enabled` | `CRAWLER_RENDER_FALLBACK_ENABLED` | bool | `false` (enabling the fallback queue — below) |
 | `fallback.worker_rate` | `CRAWLER_RENDER_FALLBACK_WORKER_RATE` | integer | `100` (entries per a 1 min window; range 1..1000000) |
 | `fallback.share_percent` | `CRAWLER_RENDER_FALLBACK_SHARE_PERCENT` | number | `30` (% per window of 1000 stage deliveries; range (0..100], `0` — no cap) |
@@ -1782,7 +1783,14 @@ Everything is checked at once; the error lists problems of the form
   `late_select_timeout` 0 or 1m..24h (T-274),
   `requeue_deprioritized_zones` — zone names in lowercase punycode
   (≤ 253 octets; TLDs — com, in; IDN — xn--p1ai), no duplicates
-  after lowercasing (T-184);
+  after lowercasing (T-184),
+  `engine_skip_patterns` — the keys only `moli`/`lightpanda`
+  (chromium is the terminal rework engine — worker B does not skip),
+  at most 100 patterns per engine, each at least 3 characters
+  (an over-broad substring is rejected loudly — it would silently
+  switch the whole stage over to skipping; empty elements and
+  duplicates are dropped by normalization; the match is case-sensitive
+  as written — hosts in lower case, T-285);
 - `content.pack_size` 1 MiB..8 GiB; `max_store_bytes` 1 byte..16 MiB,
   `disk_free_percent` in (0, 95]; `retention` 0 or 1m..30d,
   `retention_interval` 1m..24h; `retention_batch` 1000..100000,

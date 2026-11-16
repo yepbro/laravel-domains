@@ -2,9 +2,9 @@
 // single source of truth for the decision of "how a q:render /
 // q:render-fallback delivery with a render error ends". The state is
 // encoded by the error class (the certError T-159 / dnsError T-211 /
-// tarpitError T-148 / isTaskRenderError T-172 / infrastructure
-// classifiers) and two budgets: the episode tarpit budget — the
-// cardinality of the application-level Redis set render:tarpit:{task_id}
+// tarpitError T-148 / engineSkipError T-285 / isTaskRenderError T-172 /
+// infrastructure classifiers) and two budgets: the episode tarpit budget —
+// the cardinality of the application-level Redis set render:tarpit:{task_id}
 // (queue.TarpitCounter) — and the overall delivery budget — the entry's
 // PEL counter (redis.max_attempts, the delivery FSM —
 // internal/queue/deliverystate.go). The formalization does not rewrite
@@ -34,6 +34,7 @@
 //
 //	| # | Error class | Finalization guards | Outcome | Side effects |
 //	|---|-------------|---------------------|---------|--------------|
+//	| R0 | engine skip-list (engineSkipError, T-285) | always — the match is deterministic on the URL (render.engine_skip_patterns[engine]), a retry would repeat it; the check runs before the navigation | fallback (an engine-branched reason) → finalization, from the first delivery | no navigation at all; crawler_render_task_finalized_total{reason="engine-skip"} / crawler_render_fallback_published_total{reason="engine-skip"}; no stage error counter (a routing decision, not a render failure) |
 //	| R1 | cert (certError, T-159) | always — a host property does not change between attempts | finalization from the first delivery | crawler_render_cert_finalized_total |
 //	| R2 | DNS (dnsError, T-211) | always — DNS recovery takes days | finalization from the first delivery | crawler_render_dns_finalized_total |
 //	| R3 | tarpit (tarpitError, T-148) | the episode tarpit budget is exhausted: the cardinality of render:tarpit:{task_id} ≥ render.timeout_attempts (tarpitsExhausted, T-261) | fallback (an engine-branched reason) → finalization | SADD render:tarpit:{task_id}; crawler_render_tarpit_finalized_total / crawler_render_fallback_published_total{timeout} |
@@ -41,8 +42,11 @@
 //	| R5 | infrastructure (DB, storage, publishing, browser, ctx cancellation) | — | retry; after the overall limit is exhausted — q:dead | crawler_stage_errors_total{class}; reader pauses (T-152) |
 //	| R6 | success (or the row slipped out from under the task) | — | renderUpdateSQL / a regular rejection without effects | crawler_render_records_total, q:analyze |
 //
-// The row order is the check order of processDelivery: cert/DNS before
-// the tarpit, the tarpit before the task class (a tarpit on the last
+// The row order is the check order of processDelivery: the skip-list
+// first (a label born before the navigation — the engine branch is
+// already known), then cert/DNS before
+// the tarpit, the tarpit before
+// the task class (a tarpit on the last
 // delivery is the territory of T-148, not T-172,
 // TestRenderWorker_TaskFinalizeTarpitPriority).
 //

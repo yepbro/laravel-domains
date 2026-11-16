@@ -164,6 +164,7 @@ func envSpecs() []envSpec {
 		{"CRAWLER_RENDER_QUEUE_HIGH_WATERMARK", setInt(func(c *Config) *int { return &c.Render.QueueHighWatermark })},
 		{"CRAWLER_RENDER_REQUEUE_DEPRIORITIZED_ZONES", setZoneNames(func(c *Config) *[]string { return &c.Render.RequeueDeprioritizedZones })},
 		{"CRAWLER_RENDER_LATE_SELECT_TIMEOUT", setDuration(func(c *Config) *Duration { return &c.Render.LateSelectTimeout })},
+		{"CRAWLER_RENDER_ENGINE_SKIP_PATTERNS", setEngineSkipPatterns(func(c *Config) *map[string][]string { return &c.Render.EngineSkipPatterns })},
 		{"CRAWLER_RENDER_FALLBACK_ENABLED", setBool(func(c *Config) *bool { return &c.Render.Fallback.Enabled })},
 		{"CRAWLER_RENDER_FALLBACK_WORKER_RATE", setInt(func(c *Config) *int { return &c.Render.Fallback.WorkerRate })},
 		{"CRAWLER_RENDER_FALLBACK_SHARE_PERCENT", setFloat(func(c *Config) *float64 { return &c.Render.Fallback.SharePercent })},
@@ -345,6 +346,38 @@ func setZoneNames(get func(*Config) *[]string) func(*Config, string) error {
 			}
 		}
 		*get(c) = parts
+		return nil
+	}
+}
+
+// setEngineSkipPatterns parses a comma-separated "engine=pattern" pair map
+// (moli=hh.ru,moli=heavy.example,lightpanda=slow.example) — the per-engine
+// URL skip-list (T-285); the value replaces the YAML map entirely (like
+// the lists). The engine key may REPEAT — the patterns accumulate (one
+// flat pair list instead of nested separators; an engine name contains
+// no "=" and no ",", so the separators are unambiguous). Empty elements
+// (a trailing comma) and empty patterns are skipped; the key vocabulary,
+// folding and the pattern count are handled by normalize/Validate (the
+// setZoneWeights pattern).
+func setEngineSkipPatterns(get func(*Config) *map[string][]string) func(*Config, string) error {
+	return func(c *Config, v string) error {
+		m := make(map[string][]string)
+		for _, part := range strings.Split(v, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			engine, pattern, ok := strings.Cut(part, "=")
+			if !ok {
+				return fmt.Errorf("expected a comma-separated engine=pattern map (moli=hh.ru,lightpanda=slow.example), got %q", part)
+			}
+			if pattern = strings.TrimSpace(pattern); pattern == "" {
+				continue
+			}
+			e := strings.ToLower(strings.TrimSpace(engine))
+			m[e] = append(m[e], pattern)
+		}
+		*get(c) = m
 		return nil
 	}
 }

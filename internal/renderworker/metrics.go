@@ -7,7 +7,10 @@
 // in PromQL), tarpit finalizations without a render (T-148), finalizations on a
 // permanent host certificate error (T-159), finalizations on a host DNS
 // refusal (T-211), finalizations of a task-class error on the last attempt
-// with a reason label (T-172), publications to the fallback queue with a
+// with a reason label (T-172), engine-skip finalizations (the per-engine
+// URL skip-list, T-285: the reason "engine-skip" of the same dictionary —
+// the URL deterministically kills the build's engine, no navigation),
+// publications to the fallback queue with a
 // reason label (T-238, spec §4.6 item 2 — the numerator of the fallback rate, FR-15),
 // fallback publication suspension events with a gate|budget reason label
 // (T-239, FR-9, spec §4.6 item 2), fallback consumption by worker B with an
@@ -149,11 +152,11 @@ func NewMetrics(reg *metrics.Registry, engine string) *Metrics {
 		}).WithLabelValues(),
 		tasksFin: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_render_task_finalized_total",
-			Help: "Records finalized without render due to an error of the render task class on the last delivery (T-172): the outcome is the raw HTML of the HTTP phase, the record goes to q:analyze, it does not reach q:dead. The reason label is the net::ERR_* code (e.g. net::ERR_CONNECTION_REFUSED), timeout or other: the composition of what used to carry records to q:dead. The engine label is the render engine of the worker build (chromium|moli|lightpanda, render.engine, T-235): aggregations without engine do not change.",
+			Help: "Records finalized without render due to an error of the render task class on the last delivery (T-172): the outcome is the raw HTML of the HTTP phase, the record goes to q:analyze, it does not reach q:dead. The reason label is the net::ERR_* code (e.g. net::ERR_CONNECTION_REFUSED), engine-skip (the URL skip-list, T-285: the URL is a deterministic page-killer of the build's engine — no navigation happened), timeout or other: the composition of what used to carry records to q:dead. The engine label is the render engine of the worker build (chromium|moli|lightpanda, render.engine, T-235): aggregations without engine do not change.",
 		}, "reason", metrics.LabelEngine),
 		fallback: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_render_fallback_published_total",
-			Help: "Tasks published to the fallback queue q:render-fallback from the finalize-without-render paths (T-238, spec 4.4): engine-branched causes (the tarpit T-148, the task class T-172 on the last delivery) are reworked by chromium worker B, the record stays without the render_failed_at marker. The reason label is the vocabulary of crawler_render_task_finalized_total (the net::ERR_* code, timeout, other); the numerator of the fallback rate (FR-15).",
+			Help: "Tasks published to the fallback queue q:render-fallback from the finalize-without-render paths (T-238, spec 4.4): engine-branched causes (the tarpit T-148, the task class T-172 on the last delivery, the engine skip-list T-285 — a URL page-killer of the build's engine, no navigation) are reworked by chromium worker B, the record stays without the render_failed_at marker. The reason label is the vocabulary of crawler_render_task_finalized_total (the net::ERR_* code, timeout, engine-skip, other); the numerator of the fallback rate (FR-15).",
 		}, "reason"),
 		suspend: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_render_fallback_suspended_total",

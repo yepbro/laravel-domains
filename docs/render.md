@@ -632,10 +632,34 @@ SELECT the row (final_url, content_hash)
   task — a host that came up will render. Observability — the metric
   `crawler_render_task_finalized_total{reason}` (the `net::ERR_*` code,
   `timeout`, `other`).
+- **The per-engine URL skip-list** (T-285, the consequence of
+  [D-026](../DECISIONS.md): the moli v1.1.25 retest — a single CDP
+  navigation to `https://hh.ru/` deterministically takes the engine to
+  ~2 GiB RSS in 8–18 s and a memcg OOM; no engine-side compensation exists
+  before an upstream fix, `restart_every_pages` is powerless — one page is
+  the kill). Before the navigation worker A checks the task's final URL
+  against the patterns of the build's engine
+  (`render.engine_skip_patterns[render.engine]`, a substring match): the
+  lists of the other engines are inactive by construction — the wiring
+  hands the worker only its own engine's slice — and a chromium build
+  (worker B or a rollback) carries no patterns and never skips. A match —
+  **no navigation at all** (the engine does not see the page-killer): the
+  engine-branched finalization path from the **first delivery** (the match
+  is deterministic on the URL — a retry would repeat it; the cert class
+  T-159 determinism argument): with the fallback on — a publication to
+  `q:render-fallback` with the reason `engine-skip` (worker B reworks the
+  page in chromium: the domain is not lost, the engine does not die); a
+  rejection (off / the worker B stream / the T-239 gate-budget) — the
+  regular finalization without a render (the marker + q:analyze). The
+  stage error counter does not count the skip: there was no render and no
+  failure — a routing decision (the `Task`/duration histogram and the
+  finalize/publish counters count it). Details — the dedicated section
+  [below](#the-per-engine-url-skip-list-t-285).
 - **The fallback publication** (T-238, the stage 35 spec §4.4,
   FR-7/8/10/14): with `render.fallback.enabled` on, engine-dependent
-  candidates — the T-148 tarpit and the T-172 task class on the last
-  delivery (a property of the "site × engine" pair: a page that hangs on a
+  candidates — the T-148 tarpit, the T-172 task class on the last
+  delivery and the T-285 engine skip-list (a property of the "site ×
+  engine" pair: a page that hangs on or kills a
   light engine may open in chromium) — are not finalized but published to
   `q:render-fallback` (`publishFallback`): the row stays without a marker
   and without q:analyze ("awaiting fallback" — the state lives in the
@@ -700,7 +724,7 @@ SELECT the row (final_url, content_hash)
   Publication observability —
   `crawler_render_fallback_published_total{reason}`
   (the `taskFinalizeReason` dictionary: the `net::ERR_*` code, `timeout`,
-  `other`). Consumption —
+  `engine-skip` (T-285), `other`). Consumption —
   `crawler_render_fallback_consumed_total{result}`
   (T-245, counted only by the worker B build: `rendered` — the rework
   succeeded, `finalized` — the fallback exhausted, the row closed by the
@@ -974,6 +998,67 @@ headless-shell, unchanged; the profile —
 (`crawler-chromium.service`): the T-208 recycle pair applies as is —
 the recycle `ExecStart` restarts exactly this shared unit, no new files
 are needed.
+
+### The per-engine URL skip-list (T-285)
+
+The skip-list is the operator's exception list of pages that
+**deterministically kill a specific engine** — introduced after D-026: one
+CDP navigation to `https://hh.ru/` takes moli v1.1.25 to ~2 GiB RSS in
+8–18 s and a memcg kill (`--http-max-response-size` does not help;
+chromium 156 holds the same page in ~0.5 GiB — the defect is
+moli-specific, upstream lexmount/moli#3047). Until an upstream fix no
+engine-side compensation exists — the only defense is not to navigate at
+all, and the page is reworked by the terminal engine.
+
+Mechanics:
+
+- **The key** — `render.engine_skip_patterns`: the map
+  `engine → patterns` (`moli: ["hh.ru"]`); the keys are only
+  `moli`|`lightpanda` (validation), the patterns — substrings of the
+  task's final URL (a host `hh.ru`, a path `/heavy/report`), empty
+  elements and duplicates are dropped by normalization, at most 100 per
+  engine, each at least 3 characters (an over-broad pattern is a loud
+  start-up error, not a silent stage degradation). The match is
+  **case-sensitive as written** (a byte-exact substring): write hosts in
+  lower case — `HH.ru` will not match `https://hh.ru/`; only a path
+  segment may legitimately carry upper case. The default is an empty
+  map — nothing changes (production runs chromium). The env form —
+  `CRAWLER_RENDER_ENGINE_SKIP_PATTERNS`
+  (`moli=hh.ru,moli=heavy.example`), a repeated engine key accumulates.
+- **The binding** — per build: the worker receives only the patterns of
+  its own `render.engine` (cmd/render-worker resolves the slice), so the
+  lists of the other engines are inactive by construction — a switch of
+  `render.engine` switches the active list with it, no second knob. A
+  chromium build finds no key (the key vocabulary has no chromium) and
+  never skips: worker B must rework the page, and a rollback build must
+  render it — the matcher's engine guard holds the same line of defense.
+- **The check** — before the navigation (`ProcessResult`, after the target
+  row read): a match returns the `engineSkipError` label, and
+  `processDelivery` routes it by the outcome policy FSM (R0,
+  `outcomestate.go`): an engine-branched candidate **from the first
+  delivery** (the match is deterministic on the URL — a retry would
+  repeat it) — with `render.fallback.enabled` on, `publishFallback`
+  publishes the task to `q:render-fallback` with the reason
+  `engine-skip` of the `taskFinalizeReason` dictionary (the FR-7
+  eligibility: the page is a property of the "site × engine" pair, NOT
+  the DNS/cert engine-independent case); the FR-9 ceilings apply as to
+  every publication — the health gate and the share budget rejection
+  finalizes the row as today (the `render_failed_at` marker + q:analyze),
+  without losses. Worker B (the `q:render-fallback` stream) does not
+  publish — a recursive fallback is forbidden (FR-10): its skip (only
+  possible in a miswired candidate-engine build) finalizes with the
+  marker.
+- **Observability** — `crawler_render_fallback_published_total
+  {reason="engine-skip"}` (the publication) and
+  `crawler_render_task_finalized_total{reason="engine-skip",engine}`
+  (the rejected publication); the stage error counter does not count the
+  skip — there was no render and no failure, a routing decision. The
+  `Task`/duration histogram counts the delivery as usual.
+
+The marker of a rejected skip lives until the row's content changes: the
+next recheck episode (T-030) rewrites the row and publishes a new
+q:render task — with the pattern removed or the engine fixed upstream,
+the render will pass.
 
 ### Zone priority of the rework pass (T-184)
 

@@ -520,6 +520,32 @@ type Render struct {
 	// changing the ceiling without a deploy; 0 — the code default. An
 	// extension to the minimal set of spec 5.10.
 	LateSelectTimeout Duration `yaml:"late_select_timeout"`
+	// EngineSkipPatterns — the per-engine URL skip-list (T-285, the
+	// consequence of D-026: the moli v1.1.25 retest — one CDP navigation
+	// to https://hh.ru/ deterministically takes the engine to ~2 GiB RSS
+	// in 8–18 s and a memcg OOM; no engine-side compensation exists
+	// before an upstream fix): the map "engine → URL patterns" (a
+	// pattern matches by a SUBSTRING of the task's final URL — a host
+	// "hh.ru" or a path "/heavy/report"). Before the navigation worker A
+	// checks the final URL against the list of the BUILD's engine
+	// (render.engine): the lists of the other engines are inactive by
+	// construction (the wiring resolves the build's own slice), a
+	// chromium build carries no patterns and never skips — chromium is
+	// the terminal rework engine (worker B). A match — no navigation at
+	// all: the engine-branched finalization path with the "engine-skip"
+	// reason (taskFinalizeReason) — with the fallback on
+	// (render.fallback.enabled) the task is published to q:render-fallback
+	// (worker B reworks it in chromium, T-238; the gate/budget ceilings
+	// T-239 apply as to every publication), a rejection — the regular
+	// finalization without a render (the render_failed_at marker +
+	// q:analyze); DNS/cert reasons are engine-independent and never get
+	// a fallback (FR-7) — the skip-list is not their case. The keys —
+	// only moli|lightpanda (the candidate engines, checked by
+	// validation); empty patterns and duplicates are dropped by
+	// normalization. The default is empty — the behavior does not change
+	// (production runs chromium); the sample (hh.ru for the moli
+	// profile) — config.example.yaml.
+	EngineSkipPatterns map[string][]string `yaml:"engine_skip_patterns"`
 	// Fallback — the render.fallback subsection: the Chromium fallback
 	// queue (the render spec §4.1 item 1, FR-6…FR-14). The fields describe
 	// the whole feature contract; the publication from the finalization
@@ -1108,6 +1134,12 @@ func Default() *Config {
 			// T-273): the selection is adaptive and fast — the rationale
 			// at the LateSelectTimeout field.
 			LateSelectTimeout: Duration(300 * time.Second),
+			// The per-engine URL skip-list (T-285) is empty: an empty map
+			// carries no patterns for any engine — no navigation is ever
+			// skipped (production runs chromium and finds no key even in
+			// a non-empty map). The hh.ru pattern for the moli canary
+			// profile — config.example.yaml (a comment sample).
+			EngineSkipPatterns: nil,
 			// The Chromium fallback queue (FR-14) is disabled: the primary
 			// worker finalizes without render as today — enabling is a
 			// separately configured flag, without deploying new entities.
@@ -1350,6 +1382,38 @@ func (c *Config) normalize() {
 	// spelling; validation compares the canonical one and the consumers
 	// read it (the render spec §4.1 item 1).
 	c.Render.Engine = strings.ToLower(strings.TrimSpace(c.Render.Engine))
+	// The per-engine URL skip-list (T-285): the keys — engine names in
+	// lower case without edge spaces (like render.engine itself — "Moli"
+	// and "moli" in one YAML are the same engine), the patterns — without
+	// edge spaces; empty patterns are dropped and duplicates collapse
+	// (the style of the CORS allowlist: an empty substring would match
+	// EVERY URL — a trailing comma of the environment form must not
+	// switch the whole stage over to skipping, and validation flags the
+	// key vocabulary anyway). The map is rebuilt in ascending key order
+	// so that a collision after folding resolves deterministically (the
+	// style of the zone weights).
+	if len(c.Render.EngineSkipPatterns) > 0 {
+		names := make([]string, 0, len(c.Render.EngineSkipPatterns))
+		for name := range c.Render.EngineSkipPatterns {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		m := make(map[string][]string, len(names))
+		for _, name := range names {
+			patterns := c.Render.EngineSkipPatterns[name]
+			seen := make(map[string]bool, len(patterns))
+			out := make([]string, 0, len(patterns))
+			for _, p := range patterns {
+				if p = strings.TrimSpace(p); p == "" || seen[p] {
+					continue
+				}
+				seen[p] = true
+				out = append(out, p)
+			}
+			m[strings.ToLower(strings.TrimSpace(name))] = out
+		}
+		c.Render.EngineSkipPatterns = m
+	}
 	c.Log.Level = strings.ToLower(strings.TrimSpace(c.Log.Level))
 	// The CORS allowlist (L-04) — the origins without edge spaces; empty
 	// entries (a trailing comma of the environment list) are dropped and
@@ -1842,6 +1906,45 @@ func (c *Config) Validate() error {
 			continue
 		}
 		seenDepr[name] = true
+	}
+	// The per-engine URL skip-list (T-285): the keys — only the candidate
+	// engines moli|lightpanda: the list of an engine is checked solely
+	// with that render.engine (the worker resolves its own engine's slice
+	// at build time — the lists of the other engines stay inactive), and
+	// chromium is not its own fallback (S-P1-1): worker B is chromium, a
+	// skip on it would finalize pages that nothing reworks. The pattern
+	// count per engine — a sanity cap (the list is checked on every
+	// delivery of the stage; it is an operator's exception list of known
+	// page-killers, not a catalog — the style of task_consume).
+	for name, patterns := range c.Render.EngineSkipPatterns {
+		switch name {
+		case EngineMoli, EngineLightpanda:
+		default:
+			problems = append(problems, fmt.Sprintf(
+				"render.engine_skip_patterns: the key %q — expected %s|%s (a per-engine list of the candidate engines; chromium is the terminal rework engine — worker B does not skip)",
+				name, EngineMoli, EngineLightpanda))
+			continue
+		}
+		if len(patterns) > 100 {
+			problems = append(problems, fmt.Sprintf(
+				"render.engine_skip_patterns[%s]: %d patterns — at most 100 (the list is checked on every delivery; an exception list of known page-killers, not a catalog)",
+				name, len(patterns)))
+		}
+		// An over-broad pattern is a loud start-up error, not a silent
+		// stage degradation: a 1–2 character substring ("/", "ru",
+		// a scheme fragment) matches every or a huge share of the task
+		// URLs — the whole stage would leave the engine (fallback
+		// publications up to the FR-9b budget, then render_failed_at
+		// markers) before anyone looks at the metrics. Shorter than 3
+		// is practically always a typo (the same footgun argument as
+		// the empty patterns dropped by normalize).
+		for _, p := range patterns {
+			if len(p) < 3 {
+				problems = append(problems, fmt.Sprintf(
+					"render.engine_skip_patterns[%s]: the pattern %q is under 3 characters — an over-broad substring would match almost every URL and switch the whole stage over to skipping",
+					name, p))
+			}
+		}
 	}
 	// The fallback subsection (the render spec §4.1 item 2): the ranges
 	// are checked even with enabled=false — enabling the fallback by

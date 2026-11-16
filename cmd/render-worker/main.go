@@ -85,6 +85,19 @@ func main() {
 	}
 }
 
+// engineSkipPatterns — the URL patterns of the build's engine from the
+// per-engine skip-list (render.engine_skip_patterns, T-285): the map key
+// must equal the build's render.engine — the lists of the other engines
+// stay inactive (their patterns are never handed to the worker), an empty
+// or unknown engine (= chromium — the worker B build and a rollback) gets
+// none: chromium is the terminal rework engine. A pure one-liner, kept
+// named for the wiring test: the per-engine binding is the feature's
+// central claim (a flat merge of all the lists would break the isolation
+// silently).
+func engineSkipPatterns(cfg *config.Config) []string {
+	return cfg.Render.EngineSkipPatterns[cfg.Render.Engine]
+}
+
 // run — the working logic of render-worker: Chromium under the generation
 // manager (T-065: external by render.remote_url or its own process T-061,
 // the restarts by pages/memory and the replacement of a dead generation;
@@ -286,7 +299,16 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		// build is one, the metric labels distinguish the engines of the
 		// canary windows.
 		Engine: cfg.Render.Engine,
-		Log:    logger,
+		// The per-engine URL skip-list (T-285): the worker receives the
+		// patterns of ITS build's engine (render.engine) — the lists of
+		// the other engines stay inactive by construction (a switch of
+		// render.engine switches the active list with it, no second
+		// knob); an empty render.engine (= chromium) finds no key (the
+		// key vocabulary is moli|lightpanda) — no patterns, worker B
+		// does not skip: chromium is the terminal rework engine, and the
+		// matcher's engine guard holds the same line of defense.
+		EngineSkipPatterns: engineSkipPatterns(cfg),
+		Log:                logger,
 		// The browser probe: a dead generation the manager replaces right
 		// in the probe (Manager.Alive, T-065 — the reconnect after losing
 		// Chromium), here — only the consumption pause while the start does

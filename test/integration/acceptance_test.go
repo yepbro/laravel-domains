@@ -15,7 +15,9 @@
 //	                     fallback queue (the render spec of stage 35 §4.4/§4.5, T-238):
 //	                     the primary engine's tarpit → q:render-fallback without
 //	                     a marker → the finishing by chromium worker B →
-//	                     q:analyze
+//	                     q:analyze; TestAccept03b_RenderEngineSkip — the same
+//	                     for the per-engine URL skip-list (T-285): a page-killer
+//	                     URL does not reach the engine at all
 //	item 4  TestAccept04 — version/score analysis + reanalyze without a refetch
 //	item 5  TestAccept05 — selections from laravel_domains/laravel_findings (e2e)
 //	item 6  TestAccept06 — zone progress updates automatically + metrics
@@ -49,6 +51,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1412,6 +1415,207 @@ func TestAccept03_RenderFallback(t *testing.T) {
 			t.Errorf("the primary build's consumed = %v, want 0 (only worker B counts)", got)
 		}
 	})
+}
+
+// TestAccept03b_RenderEngineSkip — the per-engine URL skip-list scenario
+// (T-285, the consequence of D-026): the final URL of the SPA row matches
+// a pattern of the build's engine (render.engine_skip_patterns[engine],
+// the moli build of worker A) — worker A does NOT navigate at all (the
+// renderer is never called: the page-killer does not reach the engine)
+// and publishes the task to q:render-fallback with the reason
+// "engine-skip" from the very first delivery; the row stays without the
+// render_failed_at marker and without a q:analyze publication. Chromium
+// worker B — the same binary built differently (the q:render-fallback
+// stream, FR-12) — finishes the row on a live Chromium: the page that is
+// a killer for moli opens in chromium (the domain is not lost), rendered
+// = true with a content_hash change, a q:analyze publication. The
+// gate/budget ceilings and the rejection paths are covered by the unit
+// tests (internal/renderworker/engineskip_test.go).
+func TestAccept03b_RenderEngineSkip(t *testing.T) {
+	skipUnlessIntegration(t)
+	env := newAccEnv(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+
+	// The write render pipeline (as TestAccept03): the SPA row is published
+	// to q:render by the live HTTP phase; the row's final URL is
+	// https://spa-shell.crawl.test/ — the pattern "spa-shell" matches it
+	// (a substring), the testbed's spa scenario exists (scenarios.yaml).
+	gate := queue.NewBackpressureGate(env.rdb, queue.BackpressureOptions{})
+	renderQ, err := httpworker.NewRenderQueue(env.q, gate, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := httpworker.NewRenderRecorder(env.pool, env.q, renderQ, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env.recorder = rec
+	ids := accPipeline(ctx, t, env, accZone, []string{"spa-shell"})
+
+	analyzeBefore := streamLen(t, env.rdb, queue.StreamAnalyze)
+	before := accRows(t, env.pool, ids["spa-shell"])[0]
+	rawHash := accHash(before.contentHash)
+	if before.finalURL == nil || !strings.Contains(*before.finalURL, "spa-shell") {
+		t.Fatalf("the row's final_url = %v — the fixture row of the spa-shell scenario is needed (the pattern target)", before.finalURL)
+	}
+
+	// Worker A: the moli build with the skip-list pattern of that URL; the
+	// renderer must NOT be called — accSkipRenderer counts the navigations
+	// and fails them (a call means the page-killer reached the engine).
+	regA := metrics.New("acc-render-skip-a")
+	regB := metrics.New("acc-render-skip-b")
+	optsA := renderworker.Options{
+		Stream:      queue.StreamRender,
+		Group:       "acc-render-skip",
+		Consumer:    "acc-skip-a",
+		Concurrency: 1,
+		Consume:     4,
+		Recover:     queue.NewReliab(env.rdb, env.q, queue.ReliabOptions{MaxAttempts: 3, MinIdle: 300 * time.Millisecond}),
+		Fallback:    renderworker.FallbackOptions{Enabled: true},
+		// The candidate engine of worker A's build with ITS skip-list
+		// (render.engine_skip_patterns[moli] resolved by the wiring):
+		// the moli list acts only on the moli build (T-285), a chromium
+		// build would not skip.
+		Engine:             config.EngineMoli,
+		EngineSkipPatterns: []string{"spa-shell"},
+		Metrics:            regA,
+	}
+	skipRenderer := &accSkipRenderer{}
+	wA, err := renderworker.New(env.pool, env.q, env.store, skipRenderer, optsA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctxA, cancelA := context.WithCancel(ctx)
+	runADone := make(chan struct{})
+	go func() { defer close(runADone); _ = renderworker.Run(ctxA, wA, optsA) }()
+
+	// The task went to q:render-fallback — from the FIRST delivery (the
+	// match is deterministic on the URL, no attempts are burned). The XACK
+	// of worker A's delivery is waited for as well: a PEL remainder would
+	// mean the publication had not been acknowledged (the criterion
+	// "publication + XACK").
+	accWaitFor(t, "the task published to q:render-fallback", 30*time.Second, func() bool {
+		return streamLen(t, env.rdb, queue.StreamRenderFallback) == 1
+	})
+	accWaitFor(t, "worker A acknowledged the skipped delivery (XACK)", 30*time.Second, func() bool {
+		return pendingCount(t, env.rdb, queue.StreamRender, "acc-render-skip") == 0
+	})
+	cancelA()
+	<-runADone
+
+	t.Run("worker A: no navigation, the row waits for the fallback without a marker", func(t *testing.T) {
+		if n := atomic.LoadInt32(&skipRenderer.calls); n != 0 {
+			t.Errorf("the renderer was called %d times — the skip-list match must route the delivery BEFORE the navigation (T-285)", n)
+		}
+		if got := accCounterSum(t, regA, "crawler_render_fallback_published_total", "reason", "engine-skip"); got != 1 {
+			t.Errorf("published{reason=engine-skip} = %v, want 1", got)
+		}
+		row := accRows(t, env.pool, ids["spa-shell"])[0]
+		if row.rendered {
+			t.Error("rendered must stay false — no render happened")
+		}
+		if accHash(row.contentHash) != rawHash {
+			t.Error("content_hash must not change before worker B finishes the row")
+		}
+		var failedAt *time.Time
+		if err := env.pool.QueryRow(ctx,
+			"SELECT render_failed_at FROM subdomain_results WHERE domain_id = $1", ids["spa-shell"],
+		).Scan(&failedAt); err != nil {
+			t.Fatal(err)
+		}
+		if failedAt != nil {
+			t.Error("render_failed_at must not be set — worker B sets the marker after exhausting the fallback (FR-10)")
+		}
+		if n := streamLen(t, env.rdb, queue.StreamAnalyze); n != analyzeBefore {
+			t.Errorf("q:analyze = %d, want %d (no growth — the publication belongs to worker B)", n, analyzeBefore)
+		}
+	})
+
+	// Worker B: the same binary built differently — the q:render-fallback
+	// stream, a separate group; a live Chromium finishes the row (the
+	// page-killer of moli opens in chromium).
+	browser, err := render.StartBrowser(context.Background(), render.Options{
+		RemoteURL:         accChromiumWS(),
+		Contexts:          1,
+		Timeout:           30 * time.Second,
+		RestartEveryPages: 1000,
+	})
+	if err != nil {
+		t.Fatalf("Chromium connection: %v", err)
+	}
+	t.Cleanup(browser.Close)
+	chromePool := render.NewPool(browser)
+	t.Cleanup(chromePool.Close)
+	optsB := renderworker.Options{
+		Stream:          queue.StreamRenderFallback,
+		Group:           "acc-render-skip-b",
+		Consumer:        "acc-skip-b",
+		Concurrency:     1,
+		Consume:         4,
+		Recover:         queue.NewReliab(env.rdb, env.q, queue.ReliabOptions{MaxAttempts: 3, MinIdle: 300 * time.Millisecond}),
+		RecoverInterval: 200 * time.Millisecond,
+		Fallback:        renderworker.FallbackOptions{Enabled: true}, // the recursion is forbidden by the stream (FR-10)
+		// The chromium build carries no patterns and never skips (the
+		// matcher's engine guard): worker B renders the page itself.
+		Engine:  config.EngineChromium,
+		Metrics: regB,
+	}
+	wB, err := renderworker.New(env.pool, env.q, env.store, accHTTPRenderer{inner: chromePool}, optsB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctxB, cancelB := context.WithCancel(ctx)
+	runBDone := make(chan struct{})
+	go func() { defer close(runBDone); _ = renderworker.Run(ctxB, wB, optsB) }()
+
+	accWaitFor(t, "worker B rendered the skipped row", 90*time.Second, func() bool {
+		rows := accRows(t, env.pool, ids["spa-shell"])
+		return len(rows) == 1 && rows[0].rendered
+	})
+	accWaitFor(t, "worker B acknowledged the fallback delivery (XACK)", 30*time.Second, func() bool {
+		return pendingCount(t, env.rdb, queue.StreamRenderFallback, "acc-render-skip-b") == 0
+	})
+	cancelB()
+	<-runBDone
+
+	t.Run("worker B: the page opens in chromium, the DOM stored, q:analyze published", func(t *testing.T) {
+		after := accRows(t, env.pool, ids["spa-shell"])[0]
+		if !after.rendered {
+			t.Fatal("rendered not set — the fallback finish not recorded")
+		}
+		if accHash(after.contentHash) == rawHash {
+			t.Error("content_hash unchanged — raw HTML stored instead of the DOM")
+		}
+		dom, err := env.store.Get(ctx, accHash(after.contentHash))
+		if err != nil {
+			t.Fatalf("DOM read from the store: %v", err)
+		}
+		if !strings.Contains(string(dom), "SPA-контент после рендера") {
+			t.Errorf("the DOM lacks the JS-drawn content: %.120q", dom)
+		}
+		if n := streamLen(t, env.rdb, queue.StreamAnalyze); n != analyzeBefore+1 {
+			t.Errorf("q:analyze = %d, want %d (+1 — the finish publication, Fresh)", n, analyzeBefore+1)
+		}
+		if n := streamLen(t, env.rdb, queue.StreamRenderFallback); n != 1 {
+			t.Errorf("q:render-fallback = %d, want 1 (a recursive fallback forbidden, FR-10)", n)
+		}
+		if got := accCounterSum(t, regB, "crawler_render_fallback_consumed_total", "result", "rendered"); got != 1 {
+			t.Errorf("consumed{rendered} = %v, want 1 (worker B finished the skipped row)", got)
+		}
+	})
+}
+
+// accSkipRenderer — a renderer that must NOT be called: the engine
+// skip-list match (T-285) routes the delivery BEFORE the navigation, the
+// page-killer must not reach the engine; a call is counted and failed (a
+// successful render would mask the violation — the assertion on calls is
+// the test's).
+type accSkipRenderer struct{ calls int32 }
+
+func (r *accSkipRenderer) Run(_ context.Context, task render.RenderTask) (render.RenderOutput, error) {
+	atomic.AddInt32(&r.calls, 1)
+	return render.RenderOutput{}, fmt.Errorf("unexpected navigation to %s — the skip-list must route the delivery before the render", task.URL)
 }
 
 // ---------------------------------------------------------------- item 4

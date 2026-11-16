@@ -301,6 +301,28 @@ render:
   # renders with a 0.5% find yield:
   # requeue_deprioritized_zones:
   #   - "xn--p1ai"
+  # The per-engine URL skip-list (T-285): pages that deterministically kill
+  # A SPECIFIC engine — before the navigation worker A checks the task's
+  # final URL against the patterns of the build's engine (render.engine);
+  # the lists of the other engines are inactive (the worker receives only
+  # its own engine's slice), a chromium build never skips. A match — no
+  # navigation at all: with the fallback on (render.fallback.enabled) the
+  # task goes to q:render-fallback and is reworked by chromium worker B
+  # (the reason "engine-skip"); with it off — the finalization without a
+  # render (the render_failed_at marker + q:analyze). The keys — only
+  # moli|lightpanda; a pattern is a SUBSTRING of the final URL (a host
+  # "hh.ru" or a path "/heavy/report"), case-sensitive as written — write
+  # hosts in lower case; keep it specific (at least 3 characters — an
+  # over-broad pattern is rejected by validation: it would silently skip
+  # the whole stage); empty/whitespace elements and duplicates are
+  # dropped, at most 100 patterns per engine. The default is empty —
+  # nothing is skipped (production runs chromium).
+  # The moli canary profile (D-026: one https://hh.ru/ navigation takes
+  # moli v1.1.25 to ~2 GiB RSS in 8-18 s and a memcg OOM; upstream
+  # lexmount/moli#3047 — remove the entry after the fix):
+  # engine_skip_patterns:
+  #   moli:
+  #     - "hh.ru"
   # The Chromium fallback queue: tasks that did not get a render on the
   # main engine for an engine-dependent reason (a tarpit, the task class on
   # the last attempt) are reworked by a separate chromium worker B from
