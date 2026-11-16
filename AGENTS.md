@@ -2,12 +2,6 @@
 
 Instructions for an agent working in a loop on project tasks.
 
-**Priority:** these project instructions take precedence over the global
-`~/AGENTS.md` and the `~/.agents/agent-guides/*.md` guides. Where they
-overlap, this file wins. The file contains only the project's refinements
-and deviations — general rules are not repeated here; they live in the
-global instructions and the guides.
-
 ## Project
 
 Go monorepo: a service for bulk domain checking and discovery of Laravel sites.
@@ -50,6 +44,10 @@ Project refinements:
 The main session drives the cycle; each task is executed by a separate subagent.
 The "Work cycle" section above is the subagent's inner loop.
 
+The general workflow rules (the plan before code, mandatory tests, the
+check points, the commit discipline, documentation timing) are set by the
+global `~/AGENTS.md`; below only the project specifics are given.
+
 ### Task execution order
 
 The main session keeps a sliding window of up to 4 tasks at a time (see
@@ -65,14 +63,13 @@ ones to finish.
    `zai-coding-plan/glm-5.3` (all development goes through it only)
    with full context: the task description from the card, links to the
    specs, the current repository state, and the check requirements.
-2. The subagent runs the inner loop (implementation → tests → documentation)
-   in the worktree of the `t-NNN` branch and makes **one commit per task**
-   (format `<type>: <description> (T-0NN)`). Review fixes are applied via
-   `git commit --amend` — the commit stays single.
-3. After green tests the subagent runs a code review per the scheme from
-   the "Review scheme" section below, with follow-up work in its own
-   session: agrees with a finding — fix + amend + a re-run of the tests;
-   disagrees — a reasoned justification. The review is one round (a failed
+2. The subagent runs the inner loop in the worktree of the `t-NNN`
+   branch and makes the task commit in the format
+   `<type>: <description> (T-0NN)`.
+3. The subagent runs a code review per the scheme from the "Review
+   scheme" section below, with follow-up work in its own session: agrees
+   with a finding — applies the fix into the task commit; disagrees — a
+   reasoned justification. The review is one round (a failed
    reviewer is covered by a fallback from the chain — still one round).
    If all reviewers in the chain are unavailable (limits, errors) — no
    review is performed; the fact is recorded in the report and the commit.
@@ -84,9 +81,9 @@ ones to finish.
    taken by the next task.
 5. After verification the main session merges the task branch into `master`
    linearly — rebase + `--ff-only` (see "Linear master history"),
-   sequentially; after each merge — `make test` +
-   `make test-integration` in the main tree, then it removes the
-   task worktree and branch, then moves the card to DONE and posts the
+   sequentially; the post-merge checks in the main tree are `make test` +
+   `make test-integration`, then it removes the task worktree and branch,
+   then moves the card to DONE and posts the
    completion comment (end time, merged commit — see "Work cycle").
    Pushing — only on an explicit instruction (see "Rules").
 6. The subagent returns a full report: what was done and which decisions
@@ -167,8 +164,10 @@ reviewer is `/tmp/opencode/review/NN-<slug>.md`.
 
 ### Bulk code review and fixes
 
-A full codebase audit is a separate mode on top of the task cycle
-(for example, before a release). Procedure:
+A bulk review — of the whole codebase or of its individual parts — is a
+separate mode on top of the task cycle (for example, before a release);
+it is the explicit exception to the single-commit rule (per the global
+`~/AGENTS.md`). Procedure:
 
 1. **Baseline.** `make test` + `make lint` in the main tree — a green
    reference point to tell "we broke it" from "it was already broken".
@@ -232,9 +231,9 @@ bypass is not used). Merging a task/fix branch — only linearly:
 
 - The rebase is performed in the worktree (the branch is checked out
   there); conflicts are resolved by the main session in the same worktree.
-- Merges are sequential; after each — `make test` +
-  `make test-integration` in the main tree (see "Task execution order",
-  step 5), then removal of the worktree and the branch.
+- Merges are sequential; the checks after each merge in the main tree and
+  the removal of the worktree and branch — see "Task execution order",
+  step 5.
   Pushing (`git push origin master`) — only on an explicit instruction
   (see "Rules").
 
@@ -299,7 +298,7 @@ from "Review scheme".
 
 ## Tests
 
-- Before a commit: `make test` and `make lint` — no errors.
+- The project checks are `make test` + `make lint` — no errors.
 - `make test-race` — mandatory for tasks touching packages with goroutine
   loops/workers (the `RACE_PKGS` set in the Makefile: monitor, scheduler,
   renderworker, httpworker, dnsworker, queue, render, content): `make test`
@@ -308,7 +307,8 @@ from "Review scheme".
 - `make test-integration` — if migrations, the DB, queues, services, or
   the testbed are affected.
 - A failing test — fix it; if it is outside the task scope, record the
-  cause in the commit and a task comment on the board.
+  cause in the commit and a task comment on the board — in addition to
+  the `DECISIONS.md` entry (`D-NNN`) per the global rules.
 
 ## Documentation
 
@@ -317,7 +317,7 @@ from "Review scheme".
 
 ## Commits
 
-- One task — one commit: code, tests and docs together.
+- The task commit includes code, tests and docs together.
 - Message format: `<type>: <description> (T-0NN)`. Types: `feat`, `fix`, `docs`, `test`, `refactor`, `chore`.
 - Do not mix in changes unrelated to the task. Do not commit junk (`var/`, `tmp/`, local configs).
 
@@ -348,7 +348,8 @@ from "Review scheme".
   formalization priorities —
   `tasks/TZ-fsm.md`).
 - Doubts about the spec interpretation — resolve by the spec text; briefly
-  record the accepted decision in the commit.
+  record the accepted decision in the commit — in addition to the
+  `DECISIONS.md` entry (`D-NNN`) per the global rules.
 - Do not break existing behavior; changes to contracts between services
   must be recorded too.
 
