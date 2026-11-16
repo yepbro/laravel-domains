@@ -112,6 +112,9 @@ package render
 //     hh.ru: a single CDP navigation (even raw, without interception)
 //     bursts moli to ~2 GiB in seconds, deterministically; chromium
 //     holds the same page at ~0.5 GiB (docs/operations.md 2026-11-16).
+//     The full moli history (versions, upstream PRs, the hh.ru
+//     regression, our compensations) — the settled note
+//     questions/moli-render-engine.md.
 //   - lightpanda 1.0.2: one browser context per connection ("Cannot have
 //     more than one browser context at a time", also recorded by
 //     third-party measurements). The service tab of the starting context
