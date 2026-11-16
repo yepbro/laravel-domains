@@ -68,8 +68,8 @@ ones to finish.
    `<type>: <description> (T-0NN)`.
 3. The subagent runs a code review per the scheme from the "Review
    scheme" section below, with follow-up work in its own session: agrees
-   with a finding — applies the fix into the task commit; disagrees — a
-   reasoned justification. The review is one round (a failed
+   with a finding — fixes it; disagrees — a reasoned justification.
+   The review is one round (a failed
    reviewer is covered by a fallback from the chain — still one round).
    If all reviewers in the chain are unavailable (limits, errors) — no
    review is performed; the fact is recorded in the report and the commit.
@@ -101,14 +101,20 @@ per task** — no repeat rounds; a failed primary covered
 by a fallback is still one round. The chosen reviewer runs synchronously
 in the subagent's session (the code-review guide).
 
+Review artifacts — the prompt, the reviewer stdout files, the report —
+live in the project's gitignored `tmp/review/` directory, relative to
+the tree under review (the worktree); `/tmp` is not used — the host
+cleans it nightly (the global Temporary files rule). The subagent
+creates the directory when writing the prompt.
+
 1. Primary reviewer — `opencode run` with `opencode-go/deepseek-v4.1-flash`,
    from the worktree under review:
 
    ```bash
    timeout 1200 opencode run --auto \
      -m "opencode-go/deepseek-v4.1-flash" \
-     --title "review-<slug>" "$(cat /tmp/opencode/review/prompt-<slug>.md)" \
-     > /tmp/opencode/review/<slug>-deepseek.md 2>&1; echo "exit=$?"
+     --title "review-<slug>" "$(cat tmp/review/prompt-<slug>.md)" \
+     > tmp/review/<slug>-deepseek.md 2>&1; echo "exit=$?"
    ```
 
    `--auto` — auto-approval of all permissions not explicitly denied:
@@ -126,8 +132,8 @@ in the subagent's session (the code-review guide).
    ```bash
    timeout 1200 cursor-agent -p --output-format text --mode ask \
      --model grok-4.7-high --trust \
-     "$(cat /tmp/opencode/review/prompt-<slug>.md)" </dev/null \
-     > /tmp/opencode/review/<slug>-cursor.md 2>&1; echo "exit=$?"
+     "$(cat tmp/review/prompt-<slug>.md)" </dev/null \
+     > tmp/review/<slug>-cursor.md 2>&1; echo "exit=$?"
    ```
 
    Parameters: `-p` — headless mode with the response printed to stdout
@@ -143,15 +149,15 @@ in the subagent's session (the code-review guide).
    ```bash
    timeout 1200 opencode run --auto \
      -m "zai-coding-plan/glm-5.3#max" \
-     --title "review-<slug>" "$(cat /tmp/opencode/review/prompt-<slug>.md)" \
-     > /tmp/opencode/review/<slug>-glm.md 2>&1; echo "exit=$?"
+     --title "review-<slug>" "$(cat tmp/review/prompt-<slug>.md)" \
+     > tmp/review/<slug>-glm.md 2>&1; echo "exit=$?"
    ```
 4. Third fallback — `kimi` (Kimi Code CLI, model `kimi-code/k3.1-pro`):
 
    ```bash
    timeout 1200 kimi -m kimi-code/k3.1-pro \
-     -p "$(cat /tmp/opencode/review/prompt-<slug>.md)" --output-format text </dev/null \
-     > /tmp/opencode/review/<slug>-kimi.md 2>&1; echo "exit=$?"
+     -p "$(cat tmp/review/prompt-<slug>.md)" --output-format text </dev/null \
+     > tmp/review/<slug>-kimi.md 2>&1; echo "exit=$?"
    ```
 
    Never combine `-p` with `-y`/`--auto`; `</dev/null` keeps it
@@ -160,14 +166,13 @@ in the subagent's session (the code-review guide).
 Reviewer rules — per the code-review guide (loaded via the global AGENTS.md
 table); they apply to every reviewer in the chain and must be carried
 verbatim in the review prompt. Project-specific: the report file for any
-reviewer is `/tmp/opencode/review/NN-<slug>.md`.
+reviewer is `tmp/review/NN-<slug>.md`.
 
 ### Bulk code review and fixes
 
 A bulk review — of the whole codebase or of its individual parts — is a
-separate mode on top of the task cycle (for example, before a release);
-it is the explicit exception to the single-commit rule (per the global
-`~/AGENTS.md`). Procedure:
+separate mode on top of the task cycle (for example, before a release).
+Procedure:
 
 1. **Baseline.** `make test` + `make lint` in the main tree — a green
    reference point to tell "we broke it" from "it was already broken".
@@ -185,8 +190,8 @@ it is the explicit exception to the single-commit rule (per the global
    (glm models — only via the `zai-coding-plan` provider);
    a fix group
    (domain) = one worktree `~/worktrees/laravel-domains/fix-<slug>`
-   (rules — "Branches and worktrees"). **Each change is a separate
-   commit** `fix: <description> (<finding ID>)`. Before each commit —
+   (rules — "Branches and worktrees"). The commit message format is
+   `fix: <description> (<finding ID>)`. Before each commit —
    `COMPOSE_PROJECT_NAME=crawler make test` + `make lint` in the worktree.
    An invalid finding is not fixed but is analyzed in the report with
    argumentation; P3 items at the level of new functionality are not
@@ -207,10 +212,9 @@ it is the explicit exception to the single-commit rule (per the global
   recipes — the git-worktree guide (loaded via the global AGENTS.md table);
   the project bootstrap: symlink `.env` from the main tree, `mkdir -p var tmp`.
 - In the main branch the main session makes only service commits:
-  targeted fixes of checks that failed after a merge
-  (with the task noted in the message), AGENTS.md edits
-  on direct instructions. Task status lives on the board — no status
-  commits. No merge commits are created (linear history —
+  post-merge check fixes (per the global `~/AGENTS.md`) and AGENTS.md
+  edits on direct instructions. Task status lives on the board — no
+  status commits. No merge commits are created (linear history —
   see "Linear master history").
 - Fixes following a bulk review — the `fix-<slug>` branch and the worktree
   `~/worktrees/laravel-domains/fix-<slug>` (see "Bulk code review
@@ -306,9 +310,9 @@ from "Review scheme".
   loops (a separate step in CI).
 - `make test-integration` — if migrations, the DB, queues, services, or
   the testbed are affected.
-- A failing test — fix it; if it is outside the task scope, record the
-  cause in the commit and a task comment on the board — in addition to
-  the `DECISIONS.md` entry (`D-NNN`) per the global rules.
+- A failing test outside the task scope — record the cause in the
+  commit and a task comment on the board, in addition to the
+  `DECISIONS.md` entry (`D-NNN`) per the global rules.
 
 ## Documentation
 
@@ -317,7 +321,6 @@ from "Review scheme".
 
 ## Commits
 
-- The task commit includes code, tests and docs together.
 - Message format: `<type>: <description> (T-0NN)`. Types: `feat`, `fix`, `docs`, `test`, `refactor`, `chore`.
 - Do not mix in changes unrelated to the task. Do not commit junk (`var/`, `tmp/`, local configs).
 
