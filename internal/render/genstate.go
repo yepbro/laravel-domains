@@ -50,7 +50,7 @@ import "fmt"
 //	| T2 | G1 | StartBrowser succeeds | no replacement is pending (m.p == nil and the restartPending latch of a died generation is clear — the manager's first start) | G2 | the "chromium started" log; the Restarts counter does not grow | restartLocked |
 //	| T3 | G1 | StartBrowser succeeds | a replacement is pending: the slot had a pool (m.p != nil — the same call detached it) or the latch is set from an earlier T4 (the engine container was restarting, T-283) | G2 | a synchronous retire of the old pool (if it is still in the slot); a background Close of the old generation (T7); Restarts+1 — the death → retries → recovery path is counted here too (T-283); the "chromium restarted" log with the reason of the call that detached the generation | restartLocked |
 //	| T4 | G1 | StartBrowser fails | — | G0 | the old generation, if there was one (m.p != nil), goes to background closing (T7) and the replacement latch restartPending is set — the first successful start (T3) will count the restart (T-283); the error goes to the caller (the task/probe will retry the start); since T-283 the task's Run RETRIES the start within the Options.EngineWait budget with a backoff (an engine container restart is waited out without failing the delivery — engineRetryStep, manager.go), only after its exhaustion the error goes upward | restartLocked |
-//	| T5 | G2 | a planned replacement: the page threshold (Browser.NeedsRestart) or the memory threshold (RSS > 0 and RSS ≥ MemoryThreshold) — checked before a task/probe | — | G1 | the change as in T3, the reason — "page threshold"/"memory threshold" | swapReasonLocked → restartLocked |
+//	| T5 | G2 | a planned replacement: the page threshold (Browser.NeedsRestart) or the memory threshold (Browser.OverMemory: RSS > 0 and RSS ≥ MemoryThreshold) — checked before a task/probe | — | G1 | the change as in T3, the reason — "page threshold"/"memory threshold" | swapReasonLocked → restartLocked |
 //	| T6 | G2 | browser death: a context cancellation, LostConnection (a WebSocket drop/process death) or the probe's lost (T-218/T-226) | — | G4 | task errors — the browser class (the retry — Manager.Run); the replacement — by the nearest T1 | browser.go Alive/probeConn |
 //	| T7 | G2/G4 | the generation was replaced (T3/T5/T4) | — | G3 → gone | draining in-flight tasks (each ≤ Options.Timeout, spec 3.4), then closing the browser — in the background (go Close); the slot does not wait for the new generation | pool.go retire/Close |
 //	| T8 | G3 (in the slot) | acquire/the probe sees a closed pool | the slot's browser is alive | G1 | the change as in T3, the reason "pool closed": the tasks' ErrClosed errors do not accumulate until attempts are exhausted | swapReasonLocked |
@@ -69,7 +69,8 @@ import "fmt"
 //	                                  Pool.closed)
 //	"page threshold N (rendered M)"   G2, Pages ≥ RestartEveryPages
 //	"memory threshold N MiB (RSS M MiB)"   G2, MemoryThreshold > 0 and
-//	                                  RSS ≥ MemoryThreshold (RSS ≤ 0 —
+//	                                  RSS ≥ MemoryThreshold, the decision —
+//	                                  Browser.OverMemory (RSS ≤ 0 —
 //	                                  unknown, does not trigger)
 //
 // # Invariants
@@ -172,41 +173,27 @@ func (m *Manager) swapReasonLocked() (string, bool) {
 
 // activeSwapReasonLocked — the reasons for the planned replacement of a live
 // generation (G2 "active": the change is prevention via resource thresholds, not a
-// reaction to death). The memory threshold: the RSS is read in one /proc pass — the
-// value goes both into the check and into the message (R-06); control disabled — /proc is
-// not read at all. An unknown RSS (remote mode) does not trigger.
+// reaction to death). The memory decision — Browser.OverMemory, the single
+// source of the threshold expression (05#P2-2: until T-291 an inline copy of
+// it lived here, and a change of one of the two would not have been caught
+// by the other's tests — TestBrowserOverMemory pins the boundary, the
+// manager's path now runs the same code). The RSS for the message is read
+// once more through the 10 s cache (T-229) — a guaranteed hit: OverMemory
+// returns true only with a positive, and therefore cached, measurement, so
+// /proc is still traversed at most once per window (R-06); control
+// disabled — OverMemory does not touch /proc at all.
 func (m *Manager) activeSwapReasonLocked() (string, bool) {
 	if m.b.NeedsRestart() {
 		return fmt.Sprintf("page threshold %d (rendered %d)",
 			m.b.opts.RestartEveryPages, m.b.Pages()), true
 	}
-	if m.b.opts.MemoryThreshold > 0 {
-		// Only the mutants of the left half of the condition are equivalent
-		// (T-M08; the same conclusion as for Browser.OverMemory in browser.go): at a
-		// threshold >= 1 (the guard above) `rss > 0` is indistinguishable from `>= 0`/`> -1`/`true`
-		// — rss == 0 and rss == -1 are discarded by the right half (0/-1 >=
-		// threshold is false), rss == 1 is unreachable (RSS from /proc is a
-		// multiple of the page). The line granularity of the annotation also kills the
-		// two killable mutants of the right half — the trade-off of §4
-		// docs/mutation-testing.md: cutting out `rss >= threshold` (there would
-		// remain `rss > 0` — a restart at any positive RSS) and
-		// the `>= -> >` boundary (the equality RSS == threshold through a live /proc
-		// is nondeterministic). Cutting out the right half is pinned by
-		// TestManagerMemoryRestartBoundaries (a threshold above the live RSS —
-		// no restart); the `>= -> >` boundary has no deterministic
-		// cover at all (the equality RSS == threshold through a live
-		// /proc is unreachable) — it is covered by tests only for the copy
-		// of the expression in Browser.OverMemory (TestBrowserOverMemory,
-		// the SIGSTOP-pinned RSS).
-		// mutator-disable-next-line expression/comparison, expression/remove, numbers/decrementer, numbers/incrementer
-		if rss := m.b.RSS(); rss > 0 && rss >= m.b.opts.MemoryThreshold {
-			return fmt.Sprintf("memory threshold %d MiB (RSS %d MiB)",
-				// Logging (§4 docs/mutation-testing.md): shifts and ±1
-				// of the arguments change only the text of the restart
-				// reason message, not the decision to restart.
-				// mutator-disable-next-line arithmetic/bitwise, numbers/decrementer, numbers/incrementer
-				m.b.opts.MemoryThreshold>>20, rss>>20), true
-		}
+	if m.b.OverMemory() {
+		return fmt.Sprintf("memory threshold %d MiB (RSS %d MiB)",
+			// Logging (§4 docs/mutation-testing.md): shifts and ±1
+			// of the arguments change only the text of the restart
+			// reason message, not the decision to restart.
+			// mutator-disable-next-line arithmetic/bitwise, numbers/decrementer, numbers/incrementer
+			m.b.opts.MemoryThreshold>>20, m.b.RSS()>>20), true
 	}
 	return "", false
 }

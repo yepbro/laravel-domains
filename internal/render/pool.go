@@ -2,6 +2,8 @@ package render
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -62,9 +64,13 @@ func (p *Pool) Browser() *Browser { return p.b }
 
 // Run executes the task in a free isolated context, blocking until a slot
 // frees up or ctx is cancelled. A ClassContext error (a dead context) is
-// retried once on a fresh context; page errors and an unavailable browser
-// are returned to the caller — redelivery stays with the queue level
-// (T-066), browser restart is T-065.
+// retried once on a fresh context — unless the pool was retired meanwhile
+// (a generation swap): then the error is wrapped in ErrClosed and handed
+// to the manager, which retries the task on the new generation (a retry
+// inside the retiring pool is pointless — its browser closes after the
+// drain). Page errors and an unavailable browser are returned to the
+// caller — redelivery stays with the queue level (T-066), browser
+// restart is T-065.
 func (p *Pool) Run(ctx context.Context, task RenderTask) (RenderOutput, error) {
 	// In-flight registration happens under mu and only for a live pool:
 	// serialized with retire (see the wg invariant above) — Add never
@@ -99,7 +105,13 @@ func (p *Pool) Run(ctx context.Context, task RenderTask) (RenderOutput, error) {
 		p.b.pages.Add(1)
 		return out, nil
 	}
-	if ClassOf(err) == ClassContext && !p.closed.Load() {
+	if ClassOf(err) == ClassContext {
+		if p.closed.Load() {
+			// The generation was swapped between the failure and the
+			// retry decision: retrying inside the retiring pool is
+			// pointless, the error goes to the manager (05#P2-1).
+			return out, retiredContextErr(task.URL, err)
+		}
 		// Logging mutant (T-M07): the retry Warn does not change the
 		// observable behavior — killed per §4 of docs/mutation-testing.md
 		// (logging is not tested).
@@ -110,8 +122,37 @@ func (p *Pool) Run(ctx context.Context, task RenderTask) (RenderOutput, error) {
 			p.b.pages.Add(1)
 			return out, nil
 		}
+		if ClassOf(err) == ClassContext && p.closed.Load() {
+			// The same race, one window later: the generation was
+			// retired during the pool's own retry attempt.
+			return out, retiredContextErr(task.URL, err)
+		}
 	}
 	return out, err
+}
+
+// retiredContextErr — the ClassContext error of a task whose pool was
+// retired (a generation swap by the manager, T-065) between the failure
+// and the retry decision. The class is kept — the failure itself is
+// transient (a dead tab heals on a fresh context); the ErrClosed wrap is
+// what Manager.Run's retry filter looks for: without it a raw
+// ClassContext escaped upward (the manager retries only ClassBrowser and
+// ErrClosed), and a healable error burned one of the queue's
+// redis.max_attempts deliveries (05#P2-1 — the contract "a pool closure
+// by a generation swap means a restart and a retry" now holds for a task
+// mid-flight too, not only for one that did not start). The wrap keeps
+// the cause in the chain (%w: %w — the review P3-1: %v would cut
+// errors.Is/As of the original, e.g. context.Canceled) and wraps the
+// inner error's cause, not its *Error shell — the shell's class and URL
+// are already re-stated by this wrap.
+func retiredContextErr(url string, err error) error {
+	cause := err
+	var e *Error
+	if errors.As(err, &e) && e.Err != nil {
+		cause = e.Err
+	}
+	return &Error{Class: ClassContext, URL: url,
+		Err: fmt.Errorf("%w: %w", ErrClosed, cause)}
 }
 
 // attempt — a single attempt: a fresh isolated context, the task, closing
@@ -139,7 +180,9 @@ func (p *Pool) Close() {
 // service synchronously with the restart decision, leaving task completion
 // and the browser stop to the background Close (the "task landed in the
 // pool being closed after acquire" races are covered by the retry in
-// Manager.Run).
+// Manager.Run; since T-291 a context failure raced by the retire is
+// wrapped in ErrClosed there too — the retry on the new generation,
+// 05#P2-1).
 func (p *Pool) retire() {
 	// Under mu: atomicity of CAS + close(done) against wg.Add in Run (see
 	// the wg invariant at the pool fields); Wait in Close starts after this

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -163,9 +164,16 @@ func TestExtractCookieJSONContract(t *testing.T) {
 	}
 }
 
-// TestExtractDOMExprLimited — the DOM capture expression with a length cap (R-02):
-// the limit is moved into the browser itself, a heavy page does not pull a
-// string over the limit through CDP; 0 — the expression without truncation.
+// TestExtractDOMExprLimited — the DOM capture expression with a byte cap
+// (R-02, 05#P2-3): the limit is moved into the browser itself as a UTF-8
+// byte cut over code points (a substring(N) cap counts UTF-16 units and
+// passes up to 3×N bytes through CDP on non-ASCII content; the counting
+// loop is ES3-pure — it must run in every engine's JS, not only V8),
+// and the truncation marker is appended by the browser itself: the
+// overshoot it creates is what makes the Go-side truncateDOM cut and
+// mark — without it a cut exactly to the byte limit would be stored
+// unmarked. The byte semantics need a live engine —
+// TestExtractLiveDOMByteCap.
 func TestExtractDOMExprLimited(t *testing.T) {
 	if got := extractDOMExprLimited(0); got != extractDOMExpr {
 		t.Errorf("limit 0: %q, want the base expression %q", got, extractDOMExpr)
@@ -173,13 +181,19 @@ func TestExtractDOMExprLimited(t *testing.T) {
 	if got := extractDOMExprLimited(-5); got != extractDOMExpr {
 		t.Errorf("a negative limit: %q, want the base expression %q", got, extractDOMExpr)
 	}
-	// The boundary: a limit of 1 — the minimal valid cap (does not degrade
-	// into the unlimited expression).
-	if got := extractDOMExprLimited(1); got != extractDOMExpr+".substring(0, 1)" {
-		t.Errorf("limit 1: %q, want %q", got, extractDOMExpr+".substring(0, 1)")
+	// The boundary: a limit of 1 must not degrade into the unlimited
+	// expression.
+	if extractDOMExprLimited(1) == extractDOMExpr {
+		t.Error("limit 1 degraded into the unlimited expression")
 	}
 	got := extractDOMExprLimited(2048)
-	want := extractDOMExpr + ".substring(0, 2048)"
+	want := `((function(){var s=document.documentElement?document.documentElement.outerHTML:"";` +
+		`var n=0,i=0;while(i<s.length){var c=s.charCodeAt(i),w=1,b;` +
+		`if(c<0x80){b=1}else if(c<0x800){b=2}else if(c<0xD800||c>=0xE000){b=3}else{` +
+		`var d=c<0xDC00&&i+1<s.length?s.charCodeAt(i+1):0;` +
+		`if(c<0xDC00&&d>=0xDC00&&d<=0xDFFF){b=4;w=2}else{b=3}}` +
+		`if(n+b>2048){break}n+=b;i+=w}` +
+		`return i<s.length?s.substring(0,i)+` + strconv.Quote(extractDOMTruncated) + `:s})())`
 	if got != want {
 		t.Errorf("the expression:\n got  %s\nwant %s", got, want)
 	}

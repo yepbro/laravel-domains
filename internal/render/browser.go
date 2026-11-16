@@ -68,8 +68,8 @@ type Browser struct {
 	// of the snapshot and the rootPID it was taken for (a generation change —
 	// a new Browser; a direct rootPID reset — tests). The /proc traversal used to run
 	// on every task, now — no more often than rssCacheTTL. Under mu, like Close:
-	// reads come from swapReasonLocked under the manager's mutex, but the method
-	// is public (OverMemory, tests).
+	// reads come from the memory-threshold decision (OverMemory — the manager's
+	// swapReasonLocked path since T-291, and tests) under the manager's mutex.
 	rssPID int
 	rss    int64
 	rssAt  time.Time
@@ -403,7 +403,10 @@ func (b *Browser) RSS() int64 {
 // Options.MemoryThreshold is exceeded (spec 5.6). An unknown RSS and a zero threshold
 // (control disabled) do not trigger: the restart is soft prevention
 // of memory growth, the hard cap in any mode is held by the container's cgroup
-// (mem_limit — the docker analog of MemoryMax, spec 3.2/10.1).
+// (mem_limit — the docker analog of MemoryMax, spec 3.2/10.1). The single
+// source of the decision: since T-291 the manager's swap reason
+// (activeSwapReasonLocked) goes through this method too (05#P2-2 — before,
+// an inline copy here could drift while the method's tests stayed green).
 func (b *Browser) OverMemory() bool {
 	if b == nil || b.opts.MemoryThreshold <= 0 {
 		return false
@@ -415,7 +418,8 @@ func (b *Browser) OverMemory() bool {
 	// (0/-1 >= threshold is false), and rss == 1 is unreachable — RSS from /proc
 	// is a multiple of the page (>= 4096). The expression/comparison annotation along the way
 	// also kills the `>= → >` boundary on the right (trade-off §4); the boundary itself, "RSS
-	// equals the threshold — an excess", is pinned by TestBrowserOverMemory.
+	// equals the threshold — an excess", is pinned by TestBrowserOverMemory — and
+	// with it both paths of the decision: the method's own and the manager's.
 	// mutator-disable-next-line expression/comparison, expression/remove, numbers/decrementer, numbers/incrementer
 	return rss > 0 && rss >= b.opts.MemoryThreshold
 }

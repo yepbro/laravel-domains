@@ -236,8 +236,9 @@ func preferIPv4(addrs []net.IPAddr) net.IPAddr {
 
 // resolveRemoteWSURL — the browser WebSocket address to connect to: a
 // configuration address with the /devtools/browser/ path is a ready
-// address and is used as is; otherwise it is refined with a
-// /json/version request (webSocketDebuggerUrl), as remote.Allocator
+// address and is used as is (an http(s) scheme is upgraded to ws(s) —
+// the WebSocket client dials ws|wss only, 05#P3-1); otherwise it is
+// refined with a /json/version request (webSocketDebuggerUrl), as remote.Allocator
 // does. A host that is not an IP/localhost is resolved into an IP
 // (IPv4 preferred — preferIPv4): Chrome ≥66 requires the Host header of
 // the connection to be an IP address or localhost.
@@ -273,6 +274,19 @@ func resolveRemoteWSURL(ctx context.Context, raw string, timeout time.Duration) 
 		}
 	}
 	if strings.Contains(u.Path, "/devtools/browser/") {
+		// A ready browser endpoint — but maybe with an http(s) scheme (a
+		// copy-paste of webSocketDebuggerUrl from /json/version or a curl
+		// output; validate allows http(s) for chromium because of the
+		// refinement path): the chromedp WebSocket client dials ws|wss
+		// only — an as-is http address died in the handshake at the
+		// generation start (05#P3-1). The scheme is upgraded, preserving
+		// the TLS intent (https → wss); ws|wss stay as they are.
+		switch u.Scheme {
+		case "http":
+			u.Scheme = "ws"
+		case "https":
+			u.Scheme = "wss"
+		}
 		return u.String(), nil
 	}
 	q := *u

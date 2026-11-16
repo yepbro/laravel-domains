@@ -101,10 +101,12 @@ func NewManager(ctx context.Context, opts Options) *Manager {
 // live generation is guaranteed (a start or a restart by triggers — the
 // page and memory thresholds, browser death), then Pool.Run. Page and
 // context errors are returned as is (the pool has already made its own
-// retry on a fresh context); browser death mid-task (ClassBrowser) and
-// pool closure by a generation swap before the task started (ErrClosed —
-// the task did not run) mean a restart and a retry, at most
-// maxRestartsPerTask times.
+// retry on a fresh context); browser death mid-task (ClassBrowser), pool
+// closure by a generation swap before the task started (ErrClosed — the
+// task did not run) and a context failure raced by that closure
+// (ClassContext wrapped in ErrClosed by the pool — an in-place retry is
+// impossible in the retiring generation, 05#P2-1) mean a restart and a
+// retry, at most maxRestartsPerTask times.
 //
 // A failed generation START (the engine is unreachable — a container
 // restart, T-283) is not a task error: within the Options.EngineWait

@@ -145,7 +145,7 @@ render section of spec 5.10 has no separate field): applied to the tab via
 | Trigger | Condition | Spec |
 |---|---|---|
 | page threshold | `Browser.Pages() ≥ render.restart_every_pages` (500) | 5.6 |
-| memory threshold | RSS of the Chromium process tree ≥ `render.restart_memory_bytes` (1536 MiB) | 5.6, 3.2 |
+| memory threshold | RSS of the Chromium process tree ≥ `render.restart_memory_bytes` (1536 MiB); the decision — `Browser.OverMemory` | 5.6, 3.2 |
 | browser death | `!Browser.Alive()`: lost connection/process | §3.4 |
 
 **The generation FSM (T-263).** The liveness of the "browser + pool"
@@ -168,7 +168,11 @@ budget. A task that never started in a closing pool (`ErrClosed` — it never
 ran) and a browser that died mid-task (`ClassBrowser`) — a generation switch
 and a task retry, at most two per task: the Chromium crash loop must not
 multiply executions of a single page; beyond that — redelivery at the queue
-level.
+level. A transient context failure raced by the swap (the task's tab died
+right as the pool was retired — the pool's own retry is impossible in the
+retiring generation) is wrapped in `ErrClosed` with the context class kept
+(T-291, 05#P2-1): the manager retries it on the new generation too, instead
+of letting a healable error burn a `redis.max_attempts` delivery.
 
 **RSS — from /proc, the whole process tree.** Chromium is not one process:
 the main one, renderers, GPU; each counts toward the spec 3.2 budget. The
@@ -297,7 +301,7 @@ cookies (including JS-set ones) via CDP", §11.4 item 3):
 
 | What | How | Why |
 |---|---|---|
-| the final DOM | `chromedp.Evaluate` of the expression `document.documentElement.outerHTML` | serialization of the live tree after JS finished painting, by the same Chrome HTML serializer that "save page" uses: the format is identical to the raw HTML — straight into storage (T-067) and into the HTML/meta rules (T-068) without transformations; `DOM.getFlattenedDocument` (a node tree with nodeIds, requiring `DOM.getOuterHTML` midway) was rejected |
+| the final DOM | `chromedp.Evaluate` of the expression `document.documentElement.outerHTML` with an in-browser byte cap (`content.max_store_bytes`, R-02): a code-point walk accumulating the UTF-8 byte length cuts the string at the budget and appends the truncation marker right in the page (T-291, 05#P2-3: the former `substring(0, limit)` counted UTF-16 units and passed up to 3× the byte limit through CDP on non-ASCII pages — the very worker-cgroup OOM the cap protects from; the walk is ES3-pure — it runs in every engine's JS; the browser marker guarantees the overshoot that the Go-side `truncateDOM` re-cuts and marks; the transport frame is JSON-escaped — up to ~2× the string on quote-dense content) | serialization of the live tree after JS finished painting, by the same Chrome HTML serializer that "save page" uses: the format is identical to the raw HTML — straight into storage (T-067) and into the HTML/meta rules (T-068) without transformations; `DOM.getFlattenedDocument` (a node tree with nodeIds, requiring `DOM.getOuterHTML` midway) was rejected |
 | all cookies | CDP `Network.getCookies` with the final page URL | reads the cookie store of the isolated context, not `document.cookie` — httpOnly and JS-set cookies are visible. `Network.getAllCookies` was removed from the current protocol (cdproto v0.157.8 does not have it); `Network.getCookies` over the tab's session is the same store, and the explicit URL yields the "this page's cookies" set without subframe noise |
 | response headers | `chromedp.NavigateResponse` (the main navigation's response from `Network.responseReceived`) | spec 5.8 — header rules: for a rendered page the final document need not match what the HTTP stage captured. Chromedp itself tracks the loader/request chain across redirects — no event subscriptions needed. The `http.Header` format — a single contract with the HTTP stage (T-058) |
 

@@ -64,16 +64,48 @@ const extractDOMExpr = `document.documentElement.outerHTML`
 // and the operator see that the tree was not captured in full.
 const extractDOMTruncated = "<!-- crawler: dom truncated -->"
 
-// extractDOMExprLimited — the capture expression with a length cap: a heavy or
+// extractDOMExprLimited — the capture expression with a byte cap: a heavy or
 // hostile page (an SPA monster, bloated JS) must not pull a string over the
-// limit through CDP — the truncation happens inside the browser itself. substring counts
-// UTF-16 units, so the exact byte limit is tightened in Go
-// (truncateDOM).
+// limit through CDP — the truncation happens inside the browser itself, by
+// UTF-8 bytes (05#P2-3: until T-291 the cap was substring(0, limit), which
+// counts UTF-16 code units — up to 3 bytes pass per unit on non-ASCII
+// content, and with render.contexts tabs in flight the CDP transient
+// buffers reached ~3×MaxDOMBytes each against the worker's cgroup budget,
+// the very OOM the cap protects from, R-02). The counting walks code
+// points (charCodeAt — ES3-pure, the expression must run in every
+// engine's JS, not only V8: moli, lightpanda), accumulating the UTF-8
+// byte length (1..3 per BMP unit, 4 per surrogate pair, a lone surrogate
+// — 3: the CDP JSON transport replaces it with U+FFFD exactly like Go's
+// decoder); the loop stops at the budget, so its cost is bounded by the
+// limit, not the page size. The cut lands on a code-point boundary (no
+// torn runes). The truncation marker appended by the browser never
+// reaches the storage itself: the prefix is strictly
+// over limit-4 bytes, plus the 31-byte marker — always above the limit —
+// so the Go-side truncateDOM re-cuts and puts ITS marker; the browser
+// marker's job is to guarantee that overshoot, without it a cut exactly
+// to the byte limit would be stored unmarked (the pre-T-291 behavior for
+// ASCII pages). The cap bounds the decoded string, not the transport
+// frame: the CDP frame is JSON-escaped (", \ and C0 controls expand —
+// up to ~2× on quote-dense HTML; the residual multiplier is content
+// dependent and belongs to the memory budget, not the expression).
+// The marker goes into the JS string literal via strconv.Quote (the
+// review P3-2): a future marker containing a quote, a backslash or a
+// newline must not silently break the expression at run time — the
+// escaping is part of building it, not a convention on the constant
+// (for the current ASCII marker the quoted form is byte-identical, so
+// the pinned expression does not change). limit <= 0 — the uncapped
+// expression.
 func extractDOMExprLimited(limit int) string {
 	if limit <= 0 {
 		return extractDOMExpr
 	}
-	return extractDOMExpr + fmt.Sprintf(".substring(0, %d)", limit)
+	return `((function(){var s=document.documentElement?document.documentElement.outerHTML:"";` +
+		`var n=0,i=0;while(i<s.length){var c=s.charCodeAt(i),w=1,b;` +
+		`if(c<0x80){b=1}else if(c<0x800){b=2}else if(c<0xD800||c>=0xE000){b=3}else{` +
+		`var d=c<0xDC00&&i+1<s.length?s.charCodeAt(i+1):0;` +
+		`if(c<0xDC00&&d>=0xDC00&&d<=0xDFFF){b=4;w=2}else{b=3}}` +
+		`if(n+b>` + strconv.Itoa(limit) + `){break}n+=b;i+=w}` +
+		`return i<s.length?s.substring(0,i)+` + strconv.Quote(extractDOMTruncated) + `:s})())`
 }
 
 // truncateDOM — the hard byte limit of the final DOM in the worker's memory:

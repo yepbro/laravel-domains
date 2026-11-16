@@ -346,6 +346,53 @@ func TestGenStateLifecycle(t *testing.T) {
 	}
 }
 
+// TestManagerMemorySwapDelegatesToOverMemory — 05#P2-2: the manager's
+// memory-threshold decision is Browser.OverMemory — the single source of
+// the expression (until T-291 an inline copy lived in
+// activeSwapReasonLocked and could drift while TestBrowserOverMemory —
+// the boundary pin of the method — stayed green). The equivalence is
+// walked over the (rss × threshold) grid reachable through the /proc
+// seam: at every point the swap decision must coincide with OverMemory
+// (the rss == threshold diagonal catches a `>=`/`>` drift), and a firing
+// reason must be the memory threshold, not a neighboring trigger.
+func TestManagerMemorySwapDelegatesToOverMemory(t *testing.T) {
+	var rssVal atomic.Int64
+	oldProc := procRSS
+	procRSS = func(int) int64 { return rssVal.Load() }
+	t.Cleanup(func() { procRSS = oldProc })
+
+	b, _ := liveBrowser(1)
+	b.rootPID = 42 // a local-mode root: RSS() reads through the /proc seam
+	m := NewManager(context.Background(), managerOpts())
+	m.mu.Lock()
+	m.b, m.p = b, poolOver(b, nil)
+	m.mu.Unlock()
+
+	for _, rss := range []int64{-1, 0, 1, 128 << 20, 256 << 20} {
+		for _, threshold := range []int64{0, 1, 64 << 20, 256 << 20} {
+			// A fresh measurement per point: a foreign cache root forces
+			// a snapshot instead of the previous point's value
+			// (TestBrowserRSSCache style).
+			rssVal.Store(rss)
+			b.mu.Lock()
+			b.rssPID = 0
+			b.mu.Unlock()
+			b.opts.MemoryThreshold = threshold
+
+			m.mu.Lock()
+			reason, swap := m.swapReasonLocked()
+			m.mu.Unlock()
+			if over := b.OverMemory(); over != swap {
+				t.Errorf("rss=%d threshold=%d: the swap decision %v (%q), OverMemory %v",
+					rss, threshold, swap, reason, over)
+			}
+			if swap && !strings.Contains(reason, "memory threshold") {
+				t.Errorf("rss=%d threshold=%d: the swap reason %q is not the memory threshold", rss, threshold, reason)
+			}
+		}
+	}
+}
+
 func TestGenStateStartingSerialized(t *testing.T) {
 	// I2/G1 "starting": a generation start holds m.mu for the whole
 	// StartBrowser — a concurrent probe waits for the outcome, does not

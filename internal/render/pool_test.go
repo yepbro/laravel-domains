@@ -3,6 +3,7 @@ package render
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"strconv"
@@ -310,11 +311,21 @@ func TestPoolWaitCanceled(t *testing.T) {
 
 // TestPoolNoRetryAfterRetire — a retired pool does not retry even a
 // context error: the generation is already being taken out of service,
-// the retry is the new generation's business.
+// the retry is the new generation's business. The error is wrapped in
+// ErrClosed with the context class kept: Manager.Run retries the task on
+// the new generation (its ErrClosed contract) instead of letting a raw
+// ClassContext escape upward, where the queue would burn a
+// redis.max_attempts delivery of a healable failure (05#P2-1).
 func TestPoolNoRetryAfterRetire(t *testing.T) {
 	b := testBrowser(1)
 	p := NewPool(b)
 	rec := &recorder{}
+	// The inner cause wraps a sentinel: the ErrClosed wrap must keep the
+	// cause in the chain (the review P3-1 — the *Error contract promises
+	// the original cause to errors.Is/As, e.g. context.Canceled), not
+	// fold it into the message text.
+	inner := &Error{Class: ClassContext,
+		Err: fmt.Errorf("the tab died: %w", context.Canceled)}
 	p.newSession = func(ctx context.Context) (renderSession, error) {
 		s, err := rec.factory(ctx)
 		if err != nil {
@@ -323,6 +334,45 @@ func TestPoolNoRetryAfterRetire(t *testing.T) {
 		fs := s.(*fakeSession)
 		fs.run = func(context.Context, RenderTask) (RenderOutput, error) {
 			p.retire() // the generation was swapped during the first attempt
+			return RenderOutput{}, inner
+		}
+		return s, nil
+	}
+	_, err := p.Run(context.Background(), RenderTask{URL: "u"})
+	if ClassOf(err) != ClassContext {
+		t.Fatalf("the class %v (%v), want context", ClassOf(err), err)
+	}
+	if !errors.Is(err, ErrClosed) {
+		t.Fatalf("the error %v, want the ErrClosed wrap (a manager retry on the new generation)", err)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("the error %v, want the original cause kept in the chain (the *Error unwrap contract)", err)
+	}
+	if got := len(rec.sessions); got != 1 {
+		t.Errorf("sessions created %d, want 1 (a retired pool does not retry)", got)
+	}
+}
+
+// TestPoolRetiredDuringRetry — the same race one window later (05#P2-1):
+// the pool passed the closed check and began its own retry, and the
+// generation was retired during that attempt. The second failure is
+// wrapped in ErrClosed exactly like the first one — no third attempt in
+// the retiring pool, the retry is handed to the manager.
+func TestPoolRetiredDuringRetry(t *testing.T) {
+	b := testBrowser(1)
+	p := NewPool(b)
+	rec := &recorder{}
+	var attempts atomic.Int32
+	p.newSession = func(ctx context.Context) (renderSession, error) {
+		s, err := rec.factory(ctx)
+		if err != nil {
+			return nil, err
+		}
+		fs := s.(*fakeSession)
+		fs.run = func(context.Context, RenderTask) (RenderOutput, error) {
+			if attempts.Add(1) == 2 {
+				p.retire() // the generation was swapped during the pool's own retry
+			}
 			return RenderOutput{}, ctxErr(ClassContext)
 		}
 		return s, nil
@@ -331,8 +381,11 @@ func TestPoolNoRetryAfterRetire(t *testing.T) {
 	if ClassOf(err) != ClassContext {
 		t.Fatalf("the class %v (%v), want context", ClassOf(err), err)
 	}
-	if got := len(rec.sessions); got != 1 {
-		t.Errorf("sessions created %d, want 1 (a retired pool does not retry)", got)
+	if !errors.Is(err, ErrClosed) {
+		t.Fatalf("the error %v, want the ErrClosed wrap (a manager retry on the new generation)", err)
+	}
+	if got := len(rec.sessions); got != 2 {
+		t.Errorf("sessions created %d, want 2 (one retry, no third attempt)", got)
 	}
 }
 

@@ -23,6 +23,9 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"unicode/utf8"
+
+	"github.com/chromedp/chromedp"
 )
 
 // TestExtractLiveStaticPage — the result capture on a static fixture
@@ -86,6 +89,99 @@ func TestExtractLiveStaticPage(t *testing.T) {
 	}
 	if got := out.ResponseHeaders.Get("X-Live-Fixture"); got != "1" {
 		t.Errorf("X-Live-Fixture %q, want 1 — the headers are not from the real fixture response", got)
+	}
+}
+
+// TestExtractLiveDOMByteCap — 05#P2-3: the in-browser DOM cap cuts by
+// UTF-8 bytes, not UTF-16 units. Pages per UTF-8 width branch (the
+// review: the walk's 3-byte, surrogate-pair and lone-surrogate
+// arms — not only the 2-byte Cyrillic one): over a limit that lands
+// mid-content, the string that crosses CDP must be within limit+marker
+// bytes (the old substring(0, limit) handed over 2×limit bytes for
+// Cyrillic and up to 3×limit for CJK), end with the truncation marker
+// and decode as valid UTF-8; the stored result (after the Go-side
+// truncateDOM) is within the limit. A lone surrogate (script-injected)
+// must count as 3 bytes — what the CDP JSON transport and Go's decoder
+// both turn into U+FFFD.
+func TestExtractLiveDOMByteCap(t *testing.T) {
+	skipUnlessLive(t)
+	ctx := context.Background()
+
+	const limit = 4000
+	opts := liveOptions()
+	opts.MaxDOMBytes = limit
+
+	// repeat — a filler symbol of the tested width; the lone-surrogate
+	// page injects "\uD800" by script (the HTML parser itself never
+	// produces lone surrogates from valid UTF-8 bytes).
+	mux := http.NewServeMux()
+	mux.HandleFunc("/cyr", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = fmt.Fprint(w, "<html><body>"+strings.Repeat("д", 4096)+"</body></html>")
+	})
+	mux.HandleFunc("/cjk", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = fmt.Fprint(w, "<html><body>"+strings.Repeat("漢", 4096)+"</body></html>")
+	})
+	mux.HandleFunc("/emoji", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = fmt.Fprint(w, "<html><body>"+strings.Repeat("😀", 4096)+"</body></html>")
+	})
+	mux.HandleFunc("/lone", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = fmt.Fprint(w, `<html><body><div id="d"></div><script>`+
+			`document.getElementById("d").textContent="\uD800".repeat(4096)+"end";`+
+			`</script></body></html>`)
+	})
+	base := liveServe(t, mux)
+
+	b, err := StartBrowser(ctx, opts)
+	if err != nil {
+		t.Fatalf("StartBrowser: %v", err)
+	}
+	defer b.Close()
+
+	for _, path := range []string{"/cyr", "/cjk", "/emoji", "/lone"} {
+		t.Run(path, func(t *testing.T) {
+			page := base + path
+			s, err := b.NewSession(ctx)
+			if err != nil {
+				t.Fatalf("NewSession: %v", err)
+			}
+			defer s.Close()
+
+			out, err := s.Run(ctx, RenderTask{URL: page})
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if n := len(out.DOM); n > limit {
+				t.Fatalf("the stored DOM is %d bytes, want <= the limit %d", n, limit)
+			}
+			if !strings.HasSuffix(out.DOM, extractDOMTruncated) {
+				t.Fatalf("the stored DOM without the truncation sign: …%q", out.DOM[len(out.DOM)-40:])
+			}
+			if !utf8.ValidString(out.DOM) {
+				t.Error("the stored DOM is not valid UTF-8")
+			}
+
+			// The wire-level property: the very expression the session
+			// uses, evaluated again over the same tab, returns a string
+			// already within limit+marker bytes — the old unit-based cap
+			// returned 2×limit here (cyr) and 3×limit (cjk).
+			raw, err := chromedp.Run(s.Context(), chromedp.Evaluate[string](extractDOMExprLimited(limit)))
+			if err != nil {
+				t.Fatalf("the capped capture: %v", err)
+			}
+			if n := len(raw); n > limit+len(extractDOMTruncated) {
+				t.Fatalf("the capped capture is %d bytes, want <= %d", n, limit+len(extractDOMTruncated))
+			}
+			if !strings.HasSuffix(raw, extractDOMTruncated) {
+				t.Fatalf("the capped capture without the truncation sign: …%q", raw[len(raw)-40:])
+			}
+			if !utf8.ValidString(raw) {
+				t.Error("the capped capture is not valid UTF-8 (a code point was torn)")
+			}
+		})
 	}
 }
 

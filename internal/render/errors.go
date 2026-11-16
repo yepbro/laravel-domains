@@ -89,8 +89,11 @@ func LoadErrorCode(err error) string {
 	return ""
 }
 
-// ErrClosed — the pool or the browser is stopped, the task did not run.
-// Guarantees moving the task to the redelivery queue (T-066).
+// ErrClosed — the pool or the browser is stopped: the task did not run,
+// or its transient (context-class) failure can no longer be retried in
+// this pool — the manager restarts the generation and retries the task;
+// if the retries are exhausted, guarantees moving the task to the
+// redelivery queue (T-066).
 var ErrClosed = errors.New("render stopped")
 
 // ErrBrowserDead — the browser session is not initialized or is lost

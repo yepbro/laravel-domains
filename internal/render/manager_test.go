@@ -412,6 +412,50 @@ func TestManagerClosed(t *testing.T) {
 	}
 }
 
+// TestManagerRetryOnContextErrorInRetiredPool — 05#P2-1: the generation
+// swap (a page/memory threshold crossed by a neighboring worker, T-065)
+// races the task's transient context failure. The retiring pool does not
+// retry (its browser closes after the drain); the error wrapped in
+// ErrClosed hands the task to a retry on the new generation — the
+// manager's ErrClosed contract — instead of upward, where the queue
+// would burn one of redis.max_attempts on a healable failure.
+func TestManagerRetryOnContextErrorInRetiredPool(t *testing.T) {
+	m := NewManager(context.Background(), managerOpts())
+	var poolCalls atomic.Int32
+	m.newBrowser = func(context.Context, Options) (*Browser, error) {
+		b, _ := liveBrowser(1)
+		return b, nil
+	}
+	m.newPool = func(b *Browser) *Pool {
+		p := poolOver(b, nil)
+		if poolCalls.Add(1) == 1 {
+			// The first generation's page dies with the context class
+			// right as the generation is being replaced.
+			p.newSession = func(context.Context) (renderSession, error) {
+				return &fakeSession{run: func(context.Context, RenderTask) (RenderOutput, error) {
+					p.retire() // the swap landed while the page was running
+					return RenderOutput{}, ctxErr(ClassContext)
+				}}, nil
+			}
+		}
+		return p
+	}
+
+	out, err := m.Run(context.Background(), RenderTask{URL: "https://a.example/"})
+	if err != nil {
+		t.Fatalf("the retry on the new generation did not heal: %v", err)
+	}
+	if out.Title != "ok" {
+		t.Fatalf("result %+v", out)
+	}
+	if got := poolCalls.Load(); got != 2 {
+		t.Errorf("generations %d, want 2 (the retired one replaced)", got)
+	}
+	if got := m.Restarts(); got != 1 {
+		t.Errorf("restarts %d, want 1", got)
+	}
+}
+
 func TestManagerRunRetryOnClosedPool(t *testing.T) {
 	// The race "the generation was swapped right after acquire": the
 	// task gets ErrClosed from the already closing pool — the manager
@@ -792,8 +836,9 @@ func TestManagerMemoryRestartBoundaries(t *testing.T) {
 	// control is off; a threshold above the live RSS — not reached.
 	// Both without a restart at a positive process RSS (the second
 	// case also pins the annotation-suppressed trade-off of §4 —
-	// cutting the right half of the condition in swapReasonLocked:
-	// `rss > 0 && true` would restart the browser after every task).
+	// cutting the right half of the condition in Browser.OverMemory
+	// (called from swapReasonLocked since T-291): `rss > 0 && true`
+	// would restart the browser after every task).
 	probe, _ := liveBrowser(1)
 	probe.rootPID = os.Getpid()
 	if probe.RSS() <= 0 {

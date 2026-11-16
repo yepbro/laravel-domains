@@ -901,9 +901,10 @@ func TestSessionRunPageTimeoutDeadConnection(t *testing.T) {
 }
 
 // TestResolveRemoteWSURL — the WebSocket address refinement: a ready
-// /devtools/browser/ address is used as is (no network), otherwise — a
-// /json/version request; an answer without webSocketDebuggerUrl is an
-// error.
+// /devtools/browser/ address is used as is (no network; an http(s)
+// scheme is upgraded to ws(s), 05#P3-1 — the WebSocket client dials
+// ws|wss only), otherwise — a /json/version request; an answer without
+// webSocketDebuggerUrl is an error.
 func TestResolveRemoteWSURL(t *testing.T) {
 	ctx := context.Background()
 
@@ -914,6 +915,23 @@ func TestResolveRemoteWSURL(t *testing.T) {
 	}
 	if ws != ready {
 		t.Errorf("the ready address changed: %s", ws)
+	}
+
+	// 05#P3-1: a ready /devtools/browser/ path with an http(s) scheme
+	// (a copy-paste of the endpoint from /json/version or curl) — the
+	// scheme is upgraded to ws(s): the chromedp WebSocket client dials
+	// ws|wss only, an as-is http address died in the handshake.
+	for _, tc := range []struct{ raw, want string }{
+		{"http://127.0.0.1:9222/devtools/browser/abc", "ws://127.0.0.1:9222/devtools/browser/abc"},
+		{"https://127.0.0.1:9222/devtools/browser/abc", "wss://127.0.0.1:9222/devtools/browser/abc"},
+	} {
+		ws, err := resolveRemoteWSURL(ctx, tc.raw, time.Second)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.raw, err)
+		}
+		if ws != tc.want {
+			t.Errorf("%s: the address %s, want the upgraded scheme %s", tc.raw, ws, tc.want)
+		}
 	}
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

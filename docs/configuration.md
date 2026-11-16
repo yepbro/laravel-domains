@@ -750,10 +750,13 @@ normalized to the canonical form (`Moli` → `moli`).
 
 `remote_url` — a dev-environment extension: the address of an external
 Chromium over CDP (`ws://host:9222`); in production mode the worker
-starts the browser itself and the field is empty. The User-Agent of
-rendered pages is the single `http.user_agent` (spec §9); the stage
-architecture (isolated contexts, the pool, errors) — in
-[`render.md`](render.md).
+starts the browser itself and the field is empty. `http(s)://host:9222`
+is also accepted (the address is refined with a `/json/version` request);
+a ready `/devtools/browser/…` path with an `http(s)` scheme is upgraded
+to `ws(s)` at dial time (T-291) — the WebSocket client dials `ws|wss`
+only. The User-Agent of rendered pages is the single `http.user_agent`
+(spec §9); the stage architecture (isolated contexts, the pool, errors) —
+in [`render.md`](render.md).
 
 `contexts` — concurrent Chromium pages (pool slots, spec 5.6). The
 default of 8 (T-169) is a deliberate exceedance of the spec's 2–4
