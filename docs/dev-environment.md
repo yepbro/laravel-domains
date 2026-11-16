@@ -169,6 +169,10 @@ The `render.restart_memory_bytes` restart threshold is already `0` in the profil
 (the browser in dev is always an external container, the RSS of a foreign process is unavailable —
 validation requires 0 for moli/lightpanda), so the switch is exactly
 two keys; the chromium address needs no extra configuration when switching back.
+For moli there is a third, optional key — `restart_every_pages: 50` (the
+specimen in config.dev.yaml): the page counter works for an external engine
+and bounds moli's per-context memory retention (T-247, 2026-11-15) — it does
+not protect against the v1.1.25 memory burst (docs/operations.md, 2026-11-15).
 
 Switching back to chromium — restore `remote_url: "ws://172.28.100.14:9222"`
 and comment `engine` back out (chromium is the default), restart

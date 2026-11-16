@@ -100,10 +100,14 @@ package render
 //     (error, the counter 0) — fixed by T-276. The release retest
 //     v1.1.25 (2026-11-15, the compose image crawler/moli:v1.1.25): the
 //     slice is 6/6 green — ①④ live in a release; but the layer-2 smoke
-//     is red on the engine memory: cgroup OOM ×3 under the compose 1 GiB
-//     limit (~100 MiB/min vs ~21 MiB/min on the 13.11 build) — moli
-//     remains not-ready, the pin reverted to v1.1.21 (the journal
-//     docs/operations.md 2026-11-15, the artifacts in var/fixtures-l2/).
+//     is red on the engine memory, confirmed on a clean channel and a
+//     2 GiB limit: 3 cgroup OOM kills at a strict ~10-minute rhythm,
+//     the single main process bursting from ~0.1–0.3 GiB to the ceiling
+//     in seconds (§5.1: 4×FAILED, the report moli-v1.1.25-clean) — a
+//     release regression vs f857b6651 (736 MiB, 0 kills), not a network
+//     artifact; moli remains not-ready, the pin reverted to v1.1.21
+//     (the journal docs/operations.md 2026-11-15, the artifacts in
+//     var/fixtures-l2/, the research doc moli-v1.1.25-memory-research).
 //   - lightpanda 1.0.2: one browser context per connection ("Cannot have
 //     more than one browser context at a time", also recorded by
 //     third-party measurements). The service tab of the starting context

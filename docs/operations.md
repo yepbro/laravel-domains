@@ -1217,3 +1217,76 @@ why, and how to roll it back. Normal CD deploys are not recorded here
   The stand returned to chromium + the isolated DNS; the 7 leftover
   tasks were drained by chromium after the rollback (harmless — the
   next `import --force` resets the rows).
+
+### 2026-11-15 — T-247 (cont.): the clean-channel control run + the memory research — the regression CONFIRMED, 4×FAILED
+
+- The control run (the operator disabled the VPN after learning it
+  flapped during the first run; the 13.11 baseline had the same VPN but
+  a stable channel — so the comparison was confounded by channel
+  quality, not VPN presence): the same seed hundred, v1.1.25,
+  `MEM_MOLI=2gb` (the full growth curve instead of a truncation at
+  1 GiB), a per-process RSS capture (`docker top`), the drain cap 45
+  min. The channel probe before the start: laravel.com in 3 s. Drain
+  32 min 23 s — but **3 cgroup OOM kills again**: t+176 s / t+768 s /
+  t+1406 s (**592 s and 598 s apart — a strict ~10-minute rhythm**),
+  anon-rss ~2 063–2 070 MiB each, RestartCount 3, max RSS 2.05 GiB.
+  The growth is **bursty, not linear**: plateaus of minutes at
+  9.5–30 MiB (docker stats) / 52–100 MiB (per-process), then to the
+  ceiling in **6–21 s**; after a restart back to ~5–15 MiB. Doubling
+  the limit did not help — the process grows to whatever ceiling
+  exists. `docker top`: **one process, no children at all** — the
+  killed PID is the main moli (the "child renderer" of the first run's
+  analysis was a misread: VmHWM 341 MiB belonged to a post-restart
+  epoch; the real peak at a kill is ≥ the cgroup ceiling). Before
+  kills 2–3 the log is silent — no page-side error correlation.
+- The §5.1 report (the full one this time —
+  `var/fixtures-l2/report-moli-v1.1.25-clean.txt`): **4×FAILED +
+  1×NO DATA** — the Laravel detection divergences 3.75% (3 of 80
+  comparable; 16 Laravel verdicts on both sides) against <1%; success
+  83/100 vs the baseline 92/100 (0 engine-independent losses; the gap:
+  8 tarpit + 4 q:dead + ERR_FAILED×4 — the kill cascades' tail, see
+  T-283); memory 2.05 GiB vs ⅓ of the chromium budget 682.7 MiB; the
+  crash verdict FAILED (61 browser-class unavailability events); pace
+  NO DATA (q:analyze <2 records at the snapshot). The page time is
+  fine — avg 10.37 s vs chromium's 14.69 s; the DOM structure metrics
+  are clean (the ratio medians ×1.00; 11.25% identical hashes).
+- The memory research (a subagent; the full doc —
+  `var/fixtures-l2/moli-v1.1.25-memory-research.md`): moli is
+  single-process; the shape is "plateau → burst" (~150 MiB/s), which
+  retires the "linear leak ~100 MiB/min" reading of the first run (a
+  sampling artifact). Ranked hypotheses: **H-A** a runaway allocation
+  on a concrete page (in the first run's burst window: avito with a
+  rAF loop throwing a WebGL error every frame + font NetworkErrors on
+  "Fontconfig error: No writable cache directories" under nobody) —
+  but the clean run's silent kills and the strict periodicity rather
+  point **to an internal timer/accumulator**; **H-B** unbounded body
+  buffers (`http_max_response_size` defaults to None; retained raw
+  body captures across intercepted redirects; accumulating request
+  overrides); **H-C** per-context retention on churn (async dispose,
+  retired owners reaped only at `runtime_is_gone`, loading workers
+  outside context shutdown). Rejected by code inspection: the idle-wait
+  mode (a CLI flag, not serve), OffscreenCanvas, the discovery schema,
+  the streaming-parse change, "our worker leaks" (the adapter is
+  clean). The prioritized bisect window (71 commits f857b6651..v1.1.25)
+  and the upstream-ticket material are in the doc.
+- Decisions (the operator): the retest plan is extended with an
+  idle-watch + per-URL repro and a `--http-max-response-size` probe
+  (running); the mitigation `restart_every_pages: 50` is added to the
+  moli specimen in config.dev.yaml — the page counter works for an
+  external engine (unlike `restart_memory_bytes`) and bounds the
+  per-context retention floor, but does NOT protect against the burst;
+  no upstream issue for now (the operator is a moli contributor and
+  takes the analysis upstream). The `.env` pin reverted to the v1.1.21
+  pair (the v1.1.25 image stays local — a retest after an upstream fix
+  is a two-line flip); `.env.example` untouched; `MEM_MOLI=1gb` is now
+  an explicit line in `.env` (was the compose default). The follow-up
+  **T-283** (INBOX): render-worker does not survive an engine restart —
+  a "task is not acknowledged" cascade + claim cycles freeze the queue
+  for ≥2 min (the kill cascades above are its live demo).
+- The ops side: a host reboot happened mid-rollback (after the config
+  restore; the subagent continued cleanly — all healthy, the isolated
+  DNS SERVFAIL-verified). Artifacts: `moli-v1.1.25-clean.snapshot.json`,
+  `report-moli-v1.1.25-clean.txt`, `moli-v1.1.25-clean-{drain,rss,procs}.log`,
+  `moli-v1.1.25-clean-oom-dmesg.log`, `moli-v1.1.25-memory-research.md`
+  (+ the first run's `moli-v1125-*` set). The stand is back on chromium
+  + the isolated DNS; moli stopped.

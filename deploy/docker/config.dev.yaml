@@ -76,6 +76,11 @@ render:
   #   moli (dc --profile render-engines up -d moli):
   # engine: "moli"
   # remote_url: "ws://172.28.100.17:9222"
+  # restart_every_pages: 50   # moli only: bounds the engine's per-context
+  #   memory retention (the page counter works for an external engine —
+  #   unlike restart_memory_bytes; T-247 15.11). Does NOT protect against
+  #   the v1.1.25 burst (~2 GiB in seconds) — that one is upstream
+  #   (docs/operations.md, 2026-11-15).
   # Deliberately below the production default of 4 (T-142): dev-chromium is
   # shared by the render unit and live tests, a conservative parallelism
   # keeps the container memory (MEM_CHROMIUM 2048m) predictable under smoke
