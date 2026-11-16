@@ -937,11 +937,21 @@ func readPackBlock(dir string, packID int32, off int64, clen int32) ([]byte, err
 // off; size is the file size for validating the placement. The placement is
 // checked before the allocation: len comes from the DB (contents.len), a
 // corrupted row must not order a buffer of up to 2 GiB (C-14) — the same
-// check as in the CompactScan scan.
+// intent as in the CompactScan scan (compact.go), here in the overflow-free
+// form: with a corrupted off near int64 max the off+clen sum of the scan's
+// variant wraps around negative and slips past the size bound (bulk review
+// 08#P3-1); off ≤ size first makes the size-off subtraction overflow-free.
+// clen is also capped by maxDecodeSize: the file size alone (a pack rotates
+// at ~512 MiB) would let a corrupted-but-plausible row order hundreds of
+// MiB before the read (review of this fix, P3-2). A legitimate block is
+// the encoder output of ≤ max_store_bytes raw bytes (≤ ~16.1 MiB with the
+// zstd per-block overhead), and compaction copies blocks verbatim, so the
+// cap holds with the same 2× headroom as the decode cap — an invariant of
+// the writers, not a structural guarantee, hence recorded here.
 func readPackBlockAt(f *os.File, size int64, packID int32, off int64, clen int32) ([]byte, error) {
-	if clen < 0 || off < packHeaderLen+4 || off+int64(clen) > size {
-		return nil, fmt.Errorf("content: pack %d, offset %d, length %d: block outside the file (%d bytes)",
-			packID, off, clen, size)
+	if clen < 0 || off < packHeaderLen+4 || off > size || int64(clen) > size-off || int64(clen) > maxDecodeSize {
+		return nil, fmt.Errorf("content: pack %d, offset %d, length %d: block outside the file or above the %d-byte cap (%d bytes)",
+			packID, off, clen, maxDecodeSize, size)
 	}
 	buf := make([]byte, clen)
 	if _, err := f.ReadAt(buf, off); err != nil {

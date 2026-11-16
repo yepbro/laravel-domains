@@ -15,6 +15,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 // dictCorpus — a deterministic corpus of "parking pages": a shared
@@ -275,6 +277,38 @@ func TestDictSaveLoad(t *testing.T) {
 	}
 	if _, err := LoadDict(bad); err == nil {
 		t.Error("a broken dictionary file: an error expected")
+	}
+}
+
+// TestDictDecompressSizeCap — the dictionary decoder is bounded like the
+// package one (bulk review 08#P2-1): frames of the dictionary and
+// dictionary-less frames expanding beyond the cap are refused — Get reads
+// pack blocks through exactly this decoder.
+func TestDictDecompressSizeCap(t *testing.T) {
+	d, err := TrainDict(dictCorpus(12, 2048), TrainOptions{DictSize: 16 << 10})
+	if err != nil {
+		t.Fatalf("TrainDict: %v", err)
+	}
+	bomb := bytes.Repeat([]byte{0}, 40<<20)
+	cases := []struct {
+		name  string
+		frame []byte
+	}{
+		{"a frame of the dictionary", d.Compress(bomb)},
+		{"a dictionary-less frame", Compress(bomb)},
+	}
+	for _, tc := range cases {
+		if _, err := d.Decompress(tc.frame); !errors.Is(err, zstd.ErrDecoderSizeExceeded) {
+			t.Errorf("%s: err = %v, want zstd.ErrDecoderSizeExceeded", tc.name, err)
+		}
+	}
+
+	// The package path with the active dictionary — DecompressWithDict —
+	// is bounded too.
+	t.Cleanup(func() { SetDict(nil) })
+	SetDict(d)
+	if _, err := DecompressWithDict(d.Compress(bomb)); !errors.Is(err, zstd.ErrDecoderSizeExceeded) {
+		t.Errorf("DecompressWithDict: err = %v, want zstd.ErrDecoderSizeExceeded", err)
 	}
 }
 

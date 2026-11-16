@@ -11,6 +11,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -1243,7 +1244,10 @@ func TestPackIDFromNameCanonical(t *testing.T) {
 // TestPackReadBlockBounds — readPackBlock checks the placement against the
 // file before the allocation (C-14): a corrupted row (a len of up to 2 GiB or
 // negative, an offset past the file) is an error, not a giant buffer and not
-// a panic.
+// a panic. The check itself must not use off+clen arithmetic: with an offset
+// near int64 max the sum wraps around negative, slips past the size bound,
+// and the allocation is ordered after all — the placement check must reject
+// it (bulk review 08#P3-1).
 func TestPackReadBlockBounds(t *testing.T) {
 	dir := t.TempDir()
 	compactCraftPack(t, dir, 1, [][]byte{bytes.Repeat([]byte("block"), 8)})
@@ -1258,15 +1262,100 @@ func TestPackReadBlockBounds(t *testing.T) {
 		{"a negative len", packHeaderLen + 4, -1},
 		{"an offset past the file", size, 4},
 		{"a block longer than the file", packHeaderLen + 4, 41},
+		{"an offset near int64 max", math.MaxInt64 - 3, 8},
+		{"an offset+len overflowing int64", math.MaxInt64 - 3, 1 << 30},
 	} {
-		if _, err := readPackBlock(dir, 1, tc.off, tc.clen); err == nil {
+		_, err := readPackBlock(dir, 1, tc.off, tc.clen)
+		if err == nil {
 			t.Errorf("%s: readPackBlock accepted (%d, %d)", tc.name, tc.off, tc.clen)
+			continue
+		}
+		// The rejection must come from the placement check, not from the
+		// OS read after the buffer was ordered.
+		if !strings.Contains(err.Error(), "outside the file") {
+			t.Errorf("%s: (%d, %d) slipped past the placement check: %v", tc.name, tc.off, tc.clen, err)
 		}
 	}
 	// A live placement is read as before.
 	block, err := readPackBlock(dir, 1, packHeaderLen+4, 40)
 	if err != nil || len(block) != 40 {
 		t.Errorf("reading a whole block: %v, length %d", err, len(block))
+	}
+	// Boundary placements of the fixed check: an empty block at the very
+	// end of the file and the last byte are legitimate.
+	if b, err := readPackBlock(dir, 1, size, 0); err != nil || len(b) != 0 {
+		t.Errorf("an empty block at the end of the file: %v", err)
+	}
+	if b, err := readPackBlock(dir, 1, size-1, 1); err != nil || len(b) != 1 {
+		t.Errorf("the last byte of the file: %v", err)
+	}
+}
+
+// TestPackReadBlockLenCap — clen is bounded not only by the file size but
+// by maxDecodeSize: a pack rotates at ~512 MiB (DefaultPackSize, and a
+// pack may exceed the threshold by one block), so a corrupted row with a
+// plausible offset and a len of hundreds of MiB passes the size bound
+// inside a real pack and orders the buffer before the read (C-14) — the
+// overflow-free form alone left that residual. A legitimate block is the
+// encoder output of ≤ max_store_bytes raw bytes (≤ ~16.1 MiB with the
+// zstd per-block overhead), and compaction copies blocks verbatim, so
+// the cap holds with the same 2× headroom as the decode cap (review of
+// this fix, P3-2).
+func TestPackReadBlockLenCap(t *testing.T) {
+	dir := t.TempDir()
+	// A pack whose single block ends exactly at the file end: the size
+	// bound alone accepts an over-the-cap row placed inside it.
+	big := bytes.Repeat([]byte{0}, maxDecodeSize+1)
+	compactCraftPack(t, dir, 1, [][]byte{big})
+
+	// Without the cap disjunct the row is inside the file: the buffer is
+	// ordered and the read succeeds — the rejection must come from the
+	// placement check instead.
+	_, err := readPackBlock(dir, 1, packHeaderLen+4, maxDecodeSize+1)
+	if err == nil || !strings.Contains(err.Error(), "outside the file") {
+		t.Errorf("a block above maxDecodeSize: %v, want the placement-check rejection", err)
+	}
+	// Exactly maxDecodeSize is not over the cap: the placement stays a
+	// question of the file alone (the cap is not an off-by-one).
+	if b, err := readPackBlock(dir, 1, packHeaderLen+5, maxDecodeSize); err != nil || len(b) != maxDecodeSize {
+		t.Errorf("a block of exactly maxDecodeSize: %v", err)
+	}
+}
+
+// TestPackGetBombFrame — a corrupted block that is a structurally valid
+// zstd frame expanding far beyond any legitimate content (a "bomb": a
+// corrupted size field, hostile bytes): Get answers ErrCorrupted without
+// materializing the expansion (bulk review 08#P2-1). The row's raw_len
+// matches the bomb's expansion — the post-decode length check would have
+// passed; before the decoder cap the block would have been decoded in full
+// into the worker's memory.
+func TestPackGetBombFrame(t *testing.T) {
+	st, pool := newPackTestStore(t, func(o *PackOptions) { o.PackSize = 1 << 20 })
+	ctx := context.Background()
+	const expand = 40 << 20 // far beyond the 32 MiB decoder cap
+	bomb := Compress(bytes.Repeat([]byte{0}, expand))
+	offs := compactCraftPack(t, st.opts.Dir, 1, [][]byte{bomb})
+
+	h := HashOf([]byte("a bomb block"))
+	pool.contents[h] = &packFakeRow{
+		packID: 1, off: offs[0], clen: int32(len(bomb)),
+		rawLen: expand, refc: 1,
+	}
+	if _, err := st.Get(ctx, h); !errors.Is(err, ErrCorrupted) {
+		t.Errorf("Get of a bomb block: %v, want ErrCorrupted", err)
+	}
+
+	// A legit block in the same pack still reads: the cap does not touch
+	// ordinary content.
+	page := []byte("<html>a legitimate page after a bomb</html>")
+	frame := Compress(page)
+	offs = compactCraftPack(t, st.opts.Dir, 1, [][]byte{bomb, frame})
+	pool.contents[h] = &packFakeRow{
+		packID: 1, off: offs[1], clen: int32(len(frame)),
+		rawLen: int32(len(page)), refc: 1,
+	}
+	if got, err := st.Get(ctx, h); err != nil || string(got) != string(page) {
+		t.Errorf("Get after the bomb: %v", err)
 	}
 }
 

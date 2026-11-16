@@ -87,7 +87,9 @@ func NewDict(raw []byte) (*Dict, error) {
 	if err != nil {
 		return nil, fmt.Errorf("encoder with the dictionary: %w", err)
 	}
-	dec, err := zstd.NewReader(nil, zstd.WithDecoderDicts(raw))
+	// The decoder is bounded by maxDecodeSize like the package one: frames
+	// of the dictionary are the same untrusted disk bytes (bulk review 08#P2-1).
+	dec, err := zstd.NewReader(nil, zstd.WithDecoderDicts(raw), zstd.WithDecoderMaxMemory(maxDecodeSize))
 	if err != nil {
 		_ = enc.Close() // best-effort cleanup: the primary error is the decoder
 		return nil, fmt.Errorf("decoder with the dictionary: %w", err)

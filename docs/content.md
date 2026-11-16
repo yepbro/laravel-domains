@@ -52,6 +52,21 @@ records until the end of the file:
 the block (after the length prefix), `contents.len` — at its length:
 a read is a single `ReadAt`. `raw_len` — the size of the uncompressed
 content; it is verified after decompression (corruption detection).
+Decompression is bounded on its own: every zstd decoder of the package
+(the dictionary-less and the dictionary ones) is created with a 32 MiB
+cap (`zstd.WithDecoderMaxMemory`, a 2× headroom over the 16 MiB
+`content.max_store_bytes` limit) — a pack block is bytes from disk,
+not data of a trusted writer, and a frame expanding beyond the cap
+(a corrupted size field, hostile bytes) is rejected by the decoder
+(`zstd.ErrDecoderSizeExceeded` inside `ErrCorrupted`) with the
+materialized output bounded by the cap; the library default cap is
+64 GiB, which turns such a frame into an OOM of the worker instead
+of an error (T-294).
+The block length (`contents.len`) is bounded by the same 32 MiB before
+the buffer is ordered: a legitimate block is the compressed form of
+≤ 16 MiB raw (≈ 16.1 MiB with the zstd overhead), so a row claiming a
+longer block — even one that fits inside a real pack file — is rejected
+by the placement check without the allocation (C-14, T-294).
 The length prefix is needed by the pack scan of compaction (T-045); an
 interrupted write in the middle of a block leaves an unfinished record
 without metadata — it does not affect content reads, and the T-045
