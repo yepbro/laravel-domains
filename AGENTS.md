@@ -147,7 +147,7 @@ by a fallback is still one round.
    The prompt carries the read-only rules and the report path; the final
    message remains in the stdout file as a backup.
 2. First fallback — `cursor-agent` (Cursor CLI, model `grok-4.7-high`;
-   auth/diagnostics — `~/.config/opencode/agent-cursor.md`):
+   auth/diagnostics — `~/.agents/agent-guides/agents/cursor.md`):
 
    ```bash
    timeout 1200 cursor-agent -p --output-format text --mode ask \
@@ -176,7 +176,7 @@ by a fallback is still one round.
      > /tmp/opencode/review/<slug>-glm.md 2>&1; echo "exit=$?"
    ```
 4. Third fallback — `kimi` (Kimi Code CLI, model `kimi-code/k3.1-pro`;
-   auth/diagnostics — `~/.config/opencode/agent-kimi.md`):
+   auth/diagnostics — `~/.agents/agent-guides/agents/kimi.md`):
 
    ```bash
    timeout 1200 kimi -m kimi-code/k3.1-pro \
