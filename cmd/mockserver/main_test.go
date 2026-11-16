@@ -79,3 +79,36 @@ func TestSlowHandlerClientGone(t *testing.T) {
 		t.Fatal("the /slow handler keeps the goroutine after the client disconnects (ctx is not respected)")
 	}
 }
+
+// TestEndlessBodyHandlersClientGone — /huge and /zipbomb pour an endless
+// body in a write loop: like /slow and /tarpit, they must stop when the
+// client is gone (the ctx cancellation) instead of spinning until a
+// write error (17#P3-5; a connected non-reading client is a different,
+// by-design case — no WriteTimeout on these endpoints). The cancellation
+// here fires before the first write, pinning the ctx check itself.
+func TestEndlessBodyHandlersClientGone(t *testing.T) {
+	for _, path := range []string{"/huge", "/zipbomb"} {
+		t.Run(path, func(t *testing.T) {
+			mux := http.NewServeMux()
+			registerRoutes(mux)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			req = req.WithContext(ctx)
+			rec := httptest.NewRecorder()
+
+			done := make(chan struct{})
+			go func() {
+				mux.ServeHTTP(rec, req)
+				close(done)
+			}()
+			cancel()
+
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatalf("the %s handler keeps the goroutine after the client disconnects (ctx is not respected)", path)
+			}
+		})
+	}
+}

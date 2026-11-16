@@ -204,13 +204,23 @@ func registerRoutes(mux *http.ServeMux) {
 	})
 
 	// Huge body: a gigabyte is declared, we pour zeros (the client must
-	// truncate by the limit).
+	// truncate by the limit). The pour stops when the client is GONE —
+	// ctx cancelled or the write fails (17#P3-5); a connected non-reading
+	// client still blocks the write: no WriteTimeout by design (the
+	// nasty-scenario endpoints must outlive client timeouts), the
+	// goroutine is held until the write errors (for /huge net/http also
+	// caps the pour by the declared Content-Length — ErrContentLength).
 	mux.HandleFunc("/huge", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Length", "1073741824")
 		w.WriteHeader(http.StatusOK)
 		buf := make([]byte, 64*1024)
 		for {
+			select {
+			case <-r.Context().Done(): // the client is gone — we do not hold the goroutine
+				return
+			default:
+			}
 			if _, err := w.Write(buf); err != nil {
 				return
 			}
@@ -218,17 +228,22 @@ func registerRoutes(mux *http.ServeMux) {
 	})
 
 	// Zip bomb: a gzip stream of zeros (the decompression must be bounded
-	// by the limit).
+	// by the limit). The same stop-when-gone as /huge (no Content-Length
+	// here — the stream is truly endless until the client is gone); Close
+	// flushes the buffered gzip stream on every exit.
 	mux.HandleFunc("/zipbomb", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Encoding", "gzip")
 		w.WriteHeader(http.StatusOK)
 		zw := gzip.NewWriter(w)
+		defer func() { _ = zw.Close() }() // flush the buffered stream on every exit
 		buf := make([]byte, 64*1024)
-		if _, err := zw.Write(buf); err != nil {
-			return
-		}
 		for {
+			select {
+			case <-r.Context().Done(): // the client is gone — we do not hold the goroutine
+				return
+			default:
+			}
 			if _, err := zw.Write(buf); err != nil {
 				return
 			}

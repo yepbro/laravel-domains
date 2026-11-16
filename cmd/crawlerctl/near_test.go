@@ -211,6 +211,36 @@ func TestNearFetchErrors(t *testing.T) {
 	})
 }
 
+// TestNearCountDomains — unique domains among the findings: the domain
+// PK is the pair (zone_id, domain_id), and the selection is ordered by
+// score DESC — one domain's findings (subdomain × variant) interleave
+// with others', so a counter of DomainID changes overcounts and the
+// DomainID alone merges the same id of different zones (17#P2-2).
+func TestNearCountDomains(t *testing.T) {
+	t.Run("one domain's findings are interleaved", func(t *testing.T) {
+		rows := []nearRow{
+			{ZoneID: 3, DomainID: 11, Score: 0.55},
+			{ZoneID: 3, DomainID: 12, Score: 0.50},
+			{ZoneID: 3, DomainID: 11, Score: 0.45}, // the same domain, a weaker finding
+		}
+		if got := nearCountDomains(rows); got != 2 {
+			t.Fatalf("domains = %d, want 2 (a change counter over the score order gives 3)", got)
+		}
+	})
+	t.Run("the same domain id in different zones", func(t *testing.T) {
+		rows := []nearRow{
+			{ZoneID: 3, DomainID: 11, Score: 0.55},
+			{ZoneID: 5, DomainID: 11, Score: 0.50},
+		}
+		if got := nearCountDomains(rows); got != 2 {
+			t.Fatalf("domains = %d, want 2 (the PK is zone_id+domain_id, an id alone merges zones)", got)
+		}
+	})
+	if got := nearCountDomains(nil); got != 0 {
+		t.Errorf("domains of an empty selection = %d, want 0", got)
+	}
+}
+
 // TestNearPrintRow — the output format: domain, subdomain/variant, score,
 // versions, signals with evidence; an empty label — the apex.
 func TestNearPrintRow(t *testing.T) {

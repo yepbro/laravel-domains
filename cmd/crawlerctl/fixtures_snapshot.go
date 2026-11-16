@@ -118,10 +118,16 @@ type fixturesSnapshotRow struct {
 	// (findingDeleteSQL removes it), not "not finished": the detection
 	// diff treats it as is_laravel=false (review T-244 P1-1).
 	// The row's RulesVersion guarantees freshness.
-	LaravelFound        bool    `json:"laravel_found"`
-	IsLaravel           bool    `json:"is_laravel"`                      // laravel_findings.is_laravel (when found)
-	Score               float32 `json:"score"`                           // the findings' score (when found)
-	FindingRulesVersion *int32  `json:"finding_rules_version,omitempty"` // the findings' rule version (when found)
+	LaravelFound bool    `json:"laravel_found"`
+	IsLaravel    bool    `json:"is_laravel"` // laravel_findings.is_laravel (when found)
+	Score        float32 `json:"score"`      // the findings' score (when found)
+	// FindingRulesVersion — the findings' rule version (when found). Kept
+	// in format v1 for snapshot inspection; the report's cross-check uses
+	// the ROW stamp above: a findings stamp exists only where a finding
+	// was written, so over it a zero-findings candidate looks like "the
+	// rules changed" (17#P1-1). Both stamps carry one analyzer
+	// transaction's version.
+	FindingRulesVersion *int32 `json:"finding_rules_version,omitempty"`
 }
 
 // fixturesSnapshotDump — the dump manifest's digest for cross-checking a
@@ -424,7 +430,15 @@ func fixturesParsePromMetrics(data []byte) ([]fixturesPromSample, error) {
 			labels = parsed
 			rest = line[end+1:]
 		} else {
-			name = strings.Fields(line)[0] // a label-less sample: the name is the line's first token
+			// A whitespace-only line is not a sample: strings.Fields of it
+			// is empty and indexing it panicked (17#P2-3) — the tool reads
+			// an arbitrary --metrics URL, a broken exposition must not
+			// crash the snapshot.
+			fields := strings.Fields(line)
+			if len(fields) == 0 {
+				continue
+			}
+			name = fields[0] // a label-less sample: the name is the line's first token
 			rest = strings.TrimPrefix(strings.TrimSpace(line), name)
 		}
 		// The value is the first token after the name/labels; an

@@ -86,6 +86,24 @@ func TestFixturesParsePromMetrics(t *testing.T) {
 	}
 }
 
+// TestFixturesParsePromMetricsWhitespace — a whitespace-only line is not
+// a sample and must not panic (17#P2-3): the filter before the branch
+// skips only empty and '#' lines, and strings.Fields of such a line is
+// empty; the tool reads an arbitrary --metrics URL, a broken exposition
+// must not crash the snapshot.
+func TestFixturesParsePromMetricsWhitespace(t *testing.T) {
+	samples, err := fixturesParsePromMetrics([]byte("metric_a 1\n   \t\nmetric_b{stage=\"render\"} 2\n  \r\n"))
+	if err != nil {
+		t.Fatalf("parsing with whitespace-only lines: %v", err)
+	}
+	if len(samples) != 2 || samples[0].Name != "metric_a" || samples[1].Name != "metric_b" {
+		t.Fatalf("samples = %+v, want metric_a and metric_b only", samples)
+	}
+	if samples, err := fixturesParsePromMetrics([]byte("   \r\n")); err != nil || len(samples) != 0 {
+		t.Fatalf("a whitespace-only body = (%+v, %v), want no samples and no error", samples, err)
+	}
+}
+
 // TestFixturesMetricsFromSamples — stage instrument collection: samples
 // of foreign stages are filtered, the reason dictionaries are collected,
 // the buckets are sorted.

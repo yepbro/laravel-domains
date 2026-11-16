@@ -137,10 +137,13 @@ func TestFixturesReportDetectionDegradations(t *testing.T) {
 			t.Fatalf("the detection verdict = %+v, want NO DATA", v)
 		}
 	})
-	t.Run("finding_rules_version diverged", func(t *testing.T) {
+	t.Run("rules_version diverged", func(t *testing.T) {
 		other := int32(9)
 		b := snapOf("chromium-1", "chromium", snapRows(10, nil))
 		c := snapOf("moli-1", "moli", snapRows(10, func(i int, r *fixturesSnapshotRow) {
+			// a run with another rule set: both stamps change (one analyzer
+			// transaction stamps the row and the findings)
+			r.RulesVersion = &other
 			r.FindingRulesVersion = &other
 		}))
 		r, err := fixturesReportBuild(b, c, fixturesDefaultMemoryBudget)
@@ -175,6 +178,33 @@ func TestFixturesReportDetectionDegradations(t *testing.T) {
 		}
 		if v := verdictOf(t, r, "detection"); v == nil || v.Status != verdictFail {
 			t.Fatalf("the detection verdict = %+v, want FAILED (10%%)", v)
+		}
+	})
+	t.Run("the loss of ALL findings is a fail, not a rules change", func(t *testing.T) {
+		b := snapOf("chromium-1", "chromium", snapRows(100, nil))
+		c := snapOf("moli-1", "moli", snapRows(100, func(i int, r *fixturesSnapshotRow) {
+			// the analyzer passed over every DOM (the row stamp is set) but
+			// wrote not a single finding — the very regression the canary
+			// exists for; it must not masquerade as "the rules changed"
+			r.LaravelFound = false
+			r.IsLaravel = false
+			r.FindingRulesVersion = nil
+		}))
+		r, err := fixturesReportBuild(b, c, fixturesDefaultMemoryBudget)
+		if err != nil {
+			t.Fatalf("the report: %v", err)
+		}
+		if r.DetectionComparable != 100 || r.DetectionDiff != 100 || r.DetectionRatePct != 100 {
+			t.Fatalf("comparable %d, divergences %d (%.2f%%) — want 100/100 (100%%)", r.DetectionComparable, r.DetectionDiff, r.DetectionRatePct)
+		}
+		if v := verdictOf(t, r, "detection"); v == nil || v.Status != verdictFail {
+			t.Fatalf("the detection verdict = %+v, want FAILED (a full detection loss)", v)
+		}
+		if !r.Fail {
+			t.Fatalf("report.Fail = false, want true — --fail-exit must catch a full detection loss (17#P1-1)")
+		}
+		if joined := strings.Join(r.Warnings, "\n"); strings.Contains(joined, "rule versions diverge") {
+			t.Errorf("a full findings loss is reported as a rules divergence:\n%s", joined)
 		}
 	})
 }
@@ -365,6 +395,41 @@ func TestFixturesReportMemoryAndCrashes(t *testing.T) {
 		}
 		if v := verdictOf(t, r, "memory"); v == nil || v.Status != verdictFail {
 			t.Fatalf("the memory verdict = %+v, want FAILED (800 MiB ≥ ⅓×2 GiB)", v)
+		}
+	})
+	t.Run("a giant RSS does not overflow into PASSED", func(t *testing.T) {
+		// 3×RSS crosses 2^64 exactly here (3×6148914691236517206 =
+		// 2^64+2): the wrapped product is read as 2 — smaller than any
+		// budget — and flipped the verdict to PASSED (17#P3-4).
+		for _, rss := range []int64{6148914691236517206, math.MaxInt64} {
+			r, err := fixturesReportBuild(b, newSnap("moli-1", &rss, nil, nil), 2<<30)
+			if err != nil {
+				t.Fatalf("the report: %v", err)
+			}
+			if v := verdictOf(t, r, "memory"); v == nil || v.Status != verdictFail {
+				t.Fatalf("the memory verdict for RSS=%d = %+v, want FAILED (RSS*3 wraps int64)", rss, v)
+			}
+		}
+	})
+	t.Run("the exact ⅓ boundary", func(t *testing.T) {
+		// budget 2 GiB = 2147483648: 3×715827882 < budget <= 3×715827883 —
+		// the comparison must be exact, not shifted by the division
+		// (review P3-2).
+		rss := int64(715827882)
+		r, err := fixturesReportBuild(b, newSnap("moli-1", &rss, nil, nil), 2<<30)
+		if err != nil {
+			t.Fatalf("the report: %v", err)
+		}
+		if v := verdictOf(t, r, "memory"); v == nil || v.Status != verdictPass {
+			t.Fatalf("the memory verdict at 715827882 = %+v, want PASSED (3×RSS < budget)", v)
+		}
+		rss = 715827883
+		r, err = fixturesReportBuild(b, newSnap("moli-1", &rss, nil, nil), 2<<30)
+		if err != nil {
+			t.Fatalf("the report: %v", err)
+		}
+		if v := verdictOf(t, r, "memory"); v == nil || v.Status != verdictFail {
+			t.Fatalf("the memory verdict at 715827883 = %+v, want FAILED (3×RSS ≥ budget)", v)
 		}
 	})
 	t.Run("memory not set", func(t *testing.T) {

@@ -332,11 +332,13 @@ the `/metrics` counters then equal exactly the run; a process shared by two
 snapshots is recognized by the report via `process_start_time_seconds`, and it degrades
 the counter-dependent verdicts with a warning (the success rate over the DB
 rows and the rate over the streams remain valid). The detection diff compares
-the verdicts of one rule set: diverging `rules_version` between
-runs is also an honest degradation of the detection threshold; a missing
-`laravel_findings` row is the normal "no findings" (the analyzer deletes it at
-zero matches), not a gap — the loss of the last signal is caught as a
-discrepancy. The comparable rows are those written by the run (content present) and
+the verdicts of one rule set: diverging `rules_version` between runs (compared
+by the `subdomain_results.rules_version` stamps of the comparable rows) is also
+an honest degradation of the detection threshold; a missing `laravel_findings`
+row is the normal "no findings" (the analyzer deletes it at zero matches), not
+a gap — the loss of the last signal, up to a complete loss of all findings on
+the selection, is caught as a discrepancy (FAILED), never masked as a rules
+change. The comparable rows are those written by the run (content present) and
 stamped by the analyzer (`subdomain_results.rules_version` not NULL:
 the render clears the stamp, the analyzer sets it after its pass over the DOM) —
 take the snapshot after the analyzer has finished, otherwise the tail is excluded from the diff.

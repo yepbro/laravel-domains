@@ -273,8 +273,16 @@ func fixturesKeysUnionMismatch(b, c map[fixturesKey]fixturesSnapshotRow) (onlyB,
 // analyzer DELETES the findings row at zero hits (findingDeleteSQL) — a
 // missing row is the normal "no signs", not "not finished"; otherwise a
 // full loss/appearance of signals would fall out of the diff (review
-// T-244 P1-1). The findings' rule versions are returned for a cross-
-// check: different rule sets make the <1% threshold incomparable.
+// T-244 P1-1). The rule versions for the cross-check (different rule
+// sets make the <1% threshold incomparable) are taken from the ROW
+// stamps, not the findings' ones: the row stamp is non-nil on every
+// comparable row (the gate above), while the findings' stamp exists
+// only where a finding was written — over the findings' stamps a
+// candidate that lost ALL detections would look like "the rules
+// changed" (an empty version set) instead of a 100% diff and would
+// slip past --fail-exit (17#P1-1). Both stamps are written by one
+// analyzer transaction with the same rule set version, so for the
+// cross-check they are equivalent.
 func fixturesDetection(b, c map[fixturesKey]fixturesSnapshotRow) (comparable, diff, foundB, foundC int, rulesB, rulesC map[int32]int) {
 	rulesB, rulesC = map[int32]int{}, map[int32]int{}
 	for k, rb := range b {
@@ -286,12 +294,8 @@ func fixturesDetection(b, c map[fixturesKey]fixturesSnapshotRow) (comparable, di
 			continue // not written by the run or not analyzed in it
 		}
 		comparable++
-		if rb.FindingRulesVersion != nil {
-			rulesB[*rb.FindingRulesVersion]++
-		}
-		if rc.FindingRulesVersion != nil {
-			rulesC[*rc.FindingRulesVersion]++
-		}
+		rulesB[*rb.RulesVersion]++
+		rulesC[*rc.RulesVersion]++
 		if rb.LaravelFound && rb.IsLaravel {
 			foundB++
 		}
@@ -484,6 +488,10 @@ func fixturesReportBuild(b, c *fixturesSnapshot, budget int64) (*fixturesReport,
 	r.DetectionFoundB = foundB
 	r.DetectionFoundC = foundC
 	r.DetectionRatePct = pct(diff, comparable)
+	// The version sets come from the comparable rows' stamps (non-nil by
+	// the fixturesDetection gate), so with comparable > 0 both sets are
+	// non-empty: a candidate that found nothing can not reach this branch
+	// as "an empty set = the rules changed" — it stays a 100% diff (fail).
 	rulesDiffer := len(rulesB) != len(rulesC)
 	if !rulesDiffer {
 		for v := range rulesB {
@@ -571,7 +579,13 @@ func fixturesReportVerdicts(r *fixturesReport, rulesDiffer bool) []fixturesRepor
 	case r.RSSC == nil:
 		out = append(out, fixturesReportVerdict{Name: "memory < ⅓ of the chromium budget",
 			Status: verdictNone, Detail: "the engine RSS is not set (--engine-rss-max at the candidate's snapshot)"})
-	case *r.RSSC*3 < r.Budget:
+	// Memory < ⅓ of the chromium budget. Compared without the
+	// multiplication: RSSC*3 wraps int64 on a giant snapshot value and
+	// reads as a small positive — flipping the verdict to PASSED
+	// (17#P3-4). x <= (budget-1)/3 is the exact integer form of
+	// 3x < budget for budget > 0 (the flag validates positivity; the
+	// subtraction cannot overflow).
+	case *r.RSSC <= (r.Budget-1)/3:
 		out = append(out, fixturesReportVerdict{Name: "memory < ⅓ of the chromium budget",
 			Status: verdictPass, Detail: fmt.Sprintf("%s < ⅓ of %s", fixturesFormatBytes(*r.RSSC), fixturesFormatBytes(r.Budget))})
 	default:

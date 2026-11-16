@@ -146,13 +146,8 @@ func cmdNear(args []string, stdout, stderr io.Writer) error {
 
 	out(stdout, "near: the gray zone [%.3f .. %.3f), zone: %s, findings: %d\n\n",
 		*minScore/2, *minScore, zoneDesc, len(rows))
-	domains := 0
-	prevDomain := int64(-1)
+	domains := nearCountDomains(rows)
 	for _, r := range rows {
-		if r.DomainID != prevDomain {
-			domains++
-			prevDomain = r.DomainID
-		}
 		nearPrintRow(stdout, r)
 	}
 	if len(rows) == 0 {
@@ -197,6 +192,28 @@ func nearFetch(ctx context.Context, pool db.DB, zoneID *int16, minScore float64)
 		return nil, err
 	}
 	return res, nil
+}
+
+// nearDomainKey — a domain's PK in the selection: the pair
+// (zone_id, domain_id) — the id alone merges domains of different zones
+// (recheck.go: the domains PK is zone_id+id).
+type nearDomainKey struct {
+	zone int16
+	id   int64
+}
+
+// nearCountDomains — unique domains among the findings. The selection is
+// ordered by score DESC (nearSelectSQL), so one domain's findings
+// (subdomain × variant) interleave with others': a counter of DomainID
+// changes overcounts, and the DomainID alone merges the same id of
+// different zones — a set of PK pairs does not depend on the order
+// (17#P2-2).
+func nearCountDomains(rows []nearRow) int {
+	seen := make(map[nearDomainKey]struct{}, len(rows))
+	for _, r := range rows {
+		seen[nearDomainKey{r.ZoneID, r.DomainID}] = struct{}{}
+	}
+	return len(seen)
 }
 
 // nearPrintRow — prints one finding: a domain line + signals with evidence
