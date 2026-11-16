@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"strings"
 	"sync"
@@ -219,10 +220,10 @@ type probeClaimRedis struct {
 	sets   int
 }
 
-func (f *probeClaimRedis) XAutoClaim(ctx context.Context, a *redis.XAutoClaimArgs) *redis.XAutoClaimCmd {
+func (f *probeClaimRedis) XAutoClaimWithDeleted(ctx context.Context, a *redis.XAutoClaimArgs) *redis.XAutoClaimWithDeletedCmd {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.fakeClaimRedis.XAutoClaim(ctx, a)
+	return f.fakeClaimRedis.XAutoClaimWithDeleted(ctx, a)
 }
 
 func (f *probeClaimRedis) XPendingExt(ctx context.Context, a *redis.XPendingExtArgs) *redis.XPendingExtCmd {
@@ -350,5 +351,82 @@ func TestRecoverLoopGatedByProbe(t *testing.T) {
 	}
 	if n := fake.claimCount(); n == 0 {
 		t.Error("the claim after the recovery not made")
+	}
+}
+
+// TestRecoverLoopWritableGateLatch (T-286, the 11#P3-1 review) — the
+// write gate logs on the TRANSITIONS, not on every tick: a long OOM
+// window (the Oct 22–23 incident lasted hours, DECISIONS.md D-003) at
+// the 30 s interval printed ~120 identical Warn lines per worker per
+// hour. The latch mirrors the readiness gate's readyPaused (T-283): one
+// Warn on entering the "Redis is not writable" state, one Info on
+// leaving it.
+func TestRecoverLoopWritableGateLatch(t *testing.T) {
+	fake := &probeClaimRedis{fakeClaimRedis: &fakeClaimRedis{
+		claimMsgs: []redis.XMessage{
+			{ID: "1718-0", Values: map[string]any{fieldData: `{"task_id":"t1"}`}},
+		},
+		pendRes: map[string][]redis.XPendingExt{
+			"1718-0": {{ID: "1718-0", RetryCount: 1}},
+		},
+	}}
+	fake.setProbeErr(oomErr)
+	q := NewRedisQueue(fake, RedisOptions{PublishRetryPause: time.Nanosecond})
+	r := NewReliab(fake, q, ReliabOptions{MinIdle: time.Minute})
+
+	var buf syncBuffer
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- RecoverLoop(ctx, r, func(_ context.Context, _ Delivery) error { return nil },
+			RecoverOptions{
+				Stream: StreamHTTP, Group: "http", Consumer: "recover-1",
+				Batch: 4, Interval: 40 * time.Millisecond,
+				Log: slog.New(slog.NewTextHandler(&buf, nil)),
+			})
+	}()
+
+	// The OOM window: several gate ticks pass — one pause Warn in the
+	// log, not one per tick. The ticks are awaited by polling the probe
+	// counter up to a deadline (a fixed sleep flakes on a loaded
+	// runner — the polling style of waitPendingIdle in the integration
+	// tests).
+	deadline := time.Now().Add(5 * time.Second)
+	for fake.setCount() < 3 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if n := fake.setCount(); n < 3 {
+		t.Fatalf("write probes %d, want ≥3 (few gate ticks passed — the test must see the storm window)", n)
+	}
+	if n := strings.Count(buf.String(), "not writable"); n != 1 {
+		t.Errorf("pause Warn entries over %d ticks: %d, want exactly 1 (transition logging)", fake.setCount(), n)
+	}
+
+	// Redis recovered: the claim resumes, the resumption is logged once.
+	fake.setProbeErr(nil)
+	deadline = time.Now().Add(5 * time.Second)
+	for fake.claimCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if n := fake.claimCount(); n == 0 {
+		t.Fatal("the claim did not resume after the write recovery")
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	for !strings.Contains(buf.String(), "writable — claims resume") && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if n := strings.Count(buf.String(), "writable — claims resume"); n != 1 {
+		t.Errorf("resumption Info entries: %d, want exactly 1", n)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("RecoverLoop: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("RecoverLoop did not stop on ctx cancel")
 	}
 }

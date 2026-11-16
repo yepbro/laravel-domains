@@ -843,12 +843,12 @@ type pacingClaimRedis struct {
 	count  int64 // the Count of the last XAUTOCLAIM (the batch from the options)
 }
 
-func (f *pacingClaimRedis) XAutoClaim(ctx context.Context, a *redis.XAutoClaimArgs) *redis.XAutoClaimCmd {
+func (f *pacingClaimRedis) XAutoClaimWithDeleted(ctx context.Context, a *redis.XAutoClaimArgs) *redis.XAutoClaimWithDeletedCmd {
 	f.mu.Lock()
 	f.nclaim++
 	f.count = a.Count
 	f.mu.Unlock()
-	return f.fakeClaimRedis.XAutoClaim(ctx, a)
+	return f.fakeClaimRedis.XAutoClaimWithDeleted(ctx, a)
 }
 
 func (f *pacingClaimRedis) claims() int {
@@ -870,7 +870,7 @@ func (f *pacingClaimRedis) batch() int64 {
 // one — drained without a pause (TestRecoverLoopDrainsFullBatch). The
 // loop is assembled manually, not by runRecoverLoop: the helper is
 // typed for *fakeClaimRedis, and observing the claims on the fly
-// requires overriding XAutoClaim (the pacing fake).
+// requires overriding XAutoClaimWithDeleted (the pacing fake).
 func TestRecoverLoopIntervalPaces(t *testing.T) {
 	fake := &pacingClaimRedis{fakeClaimRedis: fakeClaimRedis{
 		claimMsgs: []redis.XMessage{

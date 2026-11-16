@@ -212,12 +212,16 @@ func ProcessingAttempt(ctx context.Context, q Queue, group string, d Delivery, a
 
 // claimStreams — the go-redis window for returning stuck entries:
 // XAUTOCLAIM (the claim, Redis 6.2+) and XPENDING EXTENDED (the delivery
-// counter). *redis.Client (queue.NewClient) and *redis.ClusterClient
-// satisfy the interface; tests substitute a fake — go-redis has no
-// New*Result factories for these commands, the values are set by
-// SetVal/SetErr on stubbed commands.
+// counter). The claim goes through the WithDeleted variant: it sends the
+// same command but, unlike the plain XAutoClaim (whose parser discards
+// the third reply element), returns the ids of PEL entries truncated out
+// of the stream — the D4 recognition (Redis 7+; a Redis 6 reply has two
+// elements and the array is empty). *redis.Client (queue.NewClient) and
+// *redis.ClusterClient satisfy the interface; tests substitute a fake —
+// go-redis has no New*Result factories for these commands, the values
+// are set by SetVal/SetErr on stubbed commands.
 type claimStreams interface {
-	XAutoClaim(ctx context.Context, a *redis.XAutoClaimArgs) *redis.XAutoClaimCmd
+	XAutoClaimWithDeleted(ctx context.Context, a *redis.XAutoClaimArgs) *redis.XAutoClaimWithDeletedCmd
 	XPendingExt(ctx context.Context, a *redis.XPendingExtArgs) *redis.XPendingExtCmd
 }
 
@@ -288,6 +292,16 @@ type ReliabOptions struct {
 	// crawler_queue_dead_unidentified_total — unidentifiable entries;
 	// metrics.NewDeadUnidentifiedHook). nil — the move is silent.
 	OnBuryUnidentified func(stream string)
+	// OnTruncated — the hook of PEL entries truncated out of the stream
+	// by the MAXLEN policy while they hung unacknowledged (T-286, the D4
+	// terminal of the delivery automaton): XAUTOCLAIM (Redis 7+) reports
+	// their ids in the third reply element and itself deletes them from
+	// the PEL — the recovery by deliveries is impossible, the source of
+	// truth is PostgreSQL (spec 3.4: lease/re-check). Called once per
+	// claim pass with all the ids of the pass. A seam in the OnBury
+	// style (the queue package does not know about metrics). nil — the
+	// event is silent.
+	OnTruncated func(stream string, ids []string)
 }
 
 // Reliab — the return of stuck Redis Streams entries with an attempt
@@ -373,9 +387,20 @@ type Claimed struct {
 // filters the PEL by idle time, re-assigns the entries and returns the
 // walk cursor; XPENDING+XCLAIM would need two rounds with a race window
 // between the listing and the claim, and XCLAIM does not filter by idle
-// time. Additionally XAUTOCLAIM (Redis 7+) purges from the PEL the
-// entries already truncated by MAXLEN: such entries come with empty
-// values and are skipped.
+// time. The command goes through the WithDeleted variant (T-286): on
+// Redis 7+ the third element of the reply carries the ids of PEL entries
+// truncated out of the stream by MAXLEN — Redis itself deletes them from
+// the PEL (the D4 terminal, no recovery by deliveries: the source of
+// truth is PostgreSQL, spec 3.4), and the ids light the OnTruncated
+// hook; the plain XAutoClaim of go-redis discards that array. The
+// messages array on Redis 7+ carries only live entries: a live entry
+// with an empty or missing data field is NOT a truncated one — it is
+// classified like any other (the counter decides), returns into the work
+// with an empty payload and, the attempts exhausted, takes the T6
+// terminal (a synthetic unknown id: an empty body has no task_id).
+// Before T-286 such an entry was skipped by the claim as "truncated" —
+// an eternal PEL loop: no classification, no bury, no XACK, a claim +1
+// every RecoverLoop pass and a frozen trim point of the stream.
 //
 // The attempt counter is maintained by Redis itself — the entry's PEL
 // deliveries counter (the RetryCount field of the XPENDING EXTENDED
@@ -439,7 +464,7 @@ func (r *Reliab) Claim(ctx context.Context, stream, group, consumer string, minI
 	if start == "" {
 		start = "0-0"
 	}
-	msgs, next, err := r.rdb.XAutoClaim(ctx, &redis.XAutoClaimArgs{
+	msgs, next, truncated, err := r.rdb.XAutoClaimWithDeleted(ctx, &redis.XAutoClaimArgs{
 		Stream:   stream,
 		Group:    group,
 		Consumer: consumer,
@@ -452,6 +477,13 @@ func (r *Reliab) Claim(ctx context.Context, stream, group, consumer string, minI
 	}
 	if next == "" {
 		next = "0-0" // the PEL walk is finished — the next one from the beginning
+	}
+	// The truncated (D4): Redis 7+ has already deleted them from the PEL
+	// and reported the ids in the third reply element — nothing to
+	// classify or acknowledge, the hook marks the loss for deliveries
+	// (T-286).
+	if len(truncated) > 0 && r.opt.OnTruncated != nil {
+		r.opt.OnTruncated(stream, truncated)
 	}
 	// The counter classification survives the caller's ctx cancel
 	// (T-222, the P2-2 review): the XAUTOCLAIM above has already assigned
@@ -470,13 +502,12 @@ func (r *Reliab) Claim(ctx context.Context, stream, group, consumer string, minI
 	var unclassified []Delivery
 	var errs []error
 	for _, m := range msgs {
+		// A live entry with an empty or missing data field goes through
+		// the classification like any other (T-286): skipping it here was
+		// an eternal PEL loop — the entry never reached q:dead and froze
+		// the stream's trim point. Truncated entries do not arrive in
+		// msgs at all on Redis 7+ (the third reply element, OnTruncated).
 		d := Delivery{Stream: stream, ID: m.ID, Payload: payloadBytes(m.Values)}
-		if len(d.Payload) == 0 {
-			// The entry was truncated by MAXLEN while it hung in pending:
-			// the values are empty, XAUTOCLAIM has already purged it from
-			// the PEL — not processed.
-			continue
-		}
 		pending, err := r.rdb.XPendingExt(ctx, &redis.XPendingExtArgs{
 			Stream: stream,
 			Group:  group,
@@ -735,7 +766,10 @@ func (r *Reliab) ProcessAttempt(ctx context.Context, group string, d Delivery, a
 // from a body that does not parse as a stream message does not identify
 // the task's subject), the original entry is acknowledged — the entry
 // leaves the PEL, the triage stays manual (q:dead — quarantine). The
-// move is marked by the separate OnBuryUnidentified hook (the counter
+// same terminal takes a live entry with an empty body (an empty or
+// missing data field — T-286): an empty payload has no task_id either,
+// the Reason distinguishes the two cases for the triage. The move is
+// marked by the separate OnBuryUnidentified hook (the counter
 // crawler_queue_dead_unidentified_total): the death of a task and the
 // quarantine of an unidentifiable entry are different events. Entries
 // with a task_id are processed as before.
@@ -747,8 +781,17 @@ func (r *Reliab) bury(ctx context.Context, group string, d Delivery, attempts in
 	}
 	reason := fmt.Sprintf("attempt limit %d exhausted: %d deliveries without ack", r.opt.MaxAttempts, attempts)
 	if unidentified {
-		reason = fmt.Sprintf("entry outside package formats (no task_id), attempt limit %d exhausted: %d deliveries without ack",
-			r.opt.MaxAttempts, attempts)
+		// An empty body (no data field at all) is called out separately
+		// from a body without a task_id (T-286): the triage of the first
+		// looks for the writer of such an entry (a manual XADD, a writer
+		// bug), of the second — at the body itself.
+		if len(d.Payload) == 0 {
+			reason = fmt.Sprintf("entry without a data field (an empty body), attempt limit %d exhausted: %d deliveries without ack",
+				r.opt.MaxAttempts, attempts)
+		} else {
+			reason = fmt.Sprintf("entry outside package formats (no task_id), attempt limit %d exhausted: %d deliveries without ack",
+				r.opt.MaxAttempts, attempts)
+		}
 	}
 	dead := Dead{
 		TaskID:   taskID,

@@ -130,7 +130,12 @@ were published validly but keep failing in processing (see the typical
 causes below); messages outside the package formats (without
 `task_id`) also end up here — with the synthetic identifier
 `unknown:<stream>:<entry_id>` and without entity fields
-(T-260: before it they spun in pending in an endless claim loop), their
+(T-260: before it they spun in pending in an endless claim loop), as
+do live entries with an empty or missing `data` field (T-286: the
+claim used to skip them as "truncated", the same endless loop with a
+frozen stream trim point; the `reason` names the empty body
+separately — look for the writer of such an entry by `entry_id`, a
+manual XADD or a writer bug); their
 flow is counted by `crawler_queue_dead_unidentified_total`; mass growth
 is a symptom of a database outage, a stuck stage, or Redis OOM (§2.6).
 

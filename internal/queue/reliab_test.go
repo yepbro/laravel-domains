@@ -2,10 +2,11 @@
 // extends the redisq_test.go command window with the claimStreams
 // commands — XAUTOCLAIM and XPENDING EXTENDED. go-redis has no
 // New*Result factories for these commands, so the fake builds the
-// redis.NewXAutoClaimCmd/NewXPendingExtCmd commands and fills them with
-// SetVal/SetErr. Covered: the command arguments, the attempt counter,
-// the move to q:dead (the Dead format), the "processing → DB → XACK"
-// order. The real Redis semantics — the integration tests of T-032.
+// redis.NewXAutoClaimWithDeletedCmd/NewXPendingExtCmd commands and
+// fills them with SetVal/SetErr. Covered: the command arguments, the
+// attempt counter, the move to q:dead (the Dead format), the
+// "processing → DB → XACK" order. The real Redis semantics — the
+// integration tests of T-032.
 
 package queue
 
@@ -30,7 +31,11 @@ type fakeClaimRedis struct {
 	claims    []redis.XAutoClaimArgs
 	claimMsgs []redis.XMessage
 	claimNext string // the next-scan cursor from the answer
-	claimErr  error
+	// claimDeleted — the ids from the third reply element (Redis 7+, the
+	// D4 terminal): the PEL entries truncated out of the stream; the
+	// server has already deleted them from the PEL itself.
+	claimDeleted []string
+	claimErr     error
 
 	pends      []redis.XPendingExtArgs
 	pendRes    map[string][]redis.XPendingExt // the XPENDING answer by the Start identifier
@@ -54,7 +59,7 @@ type fakeClaimRedis struct {
 	doErr error
 }
 
-func (f *fakeClaimRedis) XAutoClaim(ctx context.Context, a *redis.XAutoClaimArgs) *redis.XAutoClaimCmd {
+func (f *fakeClaimRedis) XAutoClaimWithDeleted(ctx context.Context, a *redis.XAutoClaimArgs) *redis.XAutoClaimWithDeletedCmd {
 	f.claims = append(f.claims, *a)
 	msgs := f.claimMsgs
 	if f.claimErr == nil && len(msgs) > 0 {
@@ -68,8 +73,8 @@ func (f *fakeClaimRedis) XAutoClaim(ctx context.Context, a *redis.XAutoClaimArgs
 			f.claimMsgs = nil
 		}
 	}
-	cmd := redis.NewXAutoClaimCmd(ctx, "xautoclaim")
-	cmd.SetVal(msgs, f.claimNext)
+	cmd := redis.NewXAutoClaimWithDeletedCmd(ctx, "xautoclaim")
+	cmd.SetVal(msgs, f.claimNext, f.claimDeleted)
 	cmd.SetErr(f.claimErr)
 	return cmd
 }
@@ -607,22 +612,107 @@ func TestReliabClaimBoundary(t *testing.T) {
 	}
 }
 
-// TestReliabClaimSkips — entries without a body (truncated by MAXLEN —
-// XAUTOCLAIM has already purged them from the PEL) and entries that left
-// the PEL between the commands are not processed and are not moved to
-// q:dead.
-func TestReliabClaimSkips(t *testing.T) {
+// TestReliabClaimEmptyData (T-286, the 11#P1-1 review) — a live entry
+// with an empty or missing data field is classified as any other one:
+// with attempts left it returns into the work (an empty payload — the
+// handler will report a decode failure and leave it unacknowledged),
+// with the attempts exhausted it takes the terminal D2i branch (a
+// synthetic unknown id, like an entry without task_id, FR-6.1). Before
+// the fix such an entry was silently skipped by the claim: no XPENDING,
+// no bury, no XACK — an eternal PEL loop claiming it again every pass
+// (it never reached q:dead and froze the stream's trim point).
+func TestReliabClaimEmptyData(t *testing.T) {
+	truncatedCalls := 0 // OnTruncated must stay silent: the reply has no deleted ids
 	fake := &fakeClaimRedis{
 		claimMsgs: []redis.XMessage{
-			{ID: "1718-0"}, // truncated by MAXLEN: no values
-			{ID: "1719-0", Values: map[string]any{fieldData: `{"task_id":"t2"}`}},
+			{ID: "1-1", Values: map[string]any{"foo": "bar"}},  // no data field at all
+			{ID: "1-2", Values: map[string]any{fieldData: ""}}, // an empty data field
 		},
 		pendRes: map[string][]redis.XPendingExt{
-			// "1718-0" — XPENDING is not called at all (the body is empty)
+			"1-1": {{ID: "1-1", RetryCount: 2}}, // the last allowed — into the work
+			"1-2": {{ID: "1-2", RetryCount: 9}}, // exhausted — the terminal branch
+		},
+	}
+	got, unclassified, _, err := newTestReliab(fake, ReliabOptions{
+		OnTruncated: func(string, []string) { truncatedCalls++ },
+	}).Claim(
+		context.Background(), StreamHTTP, "http", "recover-1", time.Minute, 5, "0-0")
+	if err != nil {
+		t.Fatalf("Claim of empty-data entries: %v — an empty body is not a claim error", err)
+	}
+
+	// The classification runs for both: the counter read is what decides
+	// their fate (before the fix neither got an XPENDING call).
+	if len(fake.pends) != 2 {
+		t.Fatalf("XPENDING calls: %d, want 2 (an empty data field does not skip the classification)", len(fake.pends))
+	}
+	// An empty-data entry is not a truncated one: the third reply
+	// element is empty — OnTruncated stays silent — and the
+	// classification succeeds — unclassified does not appear (a live
+	// empty body classifies like any other: the counter needs no body).
+	if truncatedCalls != 0 {
+		t.Errorf("OnTruncated calls: %d, want 0 (no truncated ids in the reply)", truncatedCalls)
+	}
+	if len(unclassified) != 0 {
+		t.Errorf("unclassified of empty-data entries: %+v, want none", unclassified)
+	}
+
+	// The entry with attempts left returns into the work with an empty
+	// payload: Claim does not judge the body, the handler does.
+	want := []Claimed{{Delivery{Stream: StreamHTTP, ID: "1-1", Payload: nil}, 2}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Claim of an empty-data entry:\n got  %+v\n want %+v", got, want)
+	}
+
+	// The exhausted one — the D2i terminal: a Dead with the synthetic
+	// identifier and the empty-body reason, then the XACK.
+	if len(fake.adds) != 1 || fake.adds[0].Stream != StreamDead {
+		t.Fatalf("publications to q:dead: %+v, want one Dead", fake.adds)
+	}
+	data := fake.adds[0].Values.(map[string]any)[fieldData].([]byte)
+	dead, err := Decode[Dead](Delivery{Stream: StreamDead, ID: fake.adds[0].ID, Payload: data})
+	if err != nil {
+		t.Fatalf("the data field does not decode as Dead: %v\n%s", err, data)
+	}
+	wantDead := Dead{
+		TaskID:   "unknown:q:http:1-2",
+		Stream:   StreamHTTP,
+		EntryID:  "1-2",
+		Attempts: 9,
+		Reason:   "entry without a data field (an empty body), attempt limit 3 exhausted: 9 deliveries without ack",
+	}
+	if !reflect.DeepEqual(dead, wantDead) {
+		t.Errorf("the Dead of an empty-data entry:\n got  %+v\n want %+v", dead, wantDead)
+	}
+	if want := []ackCall{{StreamHTTP, "http", []string{"1-2"}}}; !reflect.DeepEqual(fake.acks, want) {
+		t.Errorf("XACK: %+v, want %+v (the entry must leave the PEL)", fake.acks, want)
+	}
+}
+
+// TestReliabClaimSkips — the D4 truncated entries (Redis 7+: the ids
+// arrive in the third reply element of XAUTOCLAIM, not in the messages —
+// the server has already deleted them from the PEL) and the entries that
+// left the PEL between the commands (T10) are not processed and are not
+// moved to q:dead; the truncation lights the OnTruncated hook (T-286).
+func TestReliabClaimSkips(t *testing.T) {
+	var truncatedStream string
+	var truncatedIDs []string
+	fake := &fakeClaimRedis{
+		claimMsgs: []redis.XMessage{
+			{ID: "1719-0", Values: map[string]any{fieldData: `{"task_id":"t2"}`}},
+		},
+		claimNext:    "1720-0",
+		claimDeleted: []string{"1717-0", "1718-0"}, // truncated by MAXLEN while pending
+		pendRes: map[string][]redis.XPendingExt{
 			"1719-0": nil, // the entry has already left the PEL — acknowledged by someone else
 		},
 	}
-	got, _, _, err := newTestReliab(fake, ReliabOptions{}).Claim(
+	r := newTestReliab(fake, ReliabOptions{
+		OnTruncated: func(stream string, ids []string) {
+			truncatedStream, truncatedIDs = stream, ids
+		},
+	})
+	got, _, next, err := r.Claim(
 		context.Background(), StreamHTTP, "http", "recover-1", time.Minute, 5, "0-0")
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
@@ -630,11 +720,29 @@ func TestReliabClaimSkips(t *testing.T) {
 	if got != nil {
 		t.Errorf("nothing to refund, got %+v", got)
 	}
+	if next != "1720-0" {
+		t.Errorf("the next scan cursor = %q, want %q (from the XAUTOCLAIM answer)", next, "1720-0")
+	}
+	// The truncated ids are only reported by the hook: no XPENDING for
+	// them (they are not in the PEL anymore), no publication, no XACK.
+	if truncatedStream != StreamHTTP || !reflect.DeepEqual(truncatedIDs, []string{"1717-0", "1718-0"}) {
+		t.Errorf("OnTruncated: %q %v, want %q [1717-0 1718-0]", truncatedStream, truncatedIDs, StreamHTTP)
+	}
 	if len(fake.pends) != 1 || fake.pends[0].Start != "1719-0" {
-		t.Errorf("XPENDING must ask about the entry with a body only: %+v", fake.pends)
+		t.Errorf("XPENDING must ask about the live message entry only: %+v", fake.pends)
 	}
 	if len(fake.adds) != 0 || len(fake.acks) != 0 {
 		t.Errorf("skips are not published or acknowledged: %+v %+v", fake.adds, fake.acks)
+	}
+
+	// Without the hook the truncation is silent (the OnBury nil style).
+	fake = &fakeClaimRedis{claimDeleted: []string{"1717-0"}}
+	if _, _, _, err := newTestReliab(fake, ReliabOptions{}).Claim(
+		context.Background(), StreamHTTP, "http", "recover-1", time.Minute, 5, "0-0"); err != nil {
+		t.Fatalf("Claim without the hook: %v", err)
+	}
+	if len(fake.pends) != 0 || len(fake.adds) != 0 || len(fake.acks) != 0 {
+		t.Errorf("a nil hook must not change the command behavior: %+v %+v %+v", fake.pends, fake.adds, fake.acks)
 	}
 }
 

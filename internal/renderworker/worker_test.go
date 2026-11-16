@@ -2220,9 +2220,9 @@ func (f *rwProbeRedis) setProbeErr(err error) {
 	f.mu.Unlock()
 }
 
-func (f *rwProbeRedis) XAutoClaim(ctx context.Context, a *redis.XAutoClaimArgs) *redis.XAutoClaimCmd {
-	cmd := redis.NewXAutoClaimCmd(ctx, "xautoclaim")
-	cmd.SetVal(nil, "0-0")
+func (f *rwProbeRedis) XAutoClaimWithDeleted(ctx context.Context, a *redis.XAutoClaimArgs) *redis.XAutoClaimWithDeletedCmd {
+	cmd := redis.NewXAutoClaimWithDeletedCmd(ctx, "xautoclaim")
+	cmd.SetVal(nil, "0-0", nil)
 	return cmd
 }
 

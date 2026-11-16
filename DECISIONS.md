@@ -446,6 +446,63 @@ Manager: открепление живой генерации взводит е�
 shutdown не считается ошибкой движка ни в stage error counter, ни в
 стрике гейта фолбэка.
 
+### D-030 — T-286: пустое data в PEL — терминал через исчерпание попыток, D4 — по третьему элементу XAUTOCLAIM
+Дата: 2026-11-16.
+Проблема: находка 11#P1-1 bulk-ревью — Claim skip'ал любую запись с
+пустым Payload как «усечённую MAXLEN'ом», но на проде (Redis 7.0.x)
+усечённые записи вообще не приходят в msgs XAUTOCLAIM: сервер сам
+удаляет их из PEL и отдаёт ID третьим элементом ответа, который go-redis
+XAutoClaim молча выбрасывает (проверено по исходнику v9.23,
+XAutoClaimCmd.readReply → rd.DiscardNext()). Итог: живая запись с
+пустым/отсутствующим data крутилась в PEL вечно — без XPENDING, без
+bury, без XACK, +1 attempt каждые claim_min_idle, не достигая q:dead
+(нарушение FR-6.1/T-260) и замораживая trim point потока (trim.go:
+p.Lower). Спека предлагала две альтернативы терминала: bury (D2i)
+либо unclassified+refund.
+Решение: (1) терминал — ЧЕРЕЗ ИСЧЕРПАНИЕ ПОПЫТОК (новый переход T11 →
+T6), как для записей без task_id, а не мгновенный bury и не
+unclassified+refund: refund-вариант вечен (XPENDING-классификация
+успешна и с пустым телом — для чтения счётчика тело не нужно, откат
+попытки = запись никогда не достигает предела), мгновенный bury ломал
+бы симметрию с T-260 (запись без task_id тоже доезжает до D2i штатными
+попытками) и потребовал бы различать «первый клейм» от повторных.
+Пустая запись просто перестаёт скипаться: штатная классификация → в
+работу (хендлер упадёт на Decode — как и на no-task_id телах) →
+attempts > max → D2i bury; taskIDOf(empty)="" — тот же синтетический
+unknown id. (2) Различение состояний — по конструкции:
+XAutoClaimWithDeleted (та же команда на проводе, go-redis парсит
+третий элемент) — усечённые приходят ТОЛЬКО третьим массивом (D4), в
+msgs — только живые записи; третий массив зажигает новый хук
+ReliabOptions.OnTruncated(stream, ids) в стиле OnBury (метрика не
+заводилась — P3-идея в бэклог). (3) bury различает reason: «entry
+without a data field (an empty body)» vs «entry outside package
+formats (no task_id)» — разный triage (искать писателя записи vs
+смотреть тело). Redis 6.2 (не деплоится: прод 7.0.x — docs/redis.md,
+dev/testbed 7.4.11) терминала D4 не даёт: ответ из двух элементов, а
+запись без тела приходит в messages RESP-null-заглушкой, которую
+go-redis не парсит (readXMessage → ReadArrayLen → ошибка «can't parse
+array/set/push reply») — клейм падает целиком, запись остаётся в PEL
+(проверено по исходникам Redis 6.2.0 t_stream.c и go-redis v9.23;
+уточнение ревью T-286, P3-1 — прежняя формулировка «nil values →
+T11 → T6» была неверна).
+Интеграционный сценарий TestResilience_DeadEmptyData добавлен, но в
+worktree не гоняется (test-integration запрещён) — к прогону в
+основном дереве.
+Флейк вне области задачи (T-286 её не трогает): первый прогон make
+test-race упал на TestRequeueRenderPendingZoneCycle (httpworker,
+тайминг render_pending-долга); повторный полный прогон и -count=3 —
+зелёные, регресса нет (в диффе httpworker — только переименование
+метода тестового фейка).
+Ссылки: T-286; находка 11#P1-1 (tmp/review/stage-report.md),
+T-260/FR-6.1 (образец терминала), T-152 (write-gate; защёлка
+writablePaused — P3-1 той же стадии), T-283 (образец защёлки
+readyPaused); internal/queue/reliab.go (Claim/bury),
+internal/queue/deliverystate.go (T9/T11, I6),
+internal/queue/recover.go (writablePaused), docs/redis.md §4.3,
+docs/runbooks.md §2; тесты: internal/queue/reliab_test.go
+(TestReliabClaimEmptyData, TestReliabClaimSkips),
+internal/queue/infra_test.go (TestRecoverLoopWritableGateLatch),
+test/integration/resilience_test.go (TestResilience_DeadEmptyData).
 ### D-031 — «D7-гонка» ApplyDelete недостижима: пара разделена как защитная
 Дата: 2026-11-16.
 Проблема: находка 01#P1-1 первого bulk-ревью утверждала, что конкурентная

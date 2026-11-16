@@ -295,10 +295,15 @@ func RecoverLoopAttempt(ctx context.Context, r *Reliab, process func(context.Con
 
 	ticker := time.NewTicker(o.Interval)
 	defer ticker.Stop()
-	// readyPaused — the readiness gate's latch for transition logging
-	// (T-283): the pause is logged once on entering the gate, the
-	// resumption — once on leaving it, not on every skipped tick.
+	// readyPaused, writablePaused — the readiness and write gates' latches
+	// for transition logging (T-283/T-286): the pause is logged once on
+	// entering the gate, the resumption — once on leaving it, not on
+	// every skipped tick (a long outage must not spam the log — the
+	// readiness gate of T-283 was born with this rule; the write gate
+	// logged on every tick before T-286: ~120 identical Warn per worker
+	// per hour of an OOM window, DECISIONS.md D-003).
 	readyPaused := false
+	writablePaused := false
 	for {
 		// Cancellation between passes (including right after the tail
 		// refund of a full batch above) — a clean exit without a write
@@ -334,15 +339,24 @@ func RecoverLoopAttempt(ctx context.Context, r *Reliab, process func(context.Con
 		// The write gate (T-152): while Redis rejects entries, the claim
 		// is skipped — delivery attempts are not spent. The probe is one
 		// SET (Reliab.Writable); if the probe is unsupported the gate is
-		// transparent (true — the pre-T-152 behavior).
+		// transparent (true — the pre-T-152 behavior). The logging is by
+		// the transitions (the writablePaused latch), like the readiness
+		// gate above — not on every tick (T-286).
 		if !r.Writable(ctx) {
-			log.Warn("stalled delivery recovery: Redis is not writable (OOM/connection) — claim skipped, delivery attempts are not spent (T-152)")
+			if !writablePaused {
+				writablePaused = true
+				log.Warn("stalled delivery recovery: Redis is not writable (OOM/connection) — claim skipped, delivery attempts are not spent (T-152)")
+			}
 			select {
 			case <-ctx.Done():
 				return nil
 			case <-ticker.C:
 			}
 			continue
+		}
+		if writablePaused {
+			writablePaused = false
+			log.Info("stalled delivery recovery: Redis is writable — claims resume (T-152)")
 		}
 		if n := claim(); n < o.Batch {
 			// Nothing to drain — wait for a tick (a full batch — the

@@ -2129,7 +2129,7 @@ func TestRun_WindowShutdown(t *testing.T) {
 	}
 }
 
-// anClaimGate is a fake claimStreams (Reliab, T-025): XAutoClaim
+// anClaimGate is a fake claimStreams (Reliab, T-025): XAutoClaimWithDeleted
 // parks on the gate until the test releases it, then answers with an
 // empty batch; XPendingExt is not called (no records). The entered
 // signal marks the RecoverLoop entering the first claim.
@@ -2142,15 +2142,15 @@ func newANClaimGate() *anClaimGate {
 	return &anClaimGate{entered: make(chan struct{}), gate: make(chan struct{})}
 }
 
-func (g *anClaimGate) XAutoClaim(ctx context.Context, a *redis.XAutoClaimArgs) *redis.XAutoClaimCmd {
+func (g *anClaimGate) XAutoClaimWithDeleted(ctx context.Context, a *redis.XAutoClaimArgs) *redis.XAutoClaimWithDeletedCmd {
 	select {
 	case <-g.entered:
 	default:
 		close(g.entered)
 	}
 	<-g.gate
-	cmd := redis.NewXAutoClaimCmd(ctx, "xautoclaim")
-	cmd.SetVal(nil, "0-0")
+	cmd := redis.NewXAutoClaimWithDeletedCmd(ctx, "xautoclaim")
+	cmd.SetVal(nil, "0-0", nil)
 	return cmd
 }
 

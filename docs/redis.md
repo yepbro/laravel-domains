@@ -367,6 +367,29 @@ semantics — `TestResilience_DeadUnidentifiedNoTaskID`. The specification
 of the entry delivery state machine (states/transitions/invariants) —
 `internal/queue/deliverystate.go`.
 
+The same terminal now takes a live entry with an **empty or missing `data`
+field** (T-286, the bulk review 11#P1-1): the claim used to silently skip
+such entries reading them as “truncated by MAXLEN” — no XPENDING
+classification, no bury, no XACK: an eternal PEL loop (a claim +1 every
+`RecoverLoop` pass, `redis.claim_min_idle` each) that never reached
+`q:dead` and froze the stream's trim point (`trim.go` — the oldest
+pending entry holds the XTRIM MINID boundary, the acknowledged prefix
+stopped being released). The premise itself was wrong: on Redis 7+
+(§3, the production 7.0.x) a truncated PEL entry does not arrive in the
+XAUTOCLAIM messages at all — the server deletes it from the PEL itself
+and reports its id in the **third reply element** (go-redis:
+`XAutoClaimWithDeleted`; the plain `XAutoClaim` parser discards that
+array — the loss-of-deliveries event is surfaced by the
+`ReliabOptions.OnTruncated` hook). A live entry's empty values therefore
+mean a writer bypassing the packet contract (a manual XADD, a writer
+bug): the entry is classified as any other one (the counter read does
+not need the body), returns into the work with an empty payload, and the
+attempts exhausted — the T6 terminal with the synthetic id; the `reason`
+names the empty body separately (`entry without a data field (an empty
+body)`) for the triage. The live semantics —
+`TestResilience_DeadEmptyData`, the unit counterpart —
+`TestReliabClaimEmptyData`.
+
 ## 5. Persistence: why it is disabled
 
 `save ""` + `appendonly no` — as in dev. The arguments:

@@ -78,12 +78,12 @@ type rwClaimSpy struct {
 	streams []string
 }
 
-func (f *rwClaimSpy) XAutoClaim(ctx context.Context, a *redis.XAutoClaimArgs) *redis.XAutoClaimCmd {
+func (f *rwClaimSpy) XAutoClaimWithDeleted(ctx context.Context, a *redis.XAutoClaimArgs) *redis.XAutoClaimWithDeletedCmd {
 	f.mu.Lock()
 	f.streams = append(f.streams, a.Stream)
 	f.mu.Unlock()
-	cmd := redis.NewXAutoClaimCmd(ctx, "xautoclaim")
-	cmd.SetVal(nil, "0-0")
+	cmd := redis.NewXAutoClaimWithDeletedCmd(ctx, "xautoclaim")
+	cmd.SetVal(nil, "0-0", nil)
 	return cmd
 }
 

@@ -715,6 +715,125 @@ func TestResilience_DeadUnidentifiedNoTaskID(t *testing.T) {
 	}
 }
 
+// TestResilience_DeadEmptyData — the terminal branch of a live record
+// with an empty or missing data field (T-286, FR-6.1, the 11#P1-1 bulk
+// review): before T-286 Claim silently skipped such records reading them
+// as "truncated by MAXLEN" — no XPENDING classification, no bury, no
+// XACK: an eternal PEL loop (a claim +1 every RecoverLoop pass) that
+// never reached q:dead and froze the stream's trim point (trim.go). On
+// Redis 7+ (docs/redis.md) truncated records do not arrive in the
+// XAUTOCLAIM messages at all — the server reports their ids in the third
+// reply element and deletes them from the PEL itself — so a live
+// record's empty values mean a broken writer, not a truncation. Now the
+// record is classified as any other one and, the attempts exhausted,
+// leaves the PEL into q:dead with the synthetic identifier
+// unknown:<stream>:<entry-id> (the live counterpart — the unit
+// TestReliabClaimEmptyData).
+func TestResilience_DeadEmptyData(t *testing.T) {
+	skipUnlessIntegration(t)
+	rdb := resilienceRedisEnv(t)
+	q := queue.NewRedisQueue(rdb, queue.RedisOptions{Block: 150 * time.Millisecond})
+	// MaxAttempts — the default 3; a small MinIdle: no need to wait 5
+	// minutes.
+	reliab := queue.NewReliab(rdb, q, queue.ReliabOptions{MinIdle: 20 * time.Millisecond})
+	ctx := context.Background()
+	const group = "resil-emptydata"
+
+	// Live records without a usable data field — published by a direct
+	// XADD bypassing the packet contract: one with no data field at all,
+	// one with an empty data field.
+	ids := make([]string, 2)
+	for i, values := range []map[string]any{
+		{"foo": "bar"}, // no data field
+		{"data": ""},   // an empty data field
+	} {
+		id, err := rdb.XAdd(ctx, &redis.XAddArgs{
+			Stream: queue.StreamHTTP,
+			Values: values,
+		}).Result()
+		if err != nil {
+			t.Fatalf("XADD of an empty-data record #%d: %v", i, err)
+		}
+		ids[i] = id
+	}
+	batch := consumeTasks(t, q, queue.StreamHTTP, group, "w1", 10)
+	if len(batch) != 2 {
+		t.Fatalf("%d records consumed, want 2 (%v)", len(batch), ids)
+	}
+
+	// Claims #1–#2 return both records to work (the counters 2 and 3 —
+	// the last allowed), no processing runs — they hang again; claim #3
+	// (the counters 4 > the limit 3) — the terminal branch.
+	for round, wantAttempts := range []int64{2, 3} {
+		waitPendingIdle(t, rdb, queue.StreamHTTP, group, 2, 20*time.Millisecond)
+		claimed, _, _, err := reliab.Claim(ctx, queue.StreamHTTP, group, "recover", 20*time.Millisecond, 10, "0-0")
+		if err != nil {
+			t.Fatalf("claim #%d: %v", round+1, err)
+		}
+		if len(claimed) != 2 || claimed[0].Attempts != int(wantAttempts) || claimed[1].Attempts != int(wantAttempts) {
+			t.Fatalf("claim #%d returned %+v, want both records with the attempt %d",
+				round+1, claimed, wantAttempts)
+		}
+	}
+	waitPendingIdle(t, rdb, queue.StreamHTTP, group, 2, 20*time.Millisecond)
+	if claimed, _, _, err := reliab.Claim(ctx, queue.StreamHTTP, group, "recover", 20*time.Millisecond, 10, "0-0"); err != nil {
+		t.Fatalf("claim #3: %v", err)
+	} else if len(claimed) != 0 {
+		t.Fatalf("claim #3 returned work %+v, want the terminal branch", claimed)
+	}
+
+	// Both records left the PEL (the claim loop is broken) and are
+	// visible in q:dead with the synthetic identifiers.
+	if n := pendingCount(t, rdb, queue.StreamHTTP, group); n != 0 {
+		t.Fatalf("the empty-data records did not leave pending: %d, want 0 (T-286)", n)
+	}
+	if n := streamLen(t, rdb, queue.StreamDead); n != 2 {
+		t.Fatalf("records in q:dead: %d, want 2", n)
+	}
+	deadMsgs := consumeTasks(t, q, queue.StreamDead, "resil-dead", "operator", 10)
+	if len(deadMsgs) != 2 {
+		t.Fatalf("read from q:dead: %d, want 2", len(deadMsgs))
+	}
+	// The Dead records must carry the published ids — the synthetic
+	// task_id alone is self-consistent by construction and would pass
+	// with a foreign entry_id too.
+	wantIDs := map[string]bool{ids[0]: true, ids[1]: true}
+	seen := make(map[string]bool, 2)
+	for _, d := range deadMsgs {
+		dead, err := queue.Decode[queue.Dead](d)
+		if err != nil {
+			t.Fatalf("decoding Dead: %v", err)
+		}
+		if !wantIDs[dead.EntryID] {
+			t.Errorf("Dead.entry_id = %q, want one of the published %v", dead.EntryID, ids)
+		}
+		if seen[dead.TaskID] {
+			t.Errorf("a duplicate Dead: %+v", dead)
+		}
+		seen[dead.TaskID] = true
+		want := "unknown:" + queue.StreamHTTP + ":" + dead.EntryID
+		if dead.TaskID != want {
+			t.Errorf("Dead.task_id = %q, want the synthetic %q", dead.TaskID, want)
+		}
+		if dead.Stream != queue.StreamHTTP {
+			t.Errorf("Dead.stream = %q, want %q", dead.Stream, queue.StreamHTTP)
+		}
+		if dead.Attempts != 4 {
+			t.Errorf("Dead.attempts = %d, want 4 (a delivery + 3 claims)", dead.Attempts)
+		}
+		if !strings.Contains(dead.Reason, "empty body") {
+			t.Errorf("Dead.reason = %q, want the empty-body branch for the triage (T-286)", dead.Reason)
+		}
+		// No subject fields: there is no body to extract them from.
+		if dead.ZoneID != 0 || dead.DomainID != 0 || dead.Name != "" || dead.Domains != 0 {
+			t.Errorf("the Dead of an empty-data record carries the subject fields: %+v", dead)
+		}
+	}
+	if len(seen) != 2 {
+		t.Errorf("unique synthetic task_ids in q:dead: %d, want 2", len(seen))
+	}
+}
+
 // pendingFlakyRedis — a live Redis client with a counter read failure
 // injection: the first XPENDINGs over the given records fail (FR-6.2 —
 // a live Redis does not fail XPENDING by itself). Embedding
