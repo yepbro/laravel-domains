@@ -604,3 +604,56 @@ transaction, one snapshot — …SNAPSHOT OF THE CLOCK…»), чтобы нах�
 Ссылки: T-289; bulk-ревью 13#P2-2 (tmp/review/stage-report.md);
 PostgreSQL docs §9.9.5 (functions-datetime.html);
 internal/monitor/zonestats.go (комментарий шапки), ZoneStatsOnce.
+
+### D-036 — T-292: Put-ссылка живёт до коммита (кроме неоднозначного Commit), финализации растят stage error counter
+Дата: 2026-11-16.
+Проблема: две интерпретационные развилки фиксов bulk-ревью стадии 06.
+(1) 06#P2-1: `contents.Put` в ProcessResult всегда даёт +1 refcount;
+на всех путях ошибки между успешным Put и успешным tx.Commit ссылка
+утекала навсегда (строка оставалась со старым content_hash, повторная
+доставка делала новый Put — refcount 1,2,3…, retention/compaction не
+освобождали байты); комментарий «a re-delivery will rewrite it» был
+неверен. (2) 06#P3-1: комментарий processDelivery обещал, что
+labeled-финализации (cert/dns/tarpit/engineSkip) не попадают в счётчик
+ошибок, а код инкрементирует Error(ClassTask) явно; при этом ревью
+фикса (deepseek, P1-1) показало, что безусловный возврат ссылки НА
+пути ошибки Commit небезопасен: ошибка Commit ≠ откат — COMMIT мог
+примениться, пока клиент видел обрыв соединения/отмену ctx; тогда
+строка уже владеет ссылкой, Delete уронил бы refcount до 0 под живой
+строкой (компакция освободила бы блок — потеря данных, запрещённое
+направление порядка операторов SwapRef, refcount.go/docs/content.md:
+«a space leak is better than data loss», T-044), а мёртвый хэш
+отравил бы следующие эпизоды домена ErrRefIntegrity (httpworker
+SwapRefTx по старым хэшам), без самолечения (dead-строку не оживляет
+ни dedup Put — newHash==oldHash пропускает Put, ни AddRef —
+WHERE refcount > 0).
+Решение: (1) ссылка возвращается отложенным releasePutRef (свой
+короткоживущий ctx + 5с, паттерн refund из internal/queue/recover.go,
+T-222) на всех путях ГАРАНТИРОВАННОГО отката — шаги транзакции,
+guard no-op (pgx.ErrNoRows), отмена ctx до Commit; единственное
+исключение — ОШИБКА Commit: флаг commitAttempted выставляется до
+вызова (паника внутри Commit тоже оставляет исход неизвестным), defer
+не освобождает ссылку — остаточный +1 за каждую неудачную попытку
+ограничен бюджетом попыток доставки (a space leak is better than data
+loss). Альтернатива из ревью — read-back selectTarget — отклонена:
+обыный SELECT на другом соединении не ждёт блокировок
+недокоммиченной транзакции (MVCC) и в окне применения COMMIT видит
+старый хэш → освобождение как раз теряло бы живую ссылку; airtight
+вариант потребовал бы FOR UPDATE read-back — сложность, не
+оправданная редчайшим путём. (2) инкременты Error(ClassTask) в ветвях
+cert/dns/tarpit/task ОСТАЮТСЯ (финализация = неудачный render: DOM
+нет, запись идёт с сырым HTML HTTP-фазы; оператор должен видеть это в
+stage error counter; поведение зафиксировано тестами), engineSkip —
+единственное исключение (навигации не было, T-285); комментарий
+processDelivery и docs/services.md синхронизированы с фактической
+моделью, включая оговорку о retryable-падениях до порога финализации.
+Обоснования зафиксированы комментариями в worker.go (ProcessResult,
+releasePutRef) и контрактом в docs/content.md, чтобы находки не
+воспроизводились в следующих ревью.
+Ссылки: T-292; bulk-ревью 06#P2-1, 06#P3-1 (tmp/review/stage-report.md);
+ревью фикса tmp/review/29-t292.md (P1-1, P2-1, P3-1, P3-2);
+internal/renderworker/worker.go (ProcessResult, releasePutRef,
+processDelivery), worker_test.go; internal/content/refcount.go
+(порядок операторов, ErrRefIntegrity), pack.go (sqlMetaAddRef,
+dead-строки); docs/content.md, docs/services.md; spec 3.4, T-044,
+T-222, T-285.

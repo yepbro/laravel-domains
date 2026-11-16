@@ -428,6 +428,21 @@ Peculiarities versus the HTTP stage's writing:
   domain recheck (T-030/T-058) that rewrote the result cuts off a
   content substitution of a foreign episode — the `Put` reference is
   removed by `Delete`, the delivery is acknowledged;
+- the `Put` reference lives exactly until the transaction commits
+  (T-292): any failure between the `Put` and the `Commit` — the
+  transaction steps, the optimistic guard's no-op, a cancelled ctx —
+  releases it by a deferred `Delete` on its own short-lived context
+  (the delivery one can already be dead); otherwise the refcount would
+  grow +1 with every failing re-delivery (the row keeps the old
+  `content_hash`, the re-delivery calls `Put` again) and would never
+  let the content reach `refcount = 0` — retention/compaction could
+  not free the bytes. An ERRORED `Commit` is the one exception: its
+  outcome is ambiguous (the `COMMIT` may have been applied while the
+  client saw a broken connection or a cancelled ctx), so the reference
+  is kept on that path — releasing it could drop the `refcount` to 0
+  under the live row (data loss, the forbidden direction of the swap
+  order above); the residual +1 per failed attempt is bounded by the
+  delivery attempt budget — a space leak is better than data loss;
 - an alias row (the class's content is stored at the original, T-055)
   receives **its own** reference after the render: the profiles are
   isolated, every page's DOM is its own thing (the equivalence class

@@ -1317,8 +1317,43 @@ func TestRenderWorker_PutError(t *testing.T) {
 	}
 }
 
+// TestRenderWorker_BeginError — a Begin failure after a successful Put:
+// an error without a transaction, the Put reference released (T-292) — the
+// row keeps the old content_hash, a re-delivery would call Put again
+// (+1 more), so an unreleased reference is not rewritten by anyone: the
+// refcount would grow with every failing delivery and block retention
+// (the content is freed only at refcount <= 0, P2-1 of the bulk review).
+func TestRenderWorker_BeginError(t *testing.T) {
+	f := newRWFixture(t)
+	raw := rwTestHash(1)
+	f.pool.seedRow(rwKey, "https://spa.example/", &raw)
+	dom := "<html>begin fails</html>"
+	f.renderer.output = rwOutput(dom)
+	f.pool.beginErr = errors.New("no free connections")
+
+	written, err := f.w.ProcessResult(context.Background(), rwTask)
+	if err == nil {
+		t.Fatal("a Begin error must be returned")
+	}
+	if written {
+		t.Error("written must be false")
+	}
+	refc := rwRefc(f.pool)
+	domHash := content.HashOf([]byte(dom))
+	if refc[domHash] != 0 || refc[raw] != 1 {
+		t.Errorf("the refcount after the Begin failure: dom=%d raw=%d, want 0/1 (the Put reference released)",
+			refc[domHash], refc[raw])
+	}
+	if deletes := f.store.deletesSnapshot(); len(deletes) != 1 || deletes[0] != domHash {
+		t.Errorf("Delete: %+v, one %s needed", deletes, domHash)
+	}
+}
+
 // TestRenderWorker_UpdateError — an UPDATE failure: a transaction rollback, the
-// Put reference stays as a leak on the safe side (T-044).
+// Put reference released by the deferred Delete (T-292) — the leak of the
+// former "a Put does not roll back — a safe side" (T-044) is not rewritten
+// by a re-delivery (the row keeps the old content_hash), so the reference
+// must not survive the failed path.
 func TestRenderWorker_UpdateError(t *testing.T) {
 	f := newRWFixture(t)
 	raw := rwTestHash(1)
@@ -1339,9 +1374,12 @@ func TestRenderWorker_UpdateError(t *testing.T) {
 	}
 	refc := rwRefc(f.pool)
 	domHash := content.HashOf([]byte(dom))
-	if refc[domHash] != 1 || refc[raw] != 1 {
-		t.Errorf("the refcount after the rollback: dom=%d raw=%d, want 1/1 (a Put does not roll back — a safe leak)",
+	if refc[domHash] != 0 || refc[raw] != 1 {
+		t.Errorf("the refcount after the rollback: dom=%d raw=%d, want 0/1 (the Put reference released, T-292)",
 			refc[domHash], refc[raw])
+	}
+	if deletes := f.store.deletesSnapshot(); len(deletes) != 1 || deletes[0] != domHash {
+		t.Errorf("Delete: %+v, one %s needed", deletes, domHash)
 	}
 }
 
@@ -1352,7 +1390,8 @@ func TestRenderWorker_SwapIntegrity(t *testing.T) {
 	raw := rwTestHash(1)
 	f.pool.seedRow(rwKey, "https://spa.example/", &raw)
 	f.pool.refc[raw] = 0 // the reference is dead — the accounting diverged
-	f.renderer.output = rwOutput("<html>dom</html>")
+	dom := "<html>dom</html>"
+	f.renderer.output = rwOutput(dom)
 
 	_, err := f.w.ProcessResult(context.Background(), rwTask)
 	if err == nil || !errors.Is(err, content.ErrRefIntegrity) {
@@ -1361,15 +1400,68 @@ func TestRenderWorker_SwapIntegrity(t *testing.T) {
 	if rwRowSnapshot(f.pool, rwKey).rendered {
 		t.Error("the row did not change (the ErrRefIntegrity rollback)")
 	}
+	// T-292: the Put reference is released on this path too — the failed
+	// swap rolls the transaction back, the row keeps the old content.
+	refc := rwRefc(f.pool)
+	domHash := content.HashOf([]byte(dom))
+	if refc[domHash] != 0 {
+		t.Errorf("the DOM refcount = %d, 0 needed (the Put reference released, T-292)", refc[domHash])
+	}
+	if deletes := f.store.deletesSnapshot(); len(deletes) != 1 || deletes[0] != domHash {
+		t.Errorf("Delete: %+v, one %s needed", deletes, domHash)
+	}
+}
+
+// TestRenderWorker_BumpError — a failure of the rate-bucket increment inside
+// the open transaction (renderBumpRenderedCounter, T-203): a rollback and the
+// Put reference released (T-292) — the release must not depend on which step
+// of the transaction failed: the swap's −1 to the old content is rolled back
+// together with the row, the Put's +1 is returned by the deferred Delete.
+func TestRenderWorker_BumpError(t *testing.T) {
+	f := newRWFixture(t)
+	raw := rwTestHash(1)
+	f.pool.seedRow(rwKey, "https://spa.example/", &raw)
+	dom := "<html>bump fails</html>"
+	f.renderer.output = rwOutput(dom)
+	f.pool.bumpErr = errors.New("the bucket upsert failed")
+
+	written, err := f.w.ProcessResult(context.Background(), rwTask)
+	if err == nil {
+		t.Fatal("a bump error must be returned")
+	}
+	if written {
+		t.Error("written must be false")
+	}
+	if rwRowSnapshot(f.pool, rwKey).rendered {
+		t.Error("the row did not change (the rollback)")
+	}
+	refc := rwRefc(f.pool)
+	domHash := content.HashOf([]byte(dom))
+	if refc[domHash] != 0 || refc[raw] != 1 {
+		t.Errorf("the refcount after the bump failure: dom=%d raw=%d, want 0/1 (the rollback returned the old reference, the Put one is released)",
+			refc[domHash], refc[raw])
+	}
+	if deletes := f.store.deletesSnapshot(); len(deletes) != 1 || deletes[0] != domHash {
+		t.Errorf("Delete: %+v, one %s needed", deletes, domHash)
+	}
 }
 
 // TestRenderWorker_CommitError — a commit failure: an error, the row did not
-// change, the Put reference — a leak on the safe side.
+// change, and the Put reference is KEPT (T-292 review, P1-1): an errored
+// Commit is ambiguous — the COMMIT may have been applied while the client
+// saw a broken connection ("the server closed the connection" below is
+// exactly that shape). If it landed, the row already owns the reference and
+// a Delete could drop the refcount to 0 under the live row — data loss, the
+// forbidden direction of the content swap (T-044, spec 3.4). The +1 stays:
+// a space leak is better than data loss; every step error BEFORE the Commit
+// means a guaranteed rollback — there the deferred release stands (see
+// UpdateError/BumpError/CtxCancelledRefRelease).
 func TestRenderWorker_CommitError(t *testing.T) {
 	f := newRWFixture(t)
 	raw := rwTestHash(1)
 	f.pool.seedRow(rwKey, "https://spa.example/", &raw)
-	f.renderer.output = rwOutput("<html>dom</html>")
+	dom := "<html>dom</html>"
+	f.renderer.output = rwOutput(dom)
 	f.pool.commitErr = errors.New("the server closed the connection")
 
 	written, err := f.w.ProcessResult(context.Background(), rwTask)
@@ -1385,6 +1477,51 @@ func TestRenderWorker_CommitError(t *testing.T) {
 	if pubs := f.q.publishesSnapshot(); len(pubs) != 0 {
 		t.Errorf("there must be no publication after the Commit: %+v", pubs)
 	}
+	refc := rwRefc(f.pool)
+	domHash := content.HashOf([]byte(dom))
+	if refc[domHash] != 1 || refc[raw] != 1 {
+		t.Errorf("the refcount after the Commit failure: dom=%d raw=%d, want 1/1 (the errored Commit is ambiguous — the reference is kept, the safe side of T-044)",
+			refc[domHash], refc[raw])
+	}
+	if deletes := f.store.deletesSnapshot(); len(deletes) != 0 {
+		t.Errorf("Delete: %+v, none needed — an errored Commit may have landed, the row may own the reference", deletes)
+	}
+}
+
+// TestRenderWorker_CtxCancelledRefRelease — the delivery ctx dies between the
+// Put and the Commit (a shutdown, a deadline): the error return must still
+// release the reference — the deferred release runs on its own short-lived
+// context, not on the cancelled delivery one (the recover.go refund pattern,
+// T-222/T-292); on the delivery ctx the Delete would fail with the same
+// cancellation and the reference would stay +1.
+func TestRenderWorker_CtxCancelledRefRelease(t *testing.T) {
+	f := newRWFixture(t)
+	raw := rwTestHash(1)
+	f.pool.seedRow(rwKey, "https://spa.example/", &raw)
+	dom := "<html>ctx dies mid-transaction</html>"
+	f.renderer.output = rwOutput(dom)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// The cancellation lands inside the open transaction (after the Put):
+	// the next step — SwapRefTx — answers with the ctx error.
+	f.pool.mutateBeforeUpdate = func(*rwFakePool) { cancel() }
+
+	_, err := f.w.ProcessResult(ctx, rwTask)
+	if err == nil {
+		t.Fatal("a cancelled ctx must surface as an error")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("the cancellation must be the error: %v", err)
+	}
+	refc := rwRefc(f.pool)
+	domHash := content.HashOf([]byte(dom))
+	if refc[domHash] != 0 || refc[raw] != 1 {
+		t.Errorf("the refcount after the cancellation: dom=%d raw=%d, want 0/1 (the release on a live context, T-292)",
+			refc[domHash], refc[raw])
+	}
+	if deletes := f.store.deletesSnapshot(); len(deletes) != 1 || deletes[0] != domHash {
+		t.Errorf("Delete: %+v, one %s needed (a fresh context, not the cancelled delivery one)", deletes, domHash)
+	}
 }
 
 // TestRenderWorker_PublishError — a q:analyze publication failure with
@@ -1392,11 +1529,15 @@ func TestRenderWorker_CommitError(t *testing.T) {
 // of the task, the row is not processed entirely (the T-225 contract); the delivery
 // will return with a re-delivery and publish again (at-least-once,
 // spec 3.4). The fact of the written DOM is visible in the row (the Commit before the publication).
+// The committed row owns the reference: refcount dom=1 (raw=0 — the swap
+// committed), no Delete — the deferred release must never fire after a
+// successful Commit (T-292).
 func TestRenderWorker_PublishError(t *testing.T) {
 	f := newRWFixture(t)
 	raw := rwTestHash(1)
 	f.pool.seedRow(rwKey, "https://spa.example/", &raw)
-	f.renderer.output = rwOutput("<html>dom</html>")
+	dom := "<html>dom</html>"
+	f.renderer.output = rwOutput(dom)
 	f.q.publishErrs = []error{errors.New("redis unavailable")}
 
 	written, err := f.w.ProcessResult(context.Background(), rwTask)
@@ -1408,6 +1549,15 @@ func TestRenderWorker_PublishError(t *testing.T) {
 	}
 	if !rwRowSnapshot(f.pool, rwKey).rendered {
 		t.Error("the row was written (the Commit precedes the publication)")
+	}
+	refc := rwRefc(f.pool)
+	domHash := content.HashOf([]byte(dom))
+	if refc[domHash] != 1 || refc[raw] != 0 {
+		t.Errorf("the refcount after the publication failure: dom=%d raw=%d, want 1/0 (the committed row owns the reference)",
+			refc[domHash], refc[raw])
+	}
+	if deletes := f.store.deletesSnapshot(); len(deletes) != 0 {
+		t.Errorf("Delete: %+v, none needed — the reference of the committed row must not be released", deletes)
 	}
 }
 

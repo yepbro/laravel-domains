@@ -550,6 +550,15 @@ const (
 	// browser (the httpworker.DefaultErrorWait style): idle circles do not
 	// heat the logs, unacknowledged deliveries will be returned by XAUTOCLAIM (T-025).
 	DefaultErrorWait = 30 * time.Second
+
+	// putRefReleaseTimeout — the budget of the deferred release of the Put
+	// reference on the guaranteed-rollback paths of the content replacement
+	// (T-292): the release runs on its own short-lived context — by the moment
+	// of an error return the delivery ctx can already be cancelled (a shutdown,
+	// a deadline), and the reference must not depend on the delivery's state
+	// (the refund budget style of internal/queue/recover.go, T-222). One
+	// Delete statement: 5 s is enough with a margin.
+	putRefReleaseTimeout = 5 * time.Second
 )
 
 // Options — the worker's parameters; zero values are replaced by defaults
@@ -1534,10 +1543,45 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 	// ErrTooLarge — a permanent page property (the DOM is bloated by JS): the delivery
 	// attempts will be exhausted and the task will go to q:dead for manual
 	// triage (T-025) — a signal to the operator to raise content.max_store_bytes.
+	//
+	// The Put reference (+1) must live exactly until the commit. Every return
+	// before the Commit — a step failure (cookies/headers, Begin, the UPDATE,
+	// SwapRefTx, the buckets) or the guard's no-op below — means a GUARANTEED
+	// rollback and leaves the row with the OLD content_hash: a re-delivery
+	// sees hasOld=true, newHash != oldHash and calls Put AGAIN, so nobody
+	// rewrites the leaked reference — the refcount would only grow (1, 2, 3 …)
+	// and the content would never reach refcount <= 0, retention/compaction
+	// could not free the bytes (P2-1 of the 2026-11-16 bulk review, T-292;
+	// the former comment "a re-delivery will rewrite it" was wrong). On all
+	// these paths the deferred releasePutRef returns the reference (the
+	// guard's no-op branch included); registered BEFORE the deferred Rollback,
+	// so it runs AFTER it — the transaction is already closed; a panic between
+	// the Put and the Commit unwinds through it too.
+	//
+	// The ONE exception is an ERRORED Commit (commitAttempted below): its
+	// outcome is ambiguous — the COMMIT may have been applied while the
+	// client saw a broken connection or a cancelled ctx. If it landed, the
+	// row already owns the reference, and releasing it could drop the
+	// refcount to 0 under the LIVE row — the forbidden direction of the
+	// content swap ("a space leak is better than data loss", refcount.go,
+	// T-044): compaction would free the block the row points to. On that
+	// path the reference is kept — a bounded +1 per failed attempt (the
+	// attempt budget caps the growth).
+	var committed bool
+	var commitAttempted bool
 	if !hasOld || newHash != oldHash {
 		if _, err := w.contents.Put(ctx, dom); err != nil {
 			return false, fmt.Errorf("renderworker: %s: DOM saving: %w", name, err)
 		}
+		defer func() {
+			if committed {
+				return // the row owns the reference now
+			}
+			if commitAttempted {
+				return // an errored Commit is ambiguous: the row may own it already — keep (T-292)
+			}
+			w.releasePutRef(name, newHash)
+		}()
 	}
 	cookies, err := renderCookiesJSON(out.Cookies)
 	if err != nil {
@@ -1567,18 +1611,14 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 		if errors.Is(err, pgx.ErrNoRows) {
 			// The optimistic guard: the row's content changed after the read
 			// (the domain recheck rewrote the result T-058, a concurrent
-			// delivery has already written its DOM) — the row is not ours, the transaction
-			// is rolled back by the deferred Rollback. The Put reference is removed: without
-			// a row it would hang as a space leak (the content lives while there are
-			// references; Delete removes exactly the one Put added). A removal error is
-			// not a task error: a Warn, the delivery is acknowledged.
-			_ = tx.Rollback(ctx)
-			if !hasOld || newHash != oldHash {
-				if err := w.contents.Delete(ctx, newHash); err != nil && !errors.Is(err, content.ErrNotFound) {
-					w.opt.log().Warn("render: the content reference was not released (the row slipped out from under the task)",
-						"domain", name, "hash", newHash.String(), "err", err)
-				}
-			}
+			// delivery has already written its DOM) — the row is not ours; the
+			// transaction is rolled back by the deferred Rollback. The Put
+			// reference is returned by the deferred releasePutRef above (the
+			// single return point of the reference, T-292): without a row it
+			// would hang as a space leak (the content lives while there are
+			// references; Delete removes exactly the one Put added). A removal
+			// error is not a task error: a Warn inside releasePutRef, the
+			// delivery is acknowledged.
 			w.opt.log().Debug("render not written — the row was rewritten by another episode",
 				"domain", name, "zone_id", task.ZoneID, "domain_id", task.DomainID,
 				"subdomain_id", task.SubdomainID, "variant", int16(task.Variant))
@@ -1613,11 +1653,28 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 	if err := renderBumpRenderedCounter(ctx, tx, checkedAt); err != nil {
 		return false, fmt.Errorf("renderworker: %s: %w", name, err)
 	}
+	// The flag rises BEFORE the call: a panic inside Commit leaves the
+	// outcome just as unknown — the deferred release must not fire either.
+	commitAttempted = true
 	if err := tx.Commit(ctx); err != nil {
-		// The rollback will return the row; the +1 from Put will remain a space leak —
-		// the safe side (T-044), a re-delivery will rewrite it.
+		// Unlike every step above, an errored Commit does NOT guarantee the
+		// replacement rolled back: the COMMIT may have been applied while
+		// the client saw a broken connection or a cancelled ctx (an in-doubt
+		// transaction — the classic outcome of "the server closed the
+		// connection" at this point). If it landed, the row already owns the
+		// reference; releasing it could drop the refcount to 0 under the
+		// live row — compaction would free the block the row points to
+		// (data loss, the opposite of the swap's statement order, T-044/
+		// spec 3.4), and the dead hash would poison the domain's next
+		// episodes with ErrRefIntegrity (httpworker's SwapRefTx over the
+		// old hashes). The reference is kept instead (the deferred release
+		// is off, T-292): a bounded +1 leak per failed attempt — a space
+		// leak is better than data loss. When the Commit truly did not
+		// land, the row keeps the old content_hash and a re-delivery calls
+		// Put again — that rare +1 is the price of the safe side.
 		return false, fmt.Errorf("renderworker: %s: content replacement: commit: %w", name, err)
 	}
+	committed = true
 
 	// The q:analyze publication after the write (§7): the Result points at the row —
 	// it must exist by the moment the analyzer consumes it in the new
@@ -1643,6 +1700,26 @@ func (w *Worker) ProcessResult(ctx context.Context, task queue.Result) (bool, er
 		"domain", name, "final_url", out.FinalURL, "dom_bytes", len(out.DOM),
 		"cookies", len(out.Cookies))
 	return true, nil
+}
+
+// releasePutRef returns the content reference taken by the Put of ProcessResult
+// (T-292): it is called on the guaranteed-rollback paths — a step failure
+// between the Put and the Commit or the optimistic guard's no-op. An ERRORED
+// Commit is deliberately not among them: its outcome is ambiguous (the COMMIT
+// may have been applied), so the reference is kept there — see ProcessResult.
+// The context is separate and short-lived: by the moment of the call
+// the delivery ctx can already be cancelled (a shutdown, a deadline) — the
+// reference must not depend on the delivery's state (the refund pattern of
+// internal/queue/recover.go, T-222). ErrNotFound is tolerated (the reference is already
+// gone); a real removal failure is an operator's Warn — the refcount stays +1
+// and retention will not free the bytes until the store is repaired.
+func (w *Worker) releasePutRef(name string, h content.Hash) {
+	ctx, cancel := context.WithTimeout(context.Background(), putRefReleaseTimeout)
+	defer cancel()
+	if err := w.contents.Delete(ctx, h); err != nil && !errors.Is(err, content.ErrNotFound) {
+		w.opt.log().Warn("render: the content reference was not released (the content replacement did not commit)",
+			"domain", name, "hash", h.String(), "err", err)
+	}
 }
 
 // renderBumpReanalyzeCounter — an increment of the unanalyzed
@@ -2278,10 +2355,23 @@ func (w *Worker) tarpitsExhausted(ctx context.Context, task queue.Result, del qu
 // A successful processing goes into the stage metrics (T-077): the task counter and
 // the duration, processed=true — the entry processed entirely (the DOM written
 // and q:analyze published, T-225); an error — into the
-// render class counter (the delivery will return with a re-delivery, spec 3.4;
-// the labeled finalization classes — cert/dns/tarpit/engineSkip — do not get
-// here: they are acknowledged below instead, the first branch of the ladder),
-// a finalization without a render — into crawler_render_tarpit_finalized_total /
+// render class counter (the delivery will return with a re-delivery, spec 3.4).
+// The labeled finalization classes — cert/dns/tarpit/task — do not reach the
+// final catch-all of the ladder below WHEN they are acknowledged (finalized)
+// in their own branches, and are counted as errors there explicitly
+// (Error(ClassTask)) — a finalization is still a failed render (no DOM, the
+// entry continues with the raw HTML of the HTTP phase), the operator must
+// see it in the stage error counter, not only in the finalize counters
+// (T-292 — the former comment promised the opposite of what the code did).
+// Before the finalization threshold — a tarpit error with attempts left
+// (tarpitsExhausted == false) or a task-class error below MaxAttempts — the
+// error is a retryable failure and falls through to the catch-all, with the
+// same type="task" on the counter (ClassOf of a page-timeout/load error is
+// ClassTask), so the metric model is unaffected either way. engineSkip is
+// the only labeled class outside the error counter: no navigation happened
+// at all — a routing decision of the skip-list (T-285), the Task/finalize
+// counters count it.
+// A finalization without a render — into crawler_render_tarpit_finalized_total /
 // crawler_render_cert_finalized_total /
 // crawler_render_dns_finalized_total /
 // crawler_render_task_finalized_total{reason} (including reason=engine-skip —
