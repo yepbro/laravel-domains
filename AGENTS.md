@@ -25,7 +25,14 @@ todoist-todo-section: 6j2hGJxpF336Gqvw
 todoist-processing-section: 6j2hGM2X7rpjFr8P
 todoist-done-section: 6j2hGJwXCRgQXGFw
 todoist-archive-section: 6j2hGM2JW7J42HpP
+task-id-project: yepbro/laravel-domains
 ```
+
+`task-id-project` — канонический идентификатор проекта для task-id-mcp
+(выдача номеров `T-NNN`/`D-NNN`): строго это значение из git remote,
+не имя каталога и не производные (прецедент: дивергенция счётчиков
+`laravel-domains` vs `yepbro/laravel-domains`, 2026-11-16 — сиротские
+счётчики удалены, канон выровнен на t=286/d=28).
 
 Project refinements:
 
