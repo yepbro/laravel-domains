@@ -481,3 +481,40 @@ tmp/review/28-t288.md (приняты P3-1..P3-4, отвергнут P3-5 —
 cmd/crawlerctl/fixtures_report.go (fixturesDetection, вердикт
 памяти), fixtures_report_test.go; docs/dev-environment.md
 («detection diff»).
+### D-033 — T-289: находка 13#P2-2 отклонена — now()/current_date стабильны внутри транзакции, «один снимок» прохода уже гарантируется PostgreSQL
+Дата: 2026-11-16.
+Проблема: bulk-ревью стадии 13 (P2-2, internal/monitor/zonestats.go)
+утверждало, что «один снимок на проход фактически отсутствует»:
+now()/current_date вычисляются в каждом SQL отдельно, поэтому при
+проходе реконсиляции длиннее границы часа/полуночи корзины и агрегаты
+расходятся (ложный темп в status.throughputSQL, ложный дрейф gauge,
+разнос retry_mature/checks по датам). Предлагенный фикс — один
+SELECT now() в начале транзакции и передача timestamptz параметром во
+все операторы + перевод прохода в REPEATABLE READ.
+Решение: находка отклонена — посылка фактически неверна. В PostgreSQL
+CURRENT_DATE, CURRENT_TIMESTAMP и now() возвращают время НАЧАЛА
+текущей транзакции и «their values do not change during the
+transaction» (док PG §9.9.5, функция transaction_timestamp; проверено
+живьём на dev-postgres проекта 16.15-alpine: now(), current_date и
+date_trunc('hour', now()) идентичны во всех операторах одной
+транзакции при pg_sleep(3) между ними). Весь проход ZoneStatsOnce
+выполняется в одной транзакции pool.Begin() — каждое имя корзины
+(to_char(current_date…), to_char(date_trunc('hour', now())…)) и каждое
+FILTER-окно во всех ~32 операторах прохода вычисляется в одну и ту же
+границу; пересечение часовой границы/полуночи в середине прохода не
+может развести корзины и агрегаты. Предложенный фикс передавал бы
+ровно то же значение — поведенческий no-op ценой перенумерации
+параметров ~20 констант SQL. REPEATABLE READ консистентности часов не
+добавляет (она уже есть), а данные даёт только ценой абортов
+сериализации: проход перезаписывает те же строки crawler_counters, в
+которые постоянно пишут инкременты record.go — «could not serialize
+access» на горячих строках, регресс против несуществующего дефекта.
+Послепроходная согласованность читателей (status.throughputSQL читает
+две живые корзины по СВОЕМУ now()) — это документированная модель
+двух живых корзин T-203/T-204, а не внутрипроходное расхождение.
+Обоснование зафиксировано комментарием в шапке zonestats.go («One
+transaction, one snapshot — …SNAPSHOT OF THE CLOCK…»), чтобы находка
+не воспроизводилась в следующих ревью.
+Ссылки: T-289; bulk-ревью 13#P2-2 (tmp/review/stage-report.md);
+PostgreSQL docs §9.9.5 (functions-datetime.html);
+internal/monitor/zonestats.go (комментарий шапки), ZoneStatsOnce.

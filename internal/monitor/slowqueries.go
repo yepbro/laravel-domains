@@ -30,8 +30,12 @@
 // (a re-execution — a new value); a finished statement that disappeared
 // from the snapshot leaves the debounce base: the map holds only
 // currently running ones (dozens of records at most — the connection
-// limit is 50). A source failure does not drop the base: returning a
-// snapshot does not re-report what has not finished.
+// limit is 50). The replacement of the base with the pass snapshot is
+// correct exactly because the snapshot is COMPLETE (no LIMIT — the
+// slowQuerySQL comment): a key missing from it has really finished; a
+// truncated top would re-report displaced statements as "new" (the
+// bulk review 13#P2-1). A source failure does not drop the base:
+// returning a snapshot does not re-report what has not finished.
 //
 // The monitor's own passes are excluded by the pool's application_name
 // ("monitor", internal/service): the reconciliation — an UPDATE
@@ -71,9 +75,15 @@ const DefaultSlowQueryInterval = 10 * time.Second
 // server log and in Telegram.
 const DefaultSlowQueryMinDuration = 3 * time.Second
 
-// slowQueryLimit — the row cap of one snapshot (max_connections = 50 —
-// there are never more; the limit guards against a bloated message).
-const slowQueryLimit = 20
+// The snapshot has NO row cap (the bulk review 13#P2-1 removed the
+// former LIMIT 20): the debounce replaces its base with the pass
+// snapshot (seen = cur in SlowQueryLoop), which is correct only for a
+// COMPLETE set of the in-flight statements — a truncated top displaced
+// and re-admitted statements as "new" (duplicate messages, an inflated
+// crawler_pg_slow_queries_total) and missed the ones running outside
+// the top. The rows are bounded by max_connections (50 client backends
+// in production, 130 on the dev compose), the message is capped by
+// slowQueryTopLines alone.
 
 // slowQueryTopLines — the number of query lines in the message: the
 // three longest, the tail — "…and N more". A lock convoy is visible by
@@ -111,11 +121,16 @@ func (q SlowQuery) key() string {
 	return strconv.Itoa(q.PID) + "@" + strconv.FormatInt(q.StartedAt.UnixNano(), 10)
 }
 
-// slowQuerySQL — a snapshot of the client statements running longer than
-// the threshold, the longest first. Its own PID is excluded (the poll
+// slowQuerySQL — a COMPLETE snapshot of the client statements running
+// longer than the threshold, the longest first (the debounce base
+// requires the complete set of the in-flight statements — the comment
+// above the constants). Its own PID is excluded (the poll
 // itself is an active query);
 // $1 — the monitor pool's application_name (empty — the filter off),
-// $2 — the threshold in seconds, $3 — the row cap.
+// $2 — the threshold in seconds. The exclusion filter compares the
+// same COALESCE as the SELECT: a NULL application_name is a row
+// without a label (SlowQuery.App "", slowQueryAppUnknown), not a row
+// to drop silently (`application_name <> $1` is NULL for it).
 const slowQuerySQL = "SELECT pid, COALESCE(application_name, ''), " +
 	"EXTRACT(epoch FROM now() - query_start), query_start, COALESCE(query, '') " +
 	"FROM pg_stat_activity " +
@@ -123,10 +138,9 @@ const slowQuerySQL = "SELECT pid, COALESCE(application_name, ''), " +
 	"AND state = 'active' " +
 	"AND query_start IS NOT NULL " +
 	"AND pid <> pg_backend_pid() " +
-	"AND ($1 = '' OR application_name <> $1) " +
+	"AND ($1 = '' OR COALESCE(application_name, '') <> $1) " +
 	"AND EXTRACT(epoch FROM now() - query_start) > $2 " +
-	"ORDER BY now() - query_start DESC " +
-	"LIMIT $3"
+	"ORDER BY now() - query_start DESC"
 
 // SlowQuerySource is a slow queries source; an interface for
 // substitution in unit tests (the real read is pg_stat_activity of a
@@ -138,7 +152,10 @@ type SlowQuerySource interface {
 }
 
 // PGSlowQueries is a SlowQuerySource on top of the monitor DB pool: one
-// SELECT pg_stat_activity per pass.
+// SELECT pg_stat_activity per pass. The snapshot is complete — no row
+// cap: the rows are bounded by max_connections (50 client backends in
+// production; the debounce requires the complete set — the comment
+// above slowQueryTopLines).
 type PGSlowQueries struct {
 	// Pool is the DB pool; nil — a source error.
 	Pool db.DB
@@ -146,8 +163,6 @@ type PGSlowQueries struct {
 	// (its own aggregates are a routine load, not a pathology);
 	// "" — do not exclude.
 	ExcludeApp string
-	// Limit is the snapshot row cap (0 — slowQueryLimit).
-	Limit int
 }
 
 // compile-time: PGSlowQueries is a SlowQuerySource.
@@ -161,11 +176,7 @@ func (s PGSlowQueries) SlowQueries(ctx context.Context, longerThan time.Duration
 	if s.Pool == nil {
 		return nil, errors.New("monitor: slow queries: the pool is not set")
 	}
-	limit := s.Limit
-	if limit <= 0 {
-		limit = slowQueryLimit
-	}
-	rows, err := s.Pool.Query(ctx, slowQuerySQL, s.ExcludeApp, longerThan.Seconds(), limit)
+	rows, err := s.Pool.Query(ctx, slowQuerySQL, s.ExcludeApp, longerThan.Seconds())
 	if err != nil {
 		return nil, fmt.Errorf("monitor: slow queries: %w", err)
 	}

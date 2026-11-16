@@ -3,7 +3,8 @@
 // numeral agreement, the "…and more" tail), the pid+query_start
 // debounce (a new statement — one message, a continuing one — silence,
 // a finished one leaves the base, a new start of the same pid — a
-// message again, a source failure does not drop the base), disabling
+// message again, a source failure does not drop the base), the full
+// snapshot above the former cap of 20 rows (13#P2-1), disabling
 // by an interval of 0. A live pg_stat_activity is outside unit tests
 // (hermeticity, the load_test.go / zonestats_test.go style).
 package monitor
@@ -15,15 +16,22 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"crawler/internal/metrics"
 )
 
 // fakeSlowSource — a source with scheduled snapshots per pass (the
-// fakeLoadSource style); having exhausted the plan, it returns empty
-// snapshots. The counter is under a mutex: the loop goroutine writes
-// it, the test goroutine reads it (waitSlowPasses) — without the lock
-// it is a race under -race (T-190; the zonestatsFakePool style). The
-// passes/errs plan is filled before the loop starts and afterwards is
-// only read — it needs no lock.
+// fakeLoadSource style); having exhausted the plan, it repeats the
+// LAST snapshot (a live pg_stat_activity keeps showing the still
+// running statements — the trailing passes of a stopped test loop must
+// not overwrite the gauge with an artificial empty one; the fresh keys
+// of the repeated snapshot are already seen, so no more deliveries
+// appear and the message counts stay deterministic). The counter is
+// under a mutex: the loop goroutine writes it, the test goroutine
+// reads it (waitSlowPasses) — without the lock it is a race under
+// -race (T-190; the zonestatsFakePool style). The passes/errs plan is
+// filled before the loop starts and afterwards is only read — it
+// needs no lock.
 type fakeSlowSource struct {
 	mu     sync.Mutex
 	passes [][]SlowQuery
@@ -42,6 +50,9 @@ func (s *fakeSlowSource) SlowQueries(context.Context, time.Duration) ([]SlowQuer
 	if i < len(s.passes) {
 		return s.passes[i], nil
 	}
+	if len(s.passes) > 0 {
+		return s.passes[len(s.passes)-1], nil
+	}
 	return nil, nil
 }
 
@@ -59,12 +70,12 @@ func slowQueryAt(pid int, app string, sec float64, started time.Time, query stri
 
 // waitSlowPasses waits until the source returns at least n snapshots
 // (the TestZoneStatsLoopTicker style) and cancels the loop: after the
-// plan is exhausted the snapshots are empty — no more deliveries
-// appear, the message count checks are deterministic. The counter is
-// read through count() under the fake's mutex: the loop goroutine
-// writes it (a race under -race, T-190); the report itself (reports) is
-// read only after <-done — the channel provides happens-before for all
-// the loop deliveries.
+// plan is exhausted the snapshots repeat the last one — no more
+// deliveries appear (the keys are already seen), the message count
+// checks are deterministic. The counter is read through count() under
+// the fake's mutex: the loop goroutine writes it (a race under -race,
+// T-190); the report itself (reports) is read only after <-done — the
+// channel provides happens-before for all the loop deliveries.
 func waitSlowPasses(t *testing.T, src *fakeSlowSource, n int, cancel context.CancelFunc, done <-chan error) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
@@ -187,6 +198,78 @@ func TestSlowQueryLoop_FinishedEvicted(t *testing.T) {
 
 	if len(reports) != 2 {
 		t.Fatalf("messages = %d, want 2 (a new observation after completion)", len(reports))
+	}
+}
+
+// TestSlowQueryLoop_ManyQueries — the degradation scenario the loop
+// exists for, above the former snapshot cap of 20 rows (the bulk review
+// 13#P2-1: max_connections = 50, a DB degradation is exactly "more
+// than 20 slow statements at once"). The snapshot must be COMPLETE:
+// the debounce keys of all the in-flight statements are held (a
+// continuing statement — silence, no matter how deep below the top it
+// sits), the message is capped by slowQueryTopLines alone, and the
+// current gauge observes the full in-flight count.
+func TestSlowQueryLoop_ManyQueries(t *testing.T) {
+	t0 := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
+	const n = 25
+	// flying — `count` statements of pids from..from+count−1, the longest
+	// first: pid from+i started at t0+i seconds.
+	flying := func(from, count int) []SlowQuery {
+		out := make([]SlowQuery, 0, count)
+		for i := 0; i < count; i++ {
+			pid := from + i
+			out = append(out, slowQueryAt(pid, "http-worker", float64(60-i), t0.Add(time.Duration(i)*time.Second), "UPDATE …"))
+		}
+		return out
+	}
+	// Pass 1: 25 slow queries (pids 101..125). Pass 2: the same 25 —
+	// silence. Pass 3: the five longest finished (101..105), five new
+	// started (201..205) — 25 in flight, 5 events. The continuing ones
+	// keep their pid+query_start keys (a new execution — a new key);
+	// the snapshot is duration-desc, as the real one.
+	first := flying(101, n)
+	same := make([]SlowQuery, len(first))
+	copy(same, first)
+	churn := append(flying(201, 5), first[5:]...)
+
+	var reports []string
+	src := &fakeSlowSource{passes: [][]SlowQuery{first, same, churn}}
+	reg := metrics.New("monitor")
+	opts := SlowQueryOptions{
+		Interval: time.Millisecond,
+		Metrics:  reg,
+		Notify:   func(text string) { reports = append(reports, text) },
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- SlowQueryLoop(ctx, src, opts) }()
+	waitSlowPasses(t, src, len(src.passes), cancel, done)
+
+	if len(reports) != 2 {
+		t.Fatalf("messages = %d, want 2 (25 new ones, then silence for the continuing ones, then 5 new starts)", len(reports))
+	}
+	if !strings.Contains(reports[0], "25 slow queries (threshold 3s)") {
+		t.Errorf("the first message without the full count of 25:\n%s", reports[0])
+	}
+	if strings.Contains(reports[0], "total in flight") {
+		t.Errorf("all 25 are new — the \"total in flight\" addition is noise:\n%s", reports[0])
+	}
+	if n := strings.Count(reports[0], "pid "); n != slowQueryTopLines {
+		t.Errorf("the first message lines = %d, want %d (the slowQueryTopLines cap)", n, slowQueryTopLines)
+	}
+	if !strings.Contains(reports[0], "…and 22 more") {
+		t.Errorf("the first message without the \"…and 22 more\" tail:\n%s", reports[0])
+	}
+	if !strings.Contains(reports[1], "5 slow queries (threshold 3s), total in flight 25") {
+		t.Errorf("the third pass message without \"5 new, 25 in flight\":\n%s", reports[1])
+	}
+	// The current gauge — the full in-flight count of the last pass, not
+	// the capped one.
+	if v, ok := gaugeLabels(t, reg, "crawler_pg_slow_queries", nil); !ok || v != n {
+		t.Errorf("crawler_pg_slow_queries = (%v, %v), want %d (the full snapshot)", v, ok, n)
+	}
+	if v, ok := slowCounterValue(t, reg, "crawler_pg_slow_queries_total", map[string]string{"app": "http-worker"}); !ok || v != n+5 {
+		t.Errorf("crawler_pg_slow_queries_total{http-worker} = (%v, %v), want %d (25 + 5 new starts)", v, ok, n+5)
 	}
 }
 

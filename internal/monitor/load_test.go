@@ -21,6 +21,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"crawler/internal/metrics"
 	"crawler/internal/queue"
 )
 
@@ -181,6 +182,15 @@ func TestCPUDelta(t *testing.T) {
 	}
 	if _, _, _, _, ok := cpuDelta(cur, cur); ok {
 		t.Error("a zero delta is not \"n/a\"")
+	}
+	// A host restart between the passes — the counters fell (the T-289
+	// review, the TestLoadReportLoop_ProcRestart underflow class): the
+	// uint64 subtraction d = cur.Total − prev.Total underflows, the
+	// shares would be junk mod-2⁶⁴ arithmetic; the window is "n/a"
+	// (ok=false), as the cpuDelta comment promises for a reset.
+	reset := CPUStat{User: 30, System: 20, Idle: 50, Total: 100, Cores: 4}
+	if busy, _, _, _, ok := cpuDelta(cur, reset); ok || busy != 0 {
+		t.Errorf("a counter reset: (%v, %v), want the window \"n/a\" (no underflowed shares)", busy, ok)
 	}
 }
 
@@ -453,6 +463,46 @@ func TestFormatLoadReport_Degraded(t *testing.T) {
 	r = formatLoadReport(st, nil, nil, nil, nil, nil, false, nil, nil, &debt)
 	if !strings.Contains(r, "📬 Render debt: flags 443000 + lag 99120 = 542120") {
 		t.Errorf("the debt was not printed with n/a queues:\n%s", r)
+	}
+}
+
+// TestFormatLoadReport_BogusMeminfo — a corrupt /proc/meminfo pair
+// (the bulk review 13#P3-1): the parser accepts any non-negative
+// values, so MemAvailable > MemTotal and SwapFree > SwapTotal must not
+// underflow the uint64 subtraction to ~2⁶⁴ in the report line and in
+// the crawler_os_mem_bytes/crawler_os_swap_bytes "used" gauges — the
+// saturating subtraction gives an honest 0 (the TestLoadReportLoop_
+// ProcRestart underflow class).
+func TestFormatLoadReport_BogusMeminfo(t *testing.T) {
+	st := LoadStat{
+		Load1: 1.0, Load5: 1.0, Load15: 1.0,
+		CPU:          CPUStat{Cores: 4},
+		MemTotal:     4 << 30,
+		MemAvailable: 8 << 30, // bogus: above the total
+		SwapTotal:    0,
+		SwapFree:     1 << 20, // bogus: free swap without swap
+		Procs:        map[string]ProcAgg{"a": {RSS: 1 << 30}},
+	}
+	r := formatLoadReport(st, nil, nil, nil, nil, nil, false, nil, nil, nil)
+	if !strings.Contains(r, "RAM: used 0.0 of 4.0 GiB (available 8.0)") {
+		t.Errorf("the RAM line is not the saturating 0:\n%s", r)
+	}
+	if !strings.Contains(r, "swap 0 MiB") {
+		t.Errorf("the swap line is not the saturating 0:\n%s", r)
+	}
+
+	reg := metrics.New("monitor")
+	m := NewLoadMetrics(reg)
+	m.observe(st, nil, nil, nil, nil)
+	if v, ok := gaugeLabels(t, reg, "crawler_os_mem_bytes", map[string]string{"kind": "used"}); !ok || v != 0 {
+		t.Errorf("crawler_os_mem_bytes{used} = (%v, %v), want 0 (no underflow)", v, ok)
+	}
+	if v, ok := gaugeLabels(t, reg, "crawler_os_swap_bytes", map[string]string{"kind": "used"}); !ok || v != 0 {
+		t.Errorf("crawler_os_swap_bytes{used} = (%v, %v), want 0 (no underflow)", v, ok)
+	}
+	// The healthy pairs are exact as before.
+	if v, ok := gaugeLabels(t, reg, "crawler_os_mem_bytes", map[string]string{"kind": "total"}); !ok || v != float64(4<<30) {
+		t.Errorf("crawler_os_mem_bytes{total} = (%v, %v), want 4 GiB", v, ok)
 	}
 }
 

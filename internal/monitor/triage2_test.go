@@ -494,11 +494,11 @@ func TestSlowQueriesUnitBoundaries(t *testing.T) {
 		t.Errorf("MinDuration=1: %v, want as set", got)
 	}
 	pool := &zonestatsFakePool{steps: []zonestatsStep{{rows: zonestatsRows()}}}
-	if _, err := (PGSlowQueries{Pool: pool, Limit: 1}).SlowQueries(context.Background(), time.Second); err != nil {
+	if _, err := (PGSlowQueries{Pool: pool}).SlowQueries(context.Background(), time.Nanosecond); err != nil {
 		t.Fatal(err)
 	}
-	if got := pool.calls()[0].args[2]; got != 1 {
-		t.Errorf("Limit=1: %v, want 1", got)
+	if got := pool.calls()[0].args[1]; got != 1e-09 {
+		t.Errorf("longerThan=1ns: %v, want as set", got)
 	}
 }
 

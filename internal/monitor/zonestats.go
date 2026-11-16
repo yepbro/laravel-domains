@@ -11,8 +11,34 @@
 // The pass is authoritative: the value of each counter is overwritten in
 // full by the aggregate, the transition increments (the incremental-counters
 // spec §6, scheduler/ingest/httpworker/analyzer) give freshness between
-// passes. The pass composition (one transaction, one snapshot — the
-// consistency of all positions at one moment):
+// passes. One transaction, one snapshot — the consistency of all
+// positions at one moment:
+//
+//   - the SNAPSHOT OF THE CLOCK is guaranteed by PostgreSQL itself:
+//     now()/current_timestamp/current_date return the START TIME of the
+//     current transaction and "their values do not change during the
+//     transaction" (PG docs §9.9.5 Current Date/Time; verified live on
+//     the project's postgres 16.15: now(), current_date and
+//     date_trunc('hour', now()) are identical across the statements of
+//     one transaction even with pg_sleep between them). Every day/hour
+//     name and every FILTER window of the pass — from
+//     readDailyChecksSQL to recountHourlyResultsCurSQL — evaluates to
+//     the same boundary in every statement, so a pass crossing an hour
+//     or midnight boundary cannot split the baskets from the aggregates
+//     (the bulk review 13#P2-2 assumed per-statement now() and was
+//     rejected on this ground; threading one SELECT now() through all
+//     the statements as $1 would pass the identical value — a no-op);
+//   - the snapshot of the DATA is per-statement (READ COMMITTED): the
+//     increments that land between the old reads and the writes are
+//     exactly the streaming drift positions (daily:*, retry_mature:*,
+//     rendered:*, results:*, reanalyze:* — observable on the gauge,
+//     outside the Warn), reconciled by the next pass. REPEATABLE READ
+//     would not add clock consistency (already there) and would abort
+//     the pass with "could not serialize access" whenever a concurrent
+//     result-record increment touched a counters row after the pass
+//     snapshot — a regression against a non-existent defect.
+//
+// The pass composition:
 //
 //   - zones: domains_total/domains_pending/domains_queued/
 //     domains_checked — one FILTER aggregate of domains GROUP BY zone_id

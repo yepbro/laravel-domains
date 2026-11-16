@@ -566,18 +566,34 @@ func (m *LoadMetrics) observe(st LoadStat, busy, user, sys, iowait *float64) {
 	}
 	m.mem.WithLabelValues(osKindMemTotal).Set(float64(st.MemTotal))
 	m.mem.WithLabelValues(osKindMemAvailable).Set(float64(st.MemAvailable))
-	m.mem.WithLabelValues(osKindMemUsed).Set(float64(st.MemTotal - st.MemAvailable))
+	m.mem.WithLabelValues(osKindMemUsed).Set(float64(satSub(st.MemTotal, st.MemAvailable)))
 	m.swap.WithLabelValues(osKindSwapTotal).Set(float64(st.SwapTotal))
-	m.swap.WithLabelValues(osKindSwapUsed).Set(float64(st.SwapTotal - st.SwapFree))
+	m.swap.WithLabelValues(osKindSwapUsed).Set(float64(satSub(st.SwapTotal, st.SwapFree)))
+}
+
+// satSub — the saturating subtraction of unsigned counters. /proc is an
+// external source: a corrupt meminfo pair (MemAvailable > MemTotal,
+// SwapFree > SwapTotal) must not underflow to ~2⁶⁴ (the class of the
+// TestLoadReportLoop_ProcRestart junk "10¹⁴ cores") — an inconsistent
+// pair reads as an honest 0 (the bulk review 13#P3-1).
+func satSub(a, b uint64) uint64 {
+	if a < b {
+		return 0
+	}
+	return a - b
 }
 
 // cpuDelta — the tick shares between two snapshots (0..1); ok=false — the delta
 // is impossible (the first pass or the counters reset by a host restart).
 func cpuDelta(prev, cur CPUStat) (busy, user, sys, iowait float64, ok bool) {
-	d := cur.Total - prev.Total
-	if prev.Total == 0 || d == 0 {
+	if prev.Total == 0 || cur.Total <= prev.Total {
+		// No base, a zero window or a host restart between the passes
+		// (the counters fell): the uint64 subtraction of the delta
+		// would underflow — the window is honestly "n/a", not
+		// mod-2⁶⁴ junk shares (the satSub class, the T-289 review).
 		return 0, 0, 0, 0, false
 	}
+	d := cur.Total - prev.Total
 	user = float64(cur.User-prev.User) / float64(d)
 	sys = float64(cur.System-prev.System) / float64(d)
 	iowait = float64(cur.Iowait-prev.Iowait) / float64(d)
@@ -824,8 +840,8 @@ func formatLoadReport(st LoadStat, busy, iowait *float64, procCPU map[string]flo
 	}
 
 	fmt.Fprintf(&b, "\n💾 RAM: used %.1f of %.1f GiB (available %.1f), swap %.0f MiB",
-		gib(st.MemTotal-st.MemAvailable), gib(st.MemTotal), gib(st.MemAvailable),
-		mib(st.SwapTotal-st.SwapFree))
+		gib(satSub(st.MemTotal, st.MemAvailable)), gib(st.MemTotal), gib(st.MemAvailable),
+		mib(satSub(st.SwapTotal, st.SwapFree)))
 	if st.PSIPresent {
 		fmt.Fprintf(&b, "; PSI mem %d%% / full %d%%",
 			round(st.MemPSISome.Avg10), round(st.MemPSIFull.Avg10))

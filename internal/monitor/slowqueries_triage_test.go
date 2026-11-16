@@ -1,7 +1,7 @@
 // Triage tests of the mutants of the CI run of Nov 09 2026 (half A):
 // the finishing work on slowqueries.go — the PGSlowQueries source
-// (the pool not set, the SQL contract and the parameters, the limit
-// default, the Query/Scan/Err errors), the numeral agreement over the
+// (the pool not set, the SQL contract and the parameters, the
+// Query/Scan/Err errors), the numeral agreement over the
 // whole range, the debounce key, the threshold as whole seconds, the
 // metrics (the unknown label without an application_name) and the
 // constant pins. The pool fake is zonestatsFakePool (the same db.DB
@@ -32,7 +32,12 @@ func slowScanRow(pid int, app string, sec float64, query string) []any {
 
 // TestPGSlowQueries_Contract — the exact SQL text and parameters: the
 // exclusion of its own application_name, the threshold in seconds
-// (a float), the row limit; a zero/negative limit — the default.
+// (a float); the snapshot has NO row limit (the bulk review 13#P2-1:
+// a truncated top-20 snapshot broke the debounce — a query displaced
+// from the top returned as "new" and re-reported; max_connections = 50
+// caps the rows, the message is capped by slowQueryTopLines), and the
+// exclusion filter agrees with the SELECT's COALESCE (13#P3-2: a NULL
+// application_name must not be silently dropped by `<> $1`).
 func TestPGSlowQueries_Contract(t *testing.T) {
 	pool := &zonestatsFakePool{steps: []zonestatsStep{{rows: zonestatsRows()}}}
 	src := PGSlowQueries{Pool: pool, ExcludeApp: "monitor"}
@@ -43,27 +48,20 @@ func TestPGSlowQueries_Contract(t *testing.T) {
 	if len(calls) != 1 || calls[0].sql != slowQuerySQL {
 		t.Fatalf("queries = %d, want 1 with the slowQuerySQL text", len(calls))
 	}
-	want := []any{"monitor", 3.0, 20}
+	want := []any{"monitor", 3.0}
 	got := calls[0].args
-	if len(got) != 3 || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
-		t.Errorf("args = %#v, want %#v (the default limit of 20)", got, want)
+	if len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("args = %#v, want %#v (the application_name and the threshold, no row limit)", got, want)
 	}
-
-	pool2 := &zonestatsFakePool{steps: []zonestatsStep{{rows: zonestatsRows()}}}
-	if _, err := (PGSlowQueries{Pool: pool2, Limit: 7}).SlowQueries(context.Background(), time.Second); err != nil {
-		t.Fatal(err)
+	// The complete snapshot: no LIMIT clause — the debounce must see all
+	// currently running statements, not the truncated top (13#P2-1).
+	if strings.Contains(strings.ToUpper(slowQuerySQL), "LIMIT") {
+		t.Errorf("slowQuerySQL has a LIMIT — the debounce would be built on a truncated snapshot:\n%s", slowQuerySQL)
 	}
-	if got := pool2.calls()[0].args[2]; got != 7 {
-		t.Errorf("an explicit limit = %v, want 7", got)
-	}
-	for _, lim := range []int{0, -1} {
-		pool3 := &zonestatsFakePool{steps: []zonestatsStep{{rows: zonestatsRows()}}}
-		if _, err := (PGSlowQueries{Pool: pool3, Limit: lim}).SlowQueries(context.Background(), time.Second); err != nil {
-			t.Fatal(err)
-		}
-		if got := pool3.calls()[0].args[2]; got != 20 {
-			t.Errorf("the limit %d → %v, want the default 20", lim, got)
-		}
+	// The NULL application_name agreement (13#P3-2): the SELECT reads
+	// COALESCE(application_name, ''), the filter must compare the same.
+	if !strings.Contains(slowQuerySQL, "($1 = '' OR COALESCE(application_name, '') <> $1)") {
+		t.Errorf("slowQuerySQL without the NULL-agreeing exclusion filter:\n%s", slowQuerySQL)
 	}
 }
 
@@ -142,9 +140,6 @@ func TestSlowQueryConsts(t *testing.T) {
 	}
 	if DefaultSlowQueryMinDuration != 3*time.Second {
 		t.Errorf("DefaultSlowQueryMinDuration = %v, want 3s", DefaultSlowQueryMinDuration)
-	}
-	if slowQueryLimit != 20 {
-		t.Errorf("slowQueryLimit = %d, want 20", slowQueryLimit)
 	}
 	if slowQueryTopLines != 3 {
 		t.Errorf("slowQueryTopLines = %d, want 3", slowQueryTopLines)
