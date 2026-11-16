@@ -97,7 +97,13 @@ package render
 //     block_trackers, red ONLY against the stale T-275 expectations (the
 //     moli branch still waited for "sync to the network, 200"); the actual
 //     behavior matched the new #2729 semantics — the sync probe blocked
-//     (error, the counter 0) — fixed by T-276.
+//     (error, the counter 0) — fixed by T-276. The release retest
+//     v1.1.25 (2026-11-15, the compose image crawler/moli:v1.1.25): the
+//     slice is 6/6 green — ①④ live in a release; but the layer-2 smoke
+//     is red on the engine memory: cgroup OOM ×3 under the compose 1 GiB
+//     limit (~100 MiB/min vs ~21 MiB/min on the 13.11 build) — moli
+//     remains not-ready, the pin reverted to v1.1.21 (the journal
+//     docs/operations.md 2026-11-15, the artifacts in var/fixtures-l2/).
 //   - lightpanda 1.0.2: one browser context per connection ("Cannot have
 //     more than one browser context at a time", also recorded by
 //     third-party measurements). The service tab of the starting context

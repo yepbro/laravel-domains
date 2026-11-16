@@ -1166,3 +1166,54 @@ why, and how to roll it back. Normal CD deploys are not recorded here
   `report-moli-main-f857b6651.txt`. The bench container/image
   (`moli-t247`, `moli:t247`) removed after the run; the stand returned
   to chromium + the isolated DNS (`ALLOW_INTERNET=0`).
+
+### 2026-11-15 — T-247: the moli v1.1.25 release retest — layer 1 green, layer 2 NOT READY (engine OOM ×3)
+
+- The build: the release v1.1.25 (the tag `080c3fc2cbbb…`), the first
+  release carrying ①(#2704)+④(#2729+#2883) — exactly what the 13.11 plan
+  waited for. The standard pin flow this time: `MOLI_VERSION`/`MOLI_SHA256`
+  (the digest of the release asset `moli-x86_64-unknown-linux-gnu.tar.gz`,
+  `04c73204…087f`) → the compose image `crawler/moli:v1.1.25` from
+  `Dockerfile.moli` (no manual source build, unlike 13.11), the service
+  container on 172.28.100.17. Provenance checked at the gate:
+  `/json/version` → `Moli-Version: 1.1.25`, `WebKit-Version:
+  @080c3fc2cb…` (the tag SHA).
+- Layer 1 (the CDP slice): moli **6/6 PASS** — including block_trackers
+  under the T-276 expectations (on 13.11 it was the stale-expectation
+  red); the chromium control 6/6. The CDP invariants of spec 5.6 hold on
+  the release build.
+- Layer 2 (the smoke on the seed hundred, internet mode, baseline
+  chromium-1 of the dump 242): **NOT READY — the run hit the 30-min
+  drain cap**: 93/100 processed, 7 pending at the stop. The cause — the
+  engine memory: **3 cgroup OOM kills** under the compose limit
+  (`MEM_MOLI=1gb` → Memory 1 GiB, swap 2 GiB) at 22:05:20 / 22:15:24 /
+  22:25:06, anon-rss 1 020 492 / 1 028 564 / 1 031 944 KiB (+ file-rss
+  ~60 MiB each, total-vm 76–80 GB); max RSS 1009 MiB (the first kill
+  ~6 min after the publish). Each kill → the worker's
+  `connection refused` bursts on `/json/version`, stalled deliveries
+  re-claimed (attempts 2→3) — the drain spent its time in the claim
+  cycles (plateaus of ~5 min after each kill). No engine panics
+  otherwise; the log noise is page-side JS errors.
+- The memory nuance (honest comparison): 13.11 ran a manually built
+  container with no cgroup limit — RSS 736.4 MiB grew monotonically over
+  ~34 min (≈21 MiB/min); v1.1.25 grows ~100 MiB/min under the same load
+  shape — ~5× the growth rate, a release regression candidate, not an
+  artifact of the limit's presence. The qualitative losses of 13.11 did
+  not go away either (the worker tail: 3 tarpit finalizations, 4×
+  net::ERR_FAILED, 5× page-timeout-25s), but by the cap rule the
+  snapshot/report were not taken — the §5.1 verdicts for this run are
+  honestly NO DATA; the worker container was recreated by the rollback
+  `make up`, so its logs/metrics for the window are lost (the key
+  fragment is quoted in the T-247 card comments).
+- Consequences: moli stays a permanent candidate, "not ready now"; the
+  `.env` pin reverted to the v1.1.21 pair (the last release pin; the
+  v1.1.25 image stays local — a retest after an upstream fix is a
+  two-line flip); the repo default (`.env.example`) is untouched. The
+  next retest: after an upstream fix of the memory growth (an upstream
+  issue is the follow-up) or a deliberate run with a raised `MEM_MOLI`
+  to measure the growth curve — the artifacts: `var/fixtures-l2/
+  moli-v1125-rss.log`, `moli-v1125-vm.log`, `moli-v1125-drain-full.log`,
+  `moli-v1.1.25-oom-dmesg.log` (no snapshot.json/report.txt this run).
+  The stand returned to chromium + the isolated DNS; the 7 leftover
+  tasks were drained by chromium after the rollback (harmless — the
+  next `import --force` resets the rows).
