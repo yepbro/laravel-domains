@@ -195,6 +195,29 @@ a lost connection or a Chromium restart (the `crawler-chromium.service`
 unit, a docker restart of the container) the consumption pause does not
 hang forever — the next probe connects to the new generation.
 
+**Waiting out an engine restart (`render.engine_wait`, T-283).** A restart
+of the external engine container (a cgroup OOM-kill → docker restart, a
+deploy, an update) is a routine event, not a task error: the connection
+refusal on `/json/version` and the WS dial lasts tens of seconds, and the
+engine comes back by itself. `Manager.Run` retries the failed generation
+start with a backoff (1 s doubling up to 15 s) within the budget
+`render.engine_wait` (5 min by default) **per task**: the delivery held by
+the handler renders on the recovered engine and is acknowledged — it does
+not fail, does not burn queue attempts, does not grow the stage error
+counter and the fallback gate streak (a normal restart stays silent —
+the `render_browser_errors` alert's contract). The wait applies only to
+START failures: the budget of page executions (1+`maxRestartsPerTask`) is
+not spent by it, so a page-killer (the T-285 case) does not multiply its
+executions. An outage longer than the budget surfaces a `ClassBrowser`
+error as before (R5: a re-delivery; the recovery claim gate below holds
+the attempts while the engine is down). The upper bound of the knob is
+the queue lease — `render.timeout + render.engine_wait <
+redis.claim_min_idle` (checked by validation): a delivery held by the
+waiting handler longer would be re-claimed by XAUTOCLAIM (a duplicate).
+`0` disables the control (the start error returns immediately). The
+restarts the worker survived are counted in
+`crawler_render_browser_restarts_total{engine}` (docs/services.md).
+
 **CDP disconnect: a half-closed connection (T-218, incident 02.11).** After
 a Chromium recycle (the T-208 timer) workers accumulated WebSocket
 connections to :9222 (up to 284 over ~6 h), `Target.createBrowserContext`
@@ -515,7 +538,17 @@ SELECT the row (final_url, content_hash)
   `Options.Alive`): the cycle suspends consumption — deliveries stay in
   the stream unread, not in the PEL without XACK; the browser restart —
   T-065. A Chromium start error — an OnRun error (exit code 1,
-  Restart=on-failure).
+  Restart=on-failure). Since T-283 the same probe gates the
+  stalled-delivery claim of the RecoverLoop (`RecoverOptions.Ready`):
+  while the engine is down the XAUTOCLAIM passes are skipped — the PEL
+  entries ripen without spending attempts (before T-283 a claim during
+  an engine restart processed the whole batch against a refusing engine:
+  dozens of "stalled delivery not acknowledged … connection refused"
+  per outage, attempts 2→3 toward q:dead — the moli v1.1.25 retest of
+  15.11); after the recovery the claims resume (logged on the
+  transitions). An engine restart within `render.engine_wait` is waited
+  out by the manager inside the handler — see
+  [the manager section](#browser-restart-and-the-memory-threshold-t-065).
 - **Failures**: a render error (the task class — `net::ERR_*`) and
   `ErrStoreFull` — the delivery goes without XACK and returns via
   redelivery; `ErrTooLarge` (a DOM bloated by JS) — a permanent property of

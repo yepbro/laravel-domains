@@ -98,6 +98,19 @@ type RecoverOptions struct {
 	// Log — the loop logger; nil — entries are suppressed
 	// (slog.DiscardHandler).
 	Log *slog.Logger
+	// Ready — an optional processing readiness sensor (T-283): while it
+	// returns false the claim pass is SKIPPED — XAUTOCLAIM is not
+	// called, the delivery attempts of the stalled entries are not
+	// spent. The worker passes its browser probe (renderworker
+	// Options.Alive): claiming during an engine container restart would
+	// process the whole batch against a refusing engine — every entry
+	// returns an error and burns a delivery (the moli v1.1.25 retest of
+	// 15.11: dozens of "stalled delivery not acknowledged … connection
+	// refused" per outage, attempts 2→3 toward q:dead). The pause and
+	// the resumption are logged on the TRANSITIONS, not per tick (a
+	// long outage must not spam the log). nil — no gate (the pre-T-283
+	// behavior, workers without an engine probe).
+	Ready func() bool
 }
 
 func (o RecoverOptions) withDefaults() RecoverOptions {
@@ -152,7 +165,10 @@ func RecoverLoop(ctx context.Context, r *Reliab, process func(context.Context, D
 // toward q:dead (the root of the Oct 22–23 incident: 5,507 deaths with
 // healthy processing, §11.1). The pass is skipped until the next tick;
 // if Redis recovered — the claim and processing continue, attempts are
-// not lost (at-least-once, spec 3.4).
+// not lost (at-least-once, spec 3.4). The readiness gate (T-283,
+// RecoverOptions.Ready) is its engine-side twin: the claim is skipped
+// while the worker's processing sensor (the render engine probe) reports
+// not ready.
 func RecoverLoopAttempt(ctx context.Context, r *Reliab, process func(context.Context, Delivery, int) error, opt RecoverOptions) error {
 	if r == nil {
 		return errors.New("queue: stalled delivery recovery loop: reliability layer not set (NewReliab)")
@@ -279,6 +295,10 @@ func RecoverLoopAttempt(ctx context.Context, r *Reliab, process func(context.Con
 
 	ticker := time.NewTicker(o.Interval)
 	defer ticker.Stop()
+	// readyPaused — the readiness gate's latch for transition logging
+	// (T-283): the pause is logged once on entering the gate, the
+	// resumption — once on leaving it, not on every skipped tick.
+	readyPaused := false
 	for {
 		// Cancellation between passes (including right after the tail
 		// refund of a full batch above) — a clean exit without a write
@@ -287,6 +307,29 @@ func RecoverLoopAttempt(ctx context.Context, r *Reliab, process func(context.Con
 		// middle of a full batch.
 		if ctx.Err() != nil {
 			return nil
+		}
+		// The readiness gate (T-283): the processing sensor (the render
+		// engine probe of the worker) reports not ready — the claim is
+		// skipped: processing a claimed entry against a down engine
+		// burns the attempt without a chance of a result (the same
+		// argument as the T-152 write gate; the entries ripen in the
+		// PEL, their idle keeps growing, nothing is lost — after the
+		// recovery the claims resume).
+		if o.Ready != nil && !o.Ready() {
+			if !readyPaused {
+				readyPaused = true
+				log.Warn("stalled delivery recovery: the processing sensor reports not ready (the render engine is down, T-283) — claim skipped, delivery attempts are not spent")
+			}
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-ticker.C:
+			}
+			continue
+		}
+		if readyPaused {
+			readyPaused = false
+			log.Info("stalled delivery recovery: the processing sensor is ready — claims resume (T-283)")
 		}
 		// The write gate (T-152): while Redis rejects entries, the claim
 		// is skipped — delivery attempts are not spent. The probe is one

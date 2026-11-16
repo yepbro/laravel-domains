@@ -16,7 +16,9 @@
 // (T-239, FR-9, spec §4.6 item 2), fallback consumption by worker B with an
 // outcome label rendered|finalized|skipped (T-245, spec §4.6 item 2, FR-11/FR-15 —
 // the balance published = consumed + the q:render-fallback remainder, step 4
-// of the spec acceptance §6.2); the engine label on the render share,
+// of the spec acceptance §6.2), generation restarts of the render browser
+// with the build's engine label (T-283 — for an external engine a restart
+// is a reconnect: the worker-observed engine restart); the engine label on the render share,
 // tarpit finalizations (S-P2-4: a tarpit is an engine-branched failure) and
 // task class finalizations (T-235, spec §4.6 item 1, FR-15:
 // cardinality 3 — chromium/moli/lightpanda, the value — the engine
@@ -28,6 +30,8 @@
 package renderworker
 
 import (
+	"context"
+	"log/slog"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -89,6 +93,7 @@ type Metrics struct {
 	fallback *prometheus.CounterVec // crawler_render_fallback_published_total{reason} (T-238)
 	suspend  *prometheus.CounterVec // crawler_render_fallback_suspended_total{reason} (T-239)
 	consumed *prometheus.CounterVec // crawler_render_fallback_consumed_total{result} (T-245)
+	restarts prometheus.Counter     // crawler_render_browser_restarts_total{engine} (T-283)
 	engine   string                 // the engine label value — the engine of the worker's build (T-235)
 }
 
@@ -166,6 +171,10 @@ func NewMetrics(reg *metrics.Registry, engine string) *Metrics {
 			Name: "crawler_render_fallback_consumed_total",
 			Help: "q:render-fallback tasks consumed by chromium worker B (T-245, spec 4.5/4.6 item 2, FR-11/FR-15), by the outcome of a delivery that finished processing without error: result=rendered — the rework succeeded (the DOM written, rendered=true, publication to q:analyze, spec 4.5 item 2); result=finalized — the fallback is exhausted, the record was closed via finalization (the render_failed_at marker + publication to q:analyze, FR-10: the tarpit T-148 / task class T-172 / cert T-159 / DNS T-211 paths; the marker is placed while the row belongs to the episode — a race with the recheck T-058 closes the record without the marker); result=skipped — a normal refusal without side effects (no row, no final URL, or the UPDATE guard rejected it — the row slipped out from under the task). Counting is in the handler before XACK at the queue level: an Ack failure or a duplicate delivery yields a duplicate — an allowance of units at-least-once (like the budget window T-239); failed deliveries are not counted — they live in the PEL until claimed or buried into q:dead. The acceptance balance check (spec 6.2 item 4): crawler_render_fallback_published_total (worker A, T-238) = the sum of this counter + the q:render-fallback remainder — crawler_queue_depth{queue=\"q:render-fallback\"} of worker B (the group backlog: the unread lag + the PEL; held up to the MAXLEN cap of the stream) + increase(crawler_queue_dead_buried_total{queue=\"q:render-fallback\"}) + increase(crawler_queue_dead_unidentified_total{queue=\"q:render-fallback\"}) (unidentifiable records without a task_id, T-260 — stationary zero). Only the worker B build counts (Options.Stream = q:render-fallback, FR-12): the series of the closed vocabulary of the three outcomes are pre-created as zeros in all builds (S-P1-4 — the family is in the exposition from the first start), only worker B grows them: in the primary build they live at zeros.",
 		}, "result"),
+		restarts: reg.MustCounter(prometheus.CounterOpts{
+			Name: "crawler_render_browser_restarts_total",
+			Help: "Generation restarts of the render browser (the Manager counter, T-283): for an external engine (moli/lightpanda, render.remote_url) a generation restart is a reconnect — the worker-observed restart of the engine (its container is recycled by the host after a cgroup OOM-kill, a deploy, an update; planned page/memory restarts are disabled for external engines — FR-3), so the counter fixes the engine restarts the worker survived by waiting (render.engine_wait). For a local chromium build the counter includes the planned page/memory-threshold restarts too (T-065) — the same unit, one series per build's engine. The value is the DELTA of the manager's monotonic counter, polled by the Run loop (Options.Restarts): restarts between polls are not lost. The engine label is the render engine of the worker build (chromium|moli|lightpanda, render.engine, the T-235 style): cardinality 3, the series is born at the first restart.",
+		}, metrics.LabelEngine).WithLabelValues(engine),
 	}
 	// Pre-creation of zero series of the closed vocabularies (S-P1-4): both
 	// families are exported from the start (with zeros), the budget alert
@@ -301,4 +310,54 @@ func (m *Metrics) Error(class render.Class) {
 		return
 	}
 	m.errors.WithLabelValues(metrics.StageRender, class.String()).Inc()
+}
+
+// BrowserRestarts — +n into the generation restart counter (T-283): n —
+// the DELTA of the manager's monotonic counter since the previous poll
+// (several restarts between polls are added at once, not lost). The
+// engine label is fixed by the build (the T-235 style).
+func (m *Metrics) BrowserRestarts(n int) {
+	if m == nil || n <= 0 {
+		return
+	}
+	m.restarts.Add(float64(n))
+}
+
+// collectRestarts — the periodic delta poll of the generation restart
+// counter (T-283): src (Options.Restarts — the manager's Restarts(), a
+// monotonic atomic) grows on every generation swap; the metric repeats
+// the DELTA — restarts between polls are added at once, not lost. The
+// first pass right at the start only fixes the baseline (the restarts of
+// the manager's own startup are not the worker's metric events; the
+// counters before the loop start are impossible — Run outlives them).
+// A nil source or nil metrics — a no-op (isolated builds and tests); a
+// source counter decrease (impossible for the atomic, a source swap in a
+// test) only moves the baseline. A cancellation of ctx is a clean exit
+// (graceful shutdown, spec 3.4) — the metrics.CollectQueueLoop pattern.
+func collectRestarts(ctx context.Context, src func() int64, met *Metrics, interval time.Duration, log *slog.Logger) {
+	if src == nil || met == nil {
+		return
+	}
+	if interval <= 0 {
+		interval = metrics.DefaultQueueCollectInterval
+	}
+	if log == nil {
+		log = slog.New(slog.DiscardHandler)
+	}
+	log.Info("browser restart collector", "interval", interval.String())
+	last := src()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			n := src()
+			if n > last {
+				met.BrowserRestarts(int(n - last))
+			}
+			last = n
+		}
+	}
 }

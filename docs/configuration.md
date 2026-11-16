@@ -719,6 +719,7 @@ T-163 criterion measured with the sampler: the unit's anon /
 | `timeout_attempts` | `CRAWLER_RENDER_TIMEOUT_ATTEMPTS` | integer | `2` (range: 1..100; must be ≤ `redis.max_attempts`) |
 | `restart_every_pages` | `CRAWLER_RENDER_RESTART_EVERY_PAGES` | integer | `500` |
 | `restart_memory_bytes` | `CRAWLER_RENDER_RESTART_MEMORY_BYTES` | size | `1536MiB` (range: 256MiB–16GiB, `0` — disabled) |
+| `engine_wait` | `CRAWLER_RENDER_ENGINE_WAIT` | duration | `5m` (range: 1s..1h, `0` — disabled; the binding `render.timeout + engine_wait < redis.claim_min_idle` — below, T-283) |
 | `block_stylesheet` | `CRAWLER_RENDER_BLOCK_STYLESHEET` | bool | `false` (T-213; enable only after an A/B, the computed styles risk — below) |
 | `block_tracker_domains` | `CRAWLER_RENDER_BLOCK_TRACKER_DOMAINS` | bool | `true` (T-214; the domain list and the selection principle — below and in [`render.md`](render.md)) |
 | `queue_high_watermark` | `CRAWLER_RENDER_QUEUE_HIGH_WATERMARK` | integer | `10000` (0 — the shared `scheduler.queue_high_watermark`) |
@@ -875,6 +876,32 @@ Chromium (:9223) and a second render-worker against it
 mode (the dev stack) another container's RSS is not accessible —
 memory-based control does not work, and the Chromium container's limit
 holds the cap.
+
+`engine_wait` — the budget of waiting for an unreachable render engine
+(T-283): a restart of the external engine container (a cgroup OOM-kill →
+docker restart, a deploy) is a routine event — the render manager
+retries the failed connection with a backoff within this budget per
+task, the delivery does not fail, does not burn queue attempts and does
+not grow the stage error counter (a normal restart stays silent); an
+outage longer than the budget surfaces a browser-class error into a
+re-delivery, and the recovery claim gate holds the stalled entries'
+attempts while the engine is down ([`render.md`](render.md), "Waiting
+out an engine restart"). The budget is WALL time — the failed start
+attempts themselves (the dial retries) eat into it and do not stack on
+top; beyond it the delivery can still finish the in-flight tail (up to
+1+maxRestartsPerTask segments of "a dial + a page") — the binding
+formula covers the regular restart shape (a fast connection refusal)
+with that margin, keep a proportional reserve in `claim_min_idle` for
+a deliberately tight window. The default 5 m covers a docker restart
+(tens of seconds) with a margin for a slow pull. The upper bound is
+the queue lease: `render.timeout + engine_wait < redis.claim_min_idle`
+(checked by validation) — a delivery held by the waiting handler longer
+would be re-claimed by XAUTOCLAIM (a duplicate); when raising
+`engine_wait`, raise `claim_min_idle` proportionally. `0` disables the
+control (the start error returns immediately, the pre-T-283 behavior).
+The restarts the worker survived are visible in
+`crawler_render_browser_restarts_total{engine}` — the death → retries →
+recovery replacement is counted too (the manager's restart latch).
 
 `block_stylesheet` — CSS blocking in the render context (T-213): at
 `true` the list of blocked render types ([`render.md`](render.md),

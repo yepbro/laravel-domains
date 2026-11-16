@@ -244,6 +244,19 @@ render:
   # Chromium saturated (the answer is a second Chromium :9223, deploy.md
   # §2.2, not a threshold raise).
   restart_memory_bytes: "1536MiB"
+  # Waiting for an unreachable engine (T-283): a restart of the external
+  # engine container (a cgroup OOM-kill → docker restart, a deploy) is
+  # waited out by the render manager with a backoff within this budget
+  # per task — the delivery renders on the recovered engine and is
+  # acknowledged, without burning queue attempts and without the stage
+  # error counter (a normal restart stays silent); a longer outage goes
+  # into a re-delivery, and the recovery claim gate holds the attempts
+  # while the engine is down. Binding: render.timeout + engine_wait <
+  # redis.claim_min_idle (checked by validation — raise claim_min_idle
+  # proportionally when raising this); 0 — disable (the start error
+  # returns immediately). The survived restarts — the metric
+  # crawler_render_browser_restarts_total{engine}.
+  engine_wait: "5m"
   # CSS blocking in the render context (T-213): when true, the list of
   # blocked types (Image/Media/Font, T-062 — 91% of the page weight) is
   # extended with Stylesheet — the remaining 5–10% of bytes plus

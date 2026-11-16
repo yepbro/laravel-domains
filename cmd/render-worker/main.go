@@ -286,12 +286,21 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		// render-fallback-worker (B).
 		Group:   group,
 		Recover: rel, // refunding the stuck tasks (T-025)
+		// The claim gate of the recovery loop (T-283): while the engine is
+		// down (a container restart), the claim passes are skipped — the
+		// attempts of the stalled entries are not spent on a refusing
+		// engine; the sensor is the same probe as the reader's browser
+		// pause (recoverOptions). The source of the restart metric
+		// (T-283): the manager's counter — the engine restarts the worker
+		// survived by waiting are visible in
+		// crawler_render_browser_restarts_total{engine}.
 		// The pace of the stuck refunds (T-153): the batch/interval of the
 		// claim — redis.recover_*; the invariant with claim_min_idle (the
 		// render is the slowest sequential traversal) —
 		// docs/configuration.md.
 		RecoverBatch:    cfg.Redis.RecoverBatch,
 		RecoverInterval: cfg.Redis.RecoverInterval.D(),
+		Restarts:        manager.Restarts,
 		Metrics:         reg, // the stage instruments: the tasks, the durations, the class errors, rendered (T-077)
 		// The engine of the build (render.engine, T-234) → the engine label
 		// of the stage metrics (T-235, FR-15): the same value as in

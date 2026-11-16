@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // maxRestartsPerTask — the browser restart limit per task: the Chromium
@@ -19,6 +20,29 @@ import (
 // maxRestartsPerTask >= probeFailThreshold pins
 // TestRestartBudgetCoversProbeSeries).
 const maxRestartsPerTask = 2
+
+// engineRetryBase — the first wait step between generation start attempts
+// while the engine is unreachable (T-283); the production value is a
+// second, the unit tests substitute it (the engine_wait_test.go seam,
+// like Browser.probeTimeout). A variable, not a constant, only for that.
+var engineRetryBase = time.Second
+
+// engineRetryCap — the ceiling of the wait step growth (T-283): an engine
+// container restart (docker Restart=on-failure, a pull, a healthcheck
+// warm-up) is tens of seconds — probing more often than 15 s changes
+// nothing, the dial itself is bounded by DialTimeout.
+const engineRetryCap = 15 * time.Second
+
+// engineRetryStep — the next wait step between the start retries (T-283):
+// doubling from engineRetryBase up to engineRetryCap; 0 — the ladder's
+// start (the base). Pure, so the ladder is pinned by a unit test
+// (TestEngineRetryStepGrowth).
+func engineRetryStep(prev time.Duration) time.Duration {
+	if prev <= 0 {
+		return engineRetryBase
+	}
+	return min(prev*2, engineRetryCap)
+}
 
 // Manager — the Chromium worker lifecycle (T-065, spec 5.6: "restart the
 // browser every N pages and when the memory threshold is exceeded"): start,
@@ -49,6 +73,17 @@ type Manager struct {
 	mu sync.Mutex
 	b  *Browser
 	p  *Pool
+
+	// restartPending/restartReason — the latch of a replacement in
+	// flight (T-283): a live generation was detached (death, thresholds,
+	// a closed pool) but the new one has not started yet (the engine
+	// container is restarting — the start retries of Run/Alive). The
+	// first successful start after the latch counts the restart in
+	// Restarts (the canonical death → T4 retries → recovery path would
+	// otherwise complete as T2 and grow nothing — the T-283 review, P1).
+	// Under mu (restartLocked).
+	restartPending bool
+	restartReason  string
 }
 
 // NewManager — a manager over the lifecycle context ctx: all manager
@@ -70,16 +105,76 @@ func NewManager(ctx context.Context, opts Options) *Manager {
 // pool closure by a generation swap before the task started (ErrClosed —
 // the task did not run) mean a restart and a retry, at most
 // maxRestartsPerTask times.
+//
+// A failed generation START (the engine is unreachable — a container
+// restart, T-283) is not a task error: within the Options.EngineWait
+// budget the start is retried with a backoff (engineRetryStep), and the
+// waiting does not spend the execution budget — page executions stay
+// bounded by 1+maxRestartsPerTask (a page-killer must not multiply
+// them). Only when the budget is exhausted (or EngineWait is off) the
+// ClassBrowser error goes upward — a re-delivery is the queue level
+// (R5), where the recovery claim gate of the worker (T-283) keeps the
+// attempts from burning while the engine is down.
 func (m *Manager) Run(ctx context.Context, task RenderTask) (RenderOutput, error) {
-	for attempt := 0; ; attempt++ {
+	// The engine-recovery budget of THIS call (T-283): the WALL time
+	// since the call's start that may be spent on failed generation
+	// starts (waits and the start attempts themselves — dial retries eat
+	// into the deadline, they do not stack on top of it: the total hold
+	// of the delivery is bounded by EngineWait + the in-flight tail, up
+	// to (1+maxRestartsPerTask) dial+page segments — the binding
+	// render.timeout + engine_wait < redis.claim_min_idle of
+	// config.Validate covers the regular restart shape with that
+	// margin). EngineWait 0 — the deadline is now, waitStart always
+	// refuses at once (the pre-T-283 behavior).
+	deadline := timeNow().Add(m.opts.EngineWait)
+	step := time.Duration(0)
+	waitStart := func() bool {
+		if remain := deadline.Sub(timeNow()); remain > 0 {
+			step = engineRetryStep(step)
+			if step > remain {
+				step = remain
+			}
+			t := time.NewTimer(step)
+			defer t.Stop()
+			select {
+			case <-ctx.Done():
+				return false
+			case <-t.C:
+			}
+			return true
+		}
+		return false
+	}
+	executions := 0 // page executions (the maxRestartsPerTask budget)
+	for {
 		p, err := m.acquire()
 		if err != nil {
 			if errors.Is(err, ErrClosed) {
-				err = &Error{Class: ClassTask, URL: task.URL, Err: err}
+				return RenderOutput{}, &Error{Class: ClassTask, URL: task.URL, Err: err}
 			}
-			return RenderOutput{}, err
+			// The engine is unreachable (a failed generation start,
+			// T-283): wait for the recovery within the budget and retry
+			// the START — the page has not run, the execution budget is
+			// not spent. A refusal (the budget is off/exhausted) returns
+			// the start error upward.
+			if !waitStart() {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					// A graceful shutdown during the engine wait: the
+					// delivery returns to the queue with a re-delivery
+					// (spec 3.4); the error is the context's, not the
+					// engine's — the stage error counter and the
+					// fallback gate streak must not count a shutdown as
+					// an engine outage (the T-283 review, P3; the
+					// mid-page shutdown is classified the same way —
+					// ClassContext).
+					return RenderOutput{}, &Error{Class: ClassContext, URL: task.URL, Err: ctxErr}
+				}
+				return RenderOutput{}, err
+			}
+			continue
 		}
 		out, err := runAcquired(ctx, p, task)
+		executions++
 		// Equivalent mutant (T-M08): cutting out the if body when
 		// err == nil falls through to the next if, where the third
 		// disjunct is trivially true (ClassOf(nil) = ClassTask !=
@@ -89,7 +184,7 @@ func (m *Manager) Run(ctx context.Context, task RenderTask) (RenderOutput, error
 		if err == nil {
 			return out, nil
 		}
-		if m.closed.Load() || attempt >= maxRestartsPerTask ||
+		if m.closed.Load() || executions > maxRestartsPerTask ||
 			(ClassOf(err) != ClassBrowser && !errors.Is(err, ErrClosed)) {
 			return out, err
 		}
@@ -195,6 +290,17 @@ func (m *Manager) restartLocked(reason string) error {
 	old := m.p
 	if old != nil {
 		old.retire()
+		// A live generation was taken out of service (death, thresholds,
+		// a closed pool): its replacement — in THIS call or on the first
+		// successful start after the T4 retries (the engine container is
+		// restarting, T-283) — is a restart, counted once (T-283 review,
+		// P1: the canonical outage path death → failed start (the slot
+		// is cleared) → recovery used to complete as T2 and grow nothing
+		// in Restarts/crawler_render_browser_restarts_total). The reason
+		// of the call that detached the generation is the honest one for
+		// the completion log ("browser unavailable", not the "first
+		// start" of the recovering call).
+		m.restartPending, m.restartReason = true, reason
 	}
 	m.b, m.p = nil, nil
 	b, err := m.newBrowser(m.lifeCtx, m.opts)
@@ -206,14 +312,23 @@ func (m *Manager) restartLocked(reason string) error {
 	}
 	m.b = b
 	m.p = m.newPool(b)
-	if old == nil {
+	if !m.restartPending {
+		// The first start of the manager (no generation has ever been
+		// replaced) — not a restart.
 		// Logging of the chromium start (§4 docs/mutation-testing.md).
 		// mutator-disable-next-line statement/remove
 		slog.Info("chromium started", "mode", m.mode(), "pid", b.rootPID)
 		return nil
 	}
+	m.restartPending = false
+	// The reason of the call that DETACHED the replaced generation: for
+	// the T4→T2 completion (the recovery after failed retries, T-283) the
+	// recovering call's own reason is the misleading "first start".
+	reason, m.restartReason = m.restartReason, ""
+	if old != nil {
+		go old.Close()
+	}
 	n := m.restarts.Add(1)
-	go old.Close()
 	// Logging of the chromium restart (§4 docs/mutation-testing.md).
 	// mutator-disable-next-line statement/remove
 	slog.Info("chromium restarted", "reason", reason,

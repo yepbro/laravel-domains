@@ -159,6 +159,7 @@ func envSpecs() []envSpec {
 		{"CRAWLER_RENDER_TIMEOUT_ATTEMPTS", setInt(func(c *Config) *int { return &c.Render.TimeoutAttempts })},
 		{"CRAWLER_RENDER_RESTART_EVERY_PAGES", setInt(func(c *Config) *int { return &c.Render.RestartEveryPages })},
 		{"CRAWLER_RENDER_RESTART_MEMORY_BYTES", setSize(func(c *Config) *ByteSize { return &c.Render.RestartMemoryBytes })},
+		{"CRAWLER_RENDER_ENGINE_WAIT", setDuration(func(c *Config) *Duration { return &c.Render.EngineWait })},
 		{"CRAWLER_RENDER_BLOCK_STYLESHEET", setBool(func(c *Config) *bool { return &c.Render.BlockStylesheet })},
 		{"CRAWLER_RENDER_BLOCK_TRACKER_DOMAINS", setBool(func(c *Config) *bool { return &c.Render.BlockTrackerDomains })},
 		{"CRAWLER_RENDER_QUEUE_HIGH_WATERMARK", setInt(func(c *Config) *int { return &c.Render.QueueHighWatermark })},

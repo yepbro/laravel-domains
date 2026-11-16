@@ -39,7 +39,7 @@
 //	| R2 | DNS (dnsError, T-211) | always — DNS recovery takes days | finalization from the first delivery | crawler_render_dns_finalized_total |
 //	| R3 | tarpit (tarpitError, T-148) | the episode tarpit budget is exhausted: the cardinality of render:tarpit:{task_id} ≥ render.timeout_attempts (tarpitsExhausted, T-261) | fallback (an engine-branched reason) → finalization | SADD render:tarpit:{task_id}; crawler_render_tarpit_finalized_total / crawler_render_fallback_published_total{timeout} |
 //	| R4 | task class (isTaskRenderError, T-172) | the PEL delivery number ≥ redis.max_attempts — the overall limit | fallback (an engine-branched reason) → finalization | crawler_render_task_finalized_total{reason} / crawler_render_fallback_published_total{reason} |
-//	| R5 | infrastructure (DB, storage, publishing, browser, ctx cancellation) | — | retry; after the overall limit is exhausted — q:dead | crawler_stage_errors_total{class}; reader pauses (T-152) |
+//	| R5 | infrastructure (DB, storage, publishing, browser, ctx cancellation) | — | retry; after the overall limit is exhausted — q:dead | crawler_stage_errors_total{class}; reader pauses (T-152); an engine outage is waited out by the manager BEFORE R5 fires (render.engine_wait, T-283) and the recovery claim gate (RecoverOptions.Ready, T-283) holds the claim attempts while the engine is down — a routine engine restart burns no deliveries |
 //	| R6 | success (or the row slipped out from under the task) | — | renderUpdateSQL / a regular rejection without effects | crawler_render_records_total, q:analyze |
 //
 // The row order is the check order of processDelivery: the skip-list

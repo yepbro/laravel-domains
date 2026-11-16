@@ -22,7 +22,10 @@
 //	B  browser pause   Chromium is dead (Options.Alive): the stream is NOT
 //	                   read — deliveries stay in the stream (not in the
 //	                   PEL), attempts are not burned; the restart — the manager
-//	                   (T-065), the reader only waits
+//	                   (T-065: it also waits out an engine container restart
+//	                   within render.engine_wait, T-283), the reader only
+//	                   waits; the same sensor gates the RecoverLoop claim
+//	                   (RecoverOptions.Ready, T-283 — the queue package)
 //	I  infra pause     a sustained InfraError of publishing (OOM/
 //	                   the Redis connection, T-152): the stream is NOT read —
 //	                   attempts are not burned; the exit — a write probe

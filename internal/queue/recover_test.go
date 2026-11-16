@@ -918,3 +918,130 @@ func TestRecoverLoopIntervalPaces(t *testing.T) {
 		t.Errorf("claims after the ticks: %d, want ≥ 2 (the tick sets the pace, the traversal does not stop)", n)
 	}
 }
+
+// TestRecoverLoopReadyGate — the processing readiness gate (T-283): while
+// the sensor (the render engine probe of the worker, renderworker passes
+// Options.Alive) reports not ready, the claim pass is skipped — XAUTOCLAIM
+// is not called, the delivery attempts of the stalled entries are not
+// spent; after the sensor is ready the claims resume. Before T-283 a
+// claim during an engine restart processed the whole batch against a
+// refusing engine ("stalled delivery not acknowledged … connection
+// refused" × the batch, attempts 2→3 toward q:dead). The pause/resumption
+// is logged on the transitions (not on every tick — the gate of a long
+// outage must not spam the log). The log buffer is mutex-guarded: unlike
+// the neighboring log tests, this one reads the log while the loop is
+// still running (the assertions are between the gate's transitions).
+func TestRecoverLoopReadyGate(t *testing.T) {
+	fake := &pacingClaimRedis{fakeClaimRedis: fakeClaimRedis{
+		claimMsgs: []redis.XMessage{
+			{ID: "1718-0", Values: map[string]any{fieldData: `{"task_id":"t1"}`}},
+		},
+		pendRes: map[string][]redis.XPendingExt{
+			"1718-0": {{ID: "1718-0", RetryCount: 2}},
+		},
+	}}
+	ready := make(chan struct{}) // closed — the engine has recovered
+	sensor := func() bool {
+		select {
+		case <-ready:
+			return true
+		default:
+			return false
+		}
+	}
+	var buf syncBuffer
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	r := NewReliab(fake, NewRedisQueue(fake, RedisOptions{}), ReliabOptions{MinIdle: time.Minute})
+	go func() {
+		done <- RecoverLoop(ctx, r, func(_ context.Context, d Delivery) error { return nil },
+			RecoverOptions{
+				Stream: StreamRender, Group: "render-worker", Consumer: "recover-1",
+				Batch: 2, Interval: 20 * time.Millisecond,
+				Ready: sensor,
+				Log:   slog.New(slog.NewTextHandler(&buf, nil)),
+			})
+	}()
+
+	// The engine is down: several gate ticks pass — not a single claim
+	// (attempts are not spent), one pause entry in the log.
+	time.Sleep(120 * time.Millisecond)
+	if n := fake.claims(); n != 0 {
+		t.Fatalf("claims while not ready: %d, want 0 (the claim pass is skipped)", n)
+	}
+	if !strings.Contains(buf.String(), "not ready") {
+		t.Errorf("the gate pause not logged: %q", buf.String())
+	}
+
+	// The engine has recovered: the claim happens, the entry is processed.
+	close(ready)
+	deadline := time.Now().Add(5 * time.Second)
+	for fake.claims() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if n := fake.claims(); n == 0 {
+		t.Fatal("the claim did not resume after the sensor became ready")
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	for !strings.Contains(buf.String(), "ready — claims resume") && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !strings.Contains(buf.String(), "ready — claims resume") {
+		t.Errorf("the gate resumption not logged: %q", buf.String())
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("RecoverLoop: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("RecoverLoop did not stop on ctx cancel")
+	}
+}
+
+// syncBuffer — a mutex-guarded log buffer: the ready-gate test reads the
+// log while the loop goroutine keeps writing into it (recoverLogOpts of
+// the neighboring tests reads only after stop, when the loop has already
+// finished).
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+// TestRecoverLoopReadyGateOff — a nil sensor (isolated builds, workers
+// without an engine probe): the gate is transparent, the claim works as
+// before T-283 (the zero behavior).
+func TestRecoverLoopReadyGateOff(t *testing.T) {
+	fake := &fakeClaimRedis{
+		claimMsgs: []redis.XMessage{
+			{ID: "1718-0", Values: map[string]any{fieldData: `{"task_id":"t1"}`}},
+		},
+		pendRes: map[string][]redis.XPendingExt{
+			"1718-0": {{ID: "1718-0", RetryCount: 1}},
+		},
+	}
+	processed, _, stop := runRecoverLoop(t, fake, RecoverOptions{
+		Stream: StreamHTTP, Group: "http", Consumer: "recover-1",
+		Batch: 4, Interval: time.Hour, Ready: nil,
+	}, nil)
+	waitProcessed(t, processed)
+	stop()
+	if len(fake.claims) != 1 {
+		t.Errorf("XAUTOCLAIM calls: %d, want 1 (a nil sensor does not gate)", len(fake.claims))
+	}
+}

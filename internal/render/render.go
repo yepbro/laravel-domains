@@ -138,6 +138,23 @@ type Options struct {
 	// process (the RSS is unknown) and the control does not work — the
 	// cap there is held by the mem_limit of the Chromium container.
 	MemoryThreshold int64
+	// EngineWait — the budget of waiting for an unreachable engine
+	// (T-283): a restart of the external engine container (a cgroup
+	// OOM-kill → docker restart, a deploy, an update) is a routine
+	// event, not a task error — Manager.Run retries the failed
+	// generation start (connection refused on /json/version and the WS
+	// dial) with a backoff within this budget per task, and only after
+	// its exhaustion the ClassBrowser error goes upward (a re-delivery
+	// is the queue level). The wait applies ONLY to start failures, not
+	// to page executions: the maxRestartsPerTask budget of executions
+	// (a page-killer must not multiply them) is not spent by the waits.
+	// The bound of the value: the total holding time of one delivery by
+	// the handler (Timeout + EngineWait) must stay below the queue's
+	// claim_min_idle, otherwise XAUTOCLAIM re-claims a delivery still
+	// being processed (a duplicate) — the binding is checked by
+	// config.Validate. 0 — disabled (the start error returns
+	// immediately, the pre-T-283 behavior; like MemoryThreshold).
+	EngineWait time.Duration
 	// UserAgent — an identifiable User-Agent of the rendered pages
 	// (spec §9): overrides the browser UA in sessions
 	// (Emulation.setUserAgentOverride). The render section of spec 5.10
@@ -249,6 +266,7 @@ func NewOptions(cfg config.Config) Options {
 		Timeout:             time.Duration(cfg.Render.Timeout),
 		RestartEveryPages:   cfg.Render.RestartEveryPages,
 		MemoryThreshold:     cfg.Render.RestartMemoryBytes.B(),
+		EngineWait:          time.Duration(cfg.Render.EngineWait),
 		UserAgent:           cfg.HTTP.UserAgent,
 		MaxDOMBytes:         cfg.Content.MaxStoreBytes.B(),
 		BlockStylesheet:     cfg.Render.BlockStylesheet,

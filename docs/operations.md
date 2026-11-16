@@ -434,6 +434,11 @@ units) has no dedicated alert: OOM/crash restarts are caught by the
 existing `unit_oom` (T-145), the engine's CDP hang/unavailability — by
 the `render_browser_errors` alert (the growth of the stage's browser
 errors, S-P2-6) and the fallback health gate (`suspended{reason="gate"}`).
+A routine engine restart (an OOM-kill → docker restart within
+`render.engine_wait`, T-283) does not reach the alert at all — the
+worker waits it out without browser-class errors; the restarts it
+survived are counted in `crawler_render_browser_restarts_total{engine}`
+(render.md §"Waiting out an engine restart").
 
 ### 4.4. Routine checks (checklist)
 

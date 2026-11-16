@@ -431,6 +431,22 @@ type Render struct {
 	// unavailable and the control does not work (the ceiling is held by
 	// the container's mem_limit).
 	RestartMemoryBytes ByteSize `yaml:"restart_memory_bytes"`
+	// EngineWait — the budget of waiting for an unreachable render
+	// engine (T-283): a restart of the external engine container (a
+	// cgroup OOM-kill → docker restart, a deploy, an update) is a
+	// routine event, not a task error — the render manager retries the
+	// failed connection within this budget per task (a backoff), the
+	// delivery does not fail and does not burn queue attempts; only
+	// after the exhaustion the browser-class error goes into
+	// a re-delivery (and the recovery claim gate holds the attempts
+	// while the engine is down). The value is bounded from above by the
+	// queue lease: render.timeout + engine_wait < redis.claim_min_idle
+	// (checked by validation) — a delivery held by the waiting handler
+	// longer would be re-claimed by XAUTOCLAIM (a duplicate). 0 —
+	// disabled (the start error returns immediately, the pre-T-283
+	// behavior). The default 5m covers a docker restart of the engine
+	// container (tens of seconds) with a margin for a slow pull.
+	EngineWait Duration `yaml:"engine_wait"`
 	// BlockStylesheet — whether to block CSS in the render context
 	// (T-213): at true the list of the blocked render types (T-062:
 	// Image/Media/Font — 91% of the page weight) is extended with
@@ -1111,6 +1127,17 @@ func Default() *Config {
 			// answer is a second Chromium (:9223) and a second worker
 			// (deploy.md §2.2), not a threshold raise.
 			RestartMemoryBytes: ByteSize(1536 << 20),
+			// The engine-unavailability wait (T-283): 5 m — a docker
+			// restart of the engine container (a cgroup OOM-kill →
+			// restart, a deploy) takes tens of seconds, the budget covers
+			// it with a margin for a slow pull; the upper bound — the
+			// queue lease (validation: render.timeout + engine_wait <
+			// redis.claim_min_idle; 10 m − 25 s by the defaults). A
+			// longer outage (> the budget) is not a restart anymore —
+			// the browser-class error goes into a re-delivery, and the
+			// recovery claim gate (T-283) keeps the attempts while the
+			// engine is down.
+			EngineWait: Duration(5 * time.Minute),
 			// Blocking CSS in the render context (T-213) is disabled by
 			// default: the production behavior does not change until the
 			// A/B (the computed styles risk — the rationale at the
@@ -1869,6 +1896,32 @@ func (c *Config) Validate() error {
 	if t := c.Render.RestartMemoryBytes; t != 0 && (t < 256<<20 || t > 16<<30) {
 		problems = append(problems, fmt.Sprintf("render.restart_memory_bytes: expected 0 (disabled) or %s..%s, got %s",
 			ByteSize(256<<20), ByteSize(16<<30), t))
+	}
+	// The engine-unavailability wait (T-283): 0 — disabled; the working
+	// range 1s..1h; the upper bound — the queue lease: a delivery held
+	// by the waiting handler must be held shorter than
+	// redis.claim_min_idle, otherwise XAUTOCLAIM re-claims a live
+	// delivery and starts a duplicate processing. The budget is WALL
+	// time in Manager.Run — the failed start attempts themselves (the
+	// dial retries) eat into it and do not stack on top; beyond the
+	// budget the delivery can still finish the in-flight tail — up to
+	// (1+maxRestartsPerTask) segments of "a dial (DialTimeout +
+	// SessionStartTimeout, 25 s) + a page (render.timeout)". The formula
+	// covers the regular restart shape (a fast connection refusal of a
+	// recycling container) with that margin; for a deliberately tight
+	// claim window keep a proportional reserve for the tail (the
+	// duplicate is not fatal — processing is idempotent, spec 3.4 — but
+	// it burns a delivery attempt).
+	if w := c.Render.EngineWait; w != 0 {
+		if w < Duration(time.Second) || w > Duration(time.Hour) {
+			problems = append(problems, fmt.Sprintf("render.engine_wait: expected 0 (disabled) or %s..%s, got %s",
+				Duration(time.Second), Duration(time.Hour), w))
+		}
+		if held := time.Duration(c.Render.Timeout) + time.Duration(w); held >= time.Duration(c.Redis.ClaimMinIdle) {
+			problems = append(problems, fmt.Sprintf(
+				"render.engine_wait: render.timeout %s + engine_wait %s ≥ redis.claim_min_idle %s — a delivery held by the waiting handler would be re-claimed (a duplicate) before it finishes; raise redis.claim_min_idle or lower render.engine_wait (T-283)",
+				c.Render.Timeout, w, c.Redis.ClaimMinIdle))
+		}
 	}
 	// The q:render capacity gates (T-174): 0 — the shared threshold
 	// scheduler.queue_high_watermark; a positive value no higher than the

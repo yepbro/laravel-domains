@@ -148,6 +148,28 @@
 // no render and no failure — a routing decision (the Task/duration
 // histogram and the finalize/publish counters count it).
 //
+// The engine restart survival (T-283, the moli v1.1.25 retest of 15.11:
+// 4× cgroup OOM of the engine container, dozens of "stalled delivery
+// not acknowledged … connection refused" per outage, attempts 2→3, the
+// drain frozen until the claim timeouts): a restart of the external
+// engine (an OOM-kill → docker restart, a deploy, an update) is a
+// routine event, not a task error. Three layers hold it: (1) the
+// manager WAITS the failed generation start within render.engine_wait
+// (a backoff, the budget per task) — the delivery held by the handler
+// renders on the recovered engine and is acknowledged, without failing
+// and without the stage error counter / the fallback gate streak (a
+// normal restart stays silent, the render_browser_errors alert's
+// contract); only an outage longer than the budget surfaces a
+// ClassBrowser error (R5, a re-delivery); (2) the reader's browser
+// pause (modePauseBrowser, T-065) keeps the unread deliveries in the
+// stream; (3) the stalled-delivery claim of RecoverLoop is gated by the
+// same probe (RecoverOptions.Ready): while the engine is down the claim
+// passes are skipped — the PEL entries ripen without spending attempts.
+// The worker-observed engine restarts are counted into
+// crawler_render_browser_restarts_total{engine} (the delta poll of
+// Options.Restarts — the manager's generation restarts: for an external
+// engine a restart is a reconnect).
+//
 // All five finalizations without a render — the tarpit T-148, the cert
 // class T-159, the DNS class T-211, the task class T-172 on the last one
 // and the rejected engine-skip T-285 — stamp the "render impossible" marker
@@ -573,6 +595,16 @@ type Options struct {
 	// XACK) with the same Group/Consumer; nil — no recovery
 	// (isolated builds and tests without Redis specifics).
 	Recover *queue.Reliab
+	// Restarts — the source of the generation restart counter of the
+	// render manager (T-283): Run starts a background delta poll
+	// (collectRestarts) that mirrors the growth into
+	// crawler_render_browser_restarts_total{engine} — for an external
+	// engine (moli/lightpanda) a generation restart is a reconnect, i.e.
+	// the worker-observed engine restart (its container was recycled by
+	// the host); the metric fixes the restarts the worker survived by
+	// waiting (render.engine_wait). The production build passes
+	// Manager.Restarts; nil — no collection (isolated builds and tests).
+	Restarts func() int64
 	// TimeoutAttempts — how many deliveries of a task may end
 	// with a page timeout (render.timeout, a predictable tarpit) before
 	// the entry is finalized without a render — the result stays the raw HTML
@@ -1751,6 +1783,31 @@ func renderFailBackoff(streak int) time.Duration {
 	return d
 }
 
+// recoverOptions — the RecoverLoop parameters of the Run loop (T-025):
+// a pure assembly of o and log, so the wiring points are pinned by a unit
+// test (T-283): the claim pace — redis.recover_* (RecoverBatch/
+// RecoverInterval, T-153), the claim gate — the engine probe Options.Alive
+// (RecoverOptions.Ready, T-283): while the engine is down the claim pass
+// is skipped, the delivery attempts of the stalled entries are not spent
+// on a refusing engine; without the probe (nil Alive — isolated builds)
+// the gate is transparent.
+func recoverOptions(o Options, log *slog.Logger) queue.RecoverOptions {
+	return queue.RecoverOptions{
+		Stream:   o.Stream,
+		Group:    o.Group,
+		Consumer: o.Consumer,
+		// The PEL traversal rate — the queue's, not the stage's (redis.recover_*,
+		// T-153); zeros — the queue defaults.
+		Batch:    o.RecoverBatch,
+		Interval: o.RecoverInterval,
+		// The engine gate (T-283) — the same sensor as the reader's
+		// browser pause (modePauseBrowser, readerstate.go B): a dead
+		// engine accepts no tasks, and its claims burn attempts.
+		Ready: o.Alive,
+		Log:   log,
+	}
+}
+
 // Run — the render-worker loop (spec 4.2, §5.6, §7): reads the tasks of the
 // Options.Stream stream (the default q:render; the fallback worker — FR-12 —
 // is built with the q:render-fallback stream) with a consumer group in chunks of
@@ -1765,7 +1822,15 @@ func renderFailBackoff(streak int) time.Duration {
 // stage's ceiling over the Chromium bottleneck (the T-092 §4 measurement: 5.1 s/page).
 // The browser's liveness (Options.Alive) is checked before every read:
 // an unavailable Chromium — a consumption pause, the deliveries stay in the stream
-// unread (not in the PEL), the browser restart is T-065. It runs until
+// unread (not in the PEL), the browser restart is T-065. The same sensor
+// gates the stalled-delivery claim of RecoverLoop (recoverOptions.Ready,
+// T-283): while the engine is down the claim passes are skipped —
+// XAUTOCLAIM would burn the attempts of the stalled entries against
+// a refusing engine (the moli v1.1.25 retest of 15.11: dozens of
+// "stalled delivery not acknowledged … connection refused" per outage,
+// attempts 2→3 toward q:dead); the engine restart itself is waited out
+// INSIDE the manager (render.EngineWait, T-283): the task held by the
+// handler does not fail and does not spend a delivery. It runs until
 // ctx is cancelled and returns nil — the OnRun contract of the framework (T-012; the started
 // tasks finish or return to the queue with a re-delivery,
 // spec 3.4). A read or processing error does not stop the loop:
@@ -1807,25 +1872,34 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 	// The return of stuck deliveries (T-025): a background RecoverLoop on behalf of
 	// the same consumer — an XAUTOCLAIM claim and the same task processing.
 	// RecoverLoopAttempt (T-148): the handler receives the delivery number
-	// (Claimed.Attempts) for the timeout policy. Lives until ctx is cancelled;
-	// Run waits for its exit (a started task finishes or stays
+	// (Claimed.Attempts) for the timeout policy. The claim gate (T-283):
+	// while the engine probe (Options.Alive) reports not ready, the claim
+	// pass is skipped — the attempts of the stalled entries are not spent
+	// on a refusing engine (recoverOptions.Ready). Lives until ctx is
+	// cancelled; Run waits for its exit (a started task finishes or stays
 	// unacknowledged, spec 3.4).
 	if o.Recover != nil {
 		recDone := make(chan struct{})
 		go func() {
 			defer close(recDone)
-			_ = queue.RecoverLoopAttempt(ctx, o.Recover, w.processDelivery, queue.RecoverOptions{
-				Stream:   o.Stream,
-				Group:    o.Group,
-				Consumer: o.Consumer,
-				// The PEL traversal rate — the queue's, not the stage's (redis.recover_*,
-				// T-153); zeros — the queue defaults.
-				Batch:    o.RecoverBatch,
-				Interval: o.RecoverInterval,
-				Log:      log,
-			})
+			_ = queue.RecoverLoopAttempt(ctx, o.Recover, w.processDelivery, recoverOptions(o, log))
 		}()
 		defer func() { <-recDone }()
+	}
+
+	// The generation restart collector (T-283): the delta poll of
+	// Options.Restarts (the manager's counter) into
+	// crawler_render_browser_restarts_total{engine} — the engine
+	// restarts the worker survived are visible in the metrics (the
+	// acceptance of T-283); without the source (isolated builds) — not
+	// started. Lives until ctx is cancelled; Run waits for its exit.
+	if o.Restarts != nil {
+		restDone := make(chan struct{})
+		go func() {
+			defer close(restDone)
+			collectRestarts(ctx, o.Restarts, w.met, 0, log)
+		}()
+		defer func() { <-restDone }()
 	}
 
 	sem := make(chan struct{}, o.Concurrency)
