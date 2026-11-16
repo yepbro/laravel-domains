@@ -340,7 +340,12 @@ func (p *Pipeline) process(ctx context.Context, abs string) Outcome {
 		sameAction := k.Action != nil && *k.Action == f.Action
 		switch {
 		case sameZone && sameAction:
-			dup = k // exact redelivery
+			// The FIRST of the matches: known comes ORDER BY id
+			// (report.go), the "first delivery" references must point
+			// at the earliest one, not at the last the loop saw.
+			if dup == nil {
+				dup = k // exact redelivery
+			}
 		case sameAction:
 			if crossZone == nil {
 				crossZone = k // the same action in another zone
@@ -461,6 +466,45 @@ func (p *Pipeline) emitRow(ctx context.Context, cache map[string]int16, emit fun
 	return emit(Row{ZoneID: id, Label: e.Label, LineNo: lineNo})
 }
 
+// parseOptions — the shared Parse options of the txt stream
+// (streamStage) and the archive members (streamArchive): a meaningful
+// line goes through v.Line, a valid one — into staging via emitRow with
+// the row number base+l.Num (for an archive member base is the offset
+// of the archive's continuous row numbering, T-017; for a txt stream —
+// 0); a per-line parser rejection (invalid_utf8, line_len) is counted
+// in prejects and written to the validator's rejected log
+// (p.opts.RejectLog; a nil log — records suppressed, the counters are
+// kept anyway) in the Validator.reject record format — the "file"
+// attribute is v.file, the validator's own File (f.Path of a txt file
+// or f.Path+"!"+member of an archive one), the same as the validator's
+// own reject records; Reject.Text is already truncated by the parser
+// (maxRejectText).
+func (p *Pipeline) parseOptions(ctx context.Context, v *Validator, base int64, zoneIDs map[string]int16, emit func(Row) error, prejects map[Reason]int) Options {
+	rejectLog := p.opts.RejectLog
+	if rejectLog == nil {
+		rejectLog = slog.New(slog.DiscardHandler)
+	}
+	return Options{
+		OnLine: func(l Line) error {
+			e, _, ok := v.Line(l.Num, l.Text)
+			if !ok {
+				return nil // the rejection is counted by the validator (the rejected log)
+			}
+			return p.emitRow(ctx, zoneIDs, emit, e, base+int64(l.Num))
+		},
+		OnReject: func(rj Reject) error {
+			prejects[rj.Reason]++
+			rejectLog.Warn("line rejected",
+				"file", v.file,
+				"line", rj.Num,
+				"text", rj.Text,
+				"reason", string(rj.Reason),
+			)
+			return nil
+		},
+	}
+}
+
 // streamStage — one pass over the file (no re-reading, spec 3.5): the
 // stream r goes into the parser (T-015), meaningful lines are
 // validated (T-016) and loaded into staging (T-017) as parsing
@@ -483,14 +527,6 @@ func (p *Pipeline) streamStage(ctx context.Context, r io.Reader, f File, batch B
 	if err != nil {
 		return Stats{}, FileResult{}, 0, fmt.Errorf("ingest: the file %s: %w", f.Path, err)
 	}
-	// Per-line parser rejections are written to the same rejected log
-	// as the validator rejections (the format — Validator.reject):
-	// Reject.Text was already truncated by the parser (maxRejectText),
-	// a nil logger — records suppressed.
-	rejectLog := p.opts.RejectLog
-	if rejectLog == nil {
-		rejectLog = slog.New(slog.DiscardHandler)
-	}
 
 	var (
 		st       Stats
@@ -498,25 +534,7 @@ func (p *Pipeline) streamStage(ctx context.Context, r io.Reader, f File, batch B
 	)
 	staged, serr, perr := p.stageStream(ctx, batch, func(emit func(Row) error) error {
 		var perr error
-		st, perr = Parse(r, Options{
-			OnLine: func(l Line) error {
-				e, _, ok := v.Line(l.Num, l.Text)
-				if !ok {
-					return nil // the rejection is counted by the validator (the rejected log)
-				}
-				return p.emitRow(ctx, zoneIDs, emit, e, int64(l.Num))
-			},
-			OnReject: func(rj Reject) error {
-				prejects[rj.Reason]++
-				rejectLog.Warn("line rejected",
-					"file", f.Path,
-					"line", rj.Num,
-					"text", rj.Text,
-					"reason", string(rj.Reason),
-				)
-				return nil
-			},
-		})
+		st, perr = Parse(r, p.parseOptions(ctx, v, 0, zoneIDs, emit, prejects))
 		return perr
 	})
 
@@ -526,15 +544,16 @@ func (p *Pipeline) streamStage(ctx context.Context, r io.Reader, f File, batch B
 	if perr != nil && !errors.Is(perr, errStopped) {
 		return st, FileResult{}, staged, fmt.Errorf("ingest: parsing the file %s: %w", f.Path, perr)
 	}
-	res := v.Finish()
+	res := v.Finish(st.Rejected)
 	res.Reasons = mergeReasons(prejects, res.Reasons)
-	// Per-line parser rejections (invalid_utf8, line_len) never reach
-	// v.Line and are therefore not in the Finish counters — we add them
-	// into the threshold ourselves: the error share is counted over all
-	// meaningful lines of the file (a broken dump is exactly non-UTF-8,
+	// The verdict — from Finish over the validator AND parser
+	// rejections (the single decision function, T-287): the per-line
+	// parser rejections (invalid_utf8, line_len) never reach v.Line and
+	// are therefore not in the Finish counters — the caller passes
+	// their count, the error share is counted over all meaningful lines
+	// of the file (a broken dump is exactly non-UTF-8,
 	// docs/incoming-files.md §4), otherwise a file of pure junk
 	// (Data = 0) would pass as successful (ING-P1-2).
-	res.Failed = overErrorRatio(p.opts.MaxErrorRatio, res.Total, res.Rejected, st.Rejected)
 	return st, res, staged, nil
 }
 

@@ -6,9 +6,12 @@
 // status the render_pending bit is cleared (T-186): the deleted domain
 // leaves the check cycle, the render rework pass will not select it
 // anymore — the bit is cleared in a pair with a decrement of the render
-// debt counter by two statements of one application transaction
-// (applyDeleteSQL + applyClearRenderSQL, T-269: the delta — by the fact
-// of the transition, not by a snapshot).
+// debt counter by the statements of one application transaction (the
+// status move applyDeleteSQL + the guarded pair
+// applyClearRenderSQL/applyRenderDebtDeltaSQL, T-269: the delta — by
+// the fact of the transition, not by a snapshot; T-287: the pair split
+// by the renderClearPendingTx reference — a 0-row guard is a defensive
+// quiet success, not an error; see the applyClearRenderSQL comment).
 package ingest
 
 import (
@@ -29,8 +32,9 @@ import (
 // via the status <> deleted guard predicates. The render_pending bit and
 // the render debt counter are NOT touched by this statement (T-269,
 // previously a CASE in moved and a CTE rd): the "bit × counter" pair is
-// handled by the second statement applyClearRenderSQL of the same
-// transaction — see its comment (the 2026-11-08 incident: a decrement by
+// handled by the applyClearRenderSQL + applyRenderDebtDeltaSQL pair of
+// the same transaction — see their comments (the 2026-11-08 incident: a
+// decrement by
 // the had_render snapshot was applied a SECOND time on top of the
 // concurrent clearing by the rework pass, −36 in one pass). The
 // statement details:
@@ -63,10 +67,10 @@ import (
 //     after waiting for the lock (EvalPlanQual) — the CURRENT committed
 //     version. Columns outside SET are returned by RETURNING at the base
 //     version — that is exactly "the bit at the moment of the
-//     transition", the fact of the transition the second statement keeps
-//     the counter by (PG16 without RETURNING OLD cannot see the old
-//     values of the columns FROM SET — hence the bit is not cleared
-//     here);
+//     transition", the fact of the transition the second pair of
+//     statements keeps the counter by (PG16 without RETURNING OLD
+//     cannot see the old values of the columns FROM SET — hence the bit
+//     is not cleared here);
 //   - the zc CTE — the zone counter deltas over the RETURNING zone_id,
 //     check_state of the moved rows (T-178): total −n and, by the state —
 //     pending −n / queued −n / checked −n (the statement does not change
@@ -137,11 +141,10 @@ SELECT
 	(SELECT coalesce(array_agg(m.zone_id ORDER BY m.zone_id, m.label), '{}'::int2[]) FROM moved AS m WHERE m.had_render) AS render_zones,
 	(SELECT coalesce(array_agg(m.label ORDER BY m.zone_id, m.label), '{}'::text[]) FROM moved AS m WHERE m.had_render) AS render_labels`
 
-// applyClearRenderSQL — the second statement of the ApplyDelete
-// transaction: the pair "clearing the render_pending bit × decrementing
-// the render debt counter" (T-186 owns the transition, T-269 — the
-// shape; the D6 transition of the bit × counter FSM spec —
-// internal/httpworker/renderq.go at renderSetPendingSQL, T-258). The
+// applyClearRenderSQL — the guard statement of the ApplyDelete
+// transaction's second pair: the "bit × counter" FSM's D6 transition
+// (T-186 owns the transition, T-269 — the shape, T-287 — the split by
+// the renderClearPendingTx reference of httpworker, renderq.go). The
 // deleted domain leaves the check cycle (§13.1), the render rework pass
 // will not select it anymore (renderq excludes deleted), and an
 // ownerless bit would hold the render debt counter forever — the T-181
@@ -150,51 +153,71 @@ SELECT
 // The keys are the parallel arrays of applyDeleteSQL
 // (render_zones/render_labels: the moved rows whose bit was set at the
 // moment of the transition); the clearing goes by the GUARD of the bit
-// of the row's current version `(flags & render_pending) <> 0`, the
-// counter delta — by the FACT of the cleared rows (the count from
-// RETURNING): exactly the semantics of the runbooks §6 pair and the
-// httpworker statements (I1 of the FSM: RowsAffected 0 — no transition,
-// the counter is not touched). The guard closes the "snapshot → lock"
+// of the row's current version `(flags & render_pending) <> 0` —
+// exactly the semantics of the runbooks §6 pair and the httpworker
+// statements (I1 of the FSM: RowsAffected 0 — no transition, the
+// counter is not touched). The guard closes the "snapshot → lock"
 // window that broke the single statement of T-186 (the 2026-11-08
-// computed by the SNAPSHOT had_render from pre, while the bit-clearing
-// CASE read the CURRENT version — the rework pass that cleared the bits
-// between the snapshot and the lock had already contributed a −1 each,
-// and rd added a second −n by the snapshot: −36 in one pass with a
-// single set of clearings of −18, the counter at −18 with a zero bit.
-// Now: if a competitor (the rework pass, a second application instance)
-// cleared the bit earlier — the guard yields 0 rows, the counter is not
-// touched (the transition is already accounted for by the competitor,
-// D7); if the bit is set — the clearing and the −1 happen here in one
-// application transaction. The idempotency of re-applying the batch
-// (spec 3.4) is preserved: no moved rows — the arrays are empty, the
-// statement does not run at all (the Go side), no repeated deltas.
+// incident: the decrement was computed by the SNAPSHOT had_render from
+// pre, while the bit-clearing CASE read the CURRENT version — the
+// rework pass that cleared the bits between the snapshot and the lock
+// had already contributed a −1 each, and rd added a second −n by the
+// snapshot: −36 in one pass with a single set of clearings of −18, the
+// counter at −18 with a zero bit).
+//
+// The statement does NOT touch the counter (T-287): RowsAffected — the
+// fact count for applyRenderDebtDeltaSQL, run only when rows were
+// actually cleared. 0 rows over a non-empty key set is a DEFENSIVE
+// quiet success — the renderClearPendingTx parity (I1: RowsAffected 0
+// — no transition, the counter is not touched), not an error: with the
+// current key derivation such a result is not expected. The keys are
+// read from moved.had_render — the row version moved LOCKED — so a
+// competitor's earlier clear (the rework pass, a second instance, D7)
+// removes the domain from the key set itself: RETURNING re-reads the
+// current committed version after waiting for the lock (EvalPlanQual),
+// and between moved and the guard the rows are locked by THIS
+// transaction — nobody can clear the bit in the window (the
+// competitor's clear and its −1 happened before moved took the lock
+// and are excluded from the keys by had_render = false;
+// test/integration/renderbit_test.go, phase 2: "the pair did NOT run
+// (no keys)"). The 0-row branch stands so that a future change of the
+// key derivation (e.g. back to a pre-snapshot) does not turn a
+// competitor's win into a hard error again — the single statement of
+// the T-269 shape merged this case with the counter row's presence
+// check, an empty RETURNING would be read as "the counter row is
+// missing". The idempotency of re-applying the batch (spec 3.4) is
+// preserved: no moved rows — the arrays are empty, the statement does
+// not run at all (the Go side).
 //
 // The "domains → zones → counter" lock order of the docs/schema.md
-// invariant is preserved: cleared re-locks ONLY the rows already locked
-// by moved of the same transaction (the arrays are a subset of the moved
-// rows), there are no new "zones → domains" edges; the counter row —
-// last, like with all the transition writers. The condition
-// `(SELECT count(*) FROM cleared) > 0` does not touch the counter row
-// for files without flagged domains (the single serialization point of
-// the flagging transactions, record.go; the HAVING precedent of T-186).
-// RETURNING value — a row check: an empty result = the 'render_pending'
-// row is missing (migration 000015; only a manual edit can remove it,
-// runbooks §6) — an error is louder than a silent desync (the
-// renderBumpDebtCounter philosophy, T-175). The literal style — schema
-// codes via model.* (like applyDeleteSQL).
-var applyClearRenderSQL = `WITH cleared AS (
-	UPDATE domains AS d
-	SET flags = (d.flags & ` + fmt.Sprintf("%d", int16(^int16(model.FlagRenderPending))) + `)::int2
-	FROM unnest($1::int2[], $2::text[]) AS k(zone_id, label)
-	WHERE d.zone_id = k.zone_id
-	  AND d.label = k.label
-	  AND (d.flags & ` + fmt.Sprintf("%d", int16(model.FlagRenderPending)) + `) <> 0
-	RETURNING 1
-)
-UPDATE crawler_counters
-SET value = value - (SELECT count(*) FROM cleared)
-WHERE name = 'render_pending' AND (SELECT count(*) FROM cleared) > 0
-RETURNING value`
+// invariant is preserved: the guard re-locks ONLY the rows already
+// locked by moved of the same transaction (the arrays are a subset of
+// the moved rows), there are no new "zones → domains" edges; the
+// counter row — last, like with all the transition writers. The
+// literal style — schema codes via model.* (like applyDeleteSQL).
+var applyClearRenderSQL = `UPDATE domains AS d
+SET flags = (d.flags & ` + fmt.Sprintf("%d", int16(^int16(model.FlagRenderPending))) + `)::int2
+FROM unnest($1::int2[], $2::text[]) AS k(zone_id, label)
+WHERE d.zone_id = k.zone_id
+  AND d.label = k.label
+  AND (d.flags & ` + fmt.Sprintf("%d", int16(model.FlagRenderPending)) + `) <> 0`
+
+// applyRenderDebtDeltaSQL — the counter statement of the second pair:
+// the render debt counter's decrement by the fact of the cleared rows
+// (the guard's RowsAffected, not a prepared number — runbooks §6). The
+// renderCounterDeltaSQL shape of httpworker (T-175): RowsAffected != 1
+// — there is no 'render_pending' row (created and backfilled by
+// migration 000015; it can vanish only by a manual table edit,
+// runbooks §6): a silent desync would make the debt gauge a lie — the
+// caller's error is louder and rolls back the whole application
+// (the renderBumpDebtCounter philosophy). Runs only when the guard
+// actually cleared rows: files without flagged domains do not reach
+// the pair at all (the Go side), and a competitor-cleared transition
+// (D7) does not touch the counter row — the single serialization
+// point of the flagging transactions, record.go.
+var applyRenderDebtDeltaSQL = `UPDATE crawler_counters AS c
+SET value = c.value - $1::int8
+WHERE c.name = 'render_pending'`
 
 // DeleteResult — the per-file delete application counters for the report
 // (spec 5.1: "deleted"; written to ingest_files by the T-021 task). File
@@ -215,25 +238,28 @@ type DeleteResult struct {
 // ApplyDelete applies a batch of action=delete from staging (Stage,
 // T-017): moves the status of the matching domains to model.StatusDeleted
 // and clears the render_pending bit with a decrement of the render debt
-// counter — by two statements of ONE transaction (T-186 — the
+// counter — by the statements of ONE transaction (T-186 — the
 // transition, T-269 — the pair's shape: the delta by the fact of the
 // transition, not by a snapshot; the 2026-11-08 incident — the
-// applyClearRenderSQL comment) — and returns the file row counters
-// (DeleteResult). The domains stay in the DB (spec 13.1); the results
-// and content references are removed by the background task (T-020).
+// applyClearRenderSQL comment; T-287 — the pair split with a 0-row
+// guard as a defensive quiet success) — and returns the file row
+// counters (DeleteResult). The domains stay in the DB (spec 13.1); the
+// results and content references are removed by the background task
+// (T-020).
 //
-// The application is the applyDeleteSQL + applyClearRenderSQL
-// transaction: an empty batch — a no-op with zero counters; a failure of
-// any step rolls back the move and the pair entirely — a repeated
-// delivery of the file converges to the same state (spec 3.4). After the
-// application the batch is cleaned from staging (ClearBatch, stage.go) —
-// staging does not grow from file to file. The cleanup is a separate
-// statement outside the application transaction: a failure between them
-// is harmless — re-applying will move the same domains to the same
-// deleted (a no-op state-wise, the bit arrays are empty) and will finish
-// cleaning the batch (spec 3.4). On a cleanup error the counters are
-// returned together with the error: the application has already
-// happened, the report on it is valid.
+// The application is the applyDeleteSQL + applyClearRenderSQL +
+// applyRenderDebtDeltaSQL transaction: an empty batch — a no-op with
+// zero counters; a failure of any step rolls back the move and the pair
+// entirely — a repeated delivery of the file converges to the same
+// state (spec 3.4). After the application the batch is cleaned from
+// staging (ClearBatch, stage.go) — staging does not grow from file to
+// file. The cleanup is a separate statement outside the application
+// transaction: a failure between them is harmless — re-applying will
+// move the same domains to the same deleted (a no-op state-wise, the
+// bit arrays are empty) and will finish cleaning the batch (spec 3.4).
+// On a cleanup error the counters are returned together with the
+// error: the application has already happened, the report on it is
+// valid.
 func ApplyDelete(ctx context.Context, pool ApplyDB, b Batch) (DeleteResult, error) {
 	if b.ID == (BatchID{}) {
 		return DeleteResult{}, errors.New("ingest: batch without an identifier (ingest.NewBatchID)")
@@ -304,30 +330,49 @@ func applyDeleteCounters(ctx context.Context, tx pgx.Tx, b Batch) (DeleteResult,
 	return res, zones, labels, nil
 }
 
-// applyDeleteClearRender runs applyClearRenderSQL — the pair "clearing
-// the bit × decrementing the counter" over the keys of the transition's
-// bit rows (T-186/T-269; the SQL comment). An empty RETURNING result —
-// the 'render_pending' counter row is missing: a silent desync is
-// unacceptable, an error is louder (the renderBumpDebtCounter
-// philosophy, runbooks §6).
+// applyDeleteClearRender runs the second pair — the guarded bit clear
+// (applyClearRenderSQL) and, by its fact, the render debt counter's
+// decrement (applyRenderDebtDeltaSQL) — over the keys of the
+// transition's bit rows (T-186/T-269/T-287; the SQL comments). The
+// guard's RowsAffected == 0 — a DEFENSIVE quiet success (the
+// renderClearPendingTx parity of httpworker: RowsAffected 0 — no
+// transition, the counter is not touched; a writer must not turn a
+// competitor's win into an error); with the current key derivation
+// (moved.had_render of the locked row version) it is not expected over
+// a non-empty key set — a competitor's earlier clear drops the key at
+// moved itself (see the applyClearRenderSQL comment). The counter
+// row's presence is checked only when rows were actually cleared (the
+// renderBumpDebtCounter philosophy, runbooks §6).
 func applyDeleteClearRender(ctx context.Context, tx pgx.Tx, zones []int16, labels []string) error {
-	rows, err := tx.Query(ctx, applyClearRenderSQL, zones, labels)
+	tag, err := tx.Exec(ctx, applyClearRenderSQL, zones, labels)
 	if err != nil {
 		return fmt.Errorf("ingest: applying delete: clearing the render_pending bit: %w", err)
 	}
-	defer rows.Close()
-	if !rows.Next() {
-		if err := rows.Err(); err != nil {
-			return fmt.Errorf("ingest: applying delete: clearing the render_pending bit: %w", err)
-		}
+	if tag.RowsAffected() == 0 {
+		// A defensive no-op: no transition fact — the counter is not
+		// touched (the renderClearPendingTx parity).
+		return nil
+	}
+	return applyRenderDebtDelta(ctx, tx, tag.RowsAffected())
+}
+
+// applyRenderDebtDelta — the render debt counter's decrement by the
+// fact of the cleared rows in the OPEN bit transition transaction (the
+// renderCounterDeltaSQL/renderBumpDebtCounter shape of httpworker,
+// T-175): n — the count from the guard's RowsAffected, not a prepared
+// number (runbooks §6). RowsAffected != 1 — there is no
+// 'render_pending' row (created and backfilled by migration 000015; it
+// can vanish only by a manual table edit, runbooks §6): the error
+// rolls back the caller's transaction — the bit and the counter change
+// only together (§3.4); a silent desync would make the debt gauge a
+// lie — the error is louder.
+func applyRenderDebtDelta(ctx context.Context, tx pgx.Tx, n int64) error {
+	tag, err := tx.Exec(ctx, applyRenderDebtDeltaSQL, n)
+	if err != nil {
+		return fmt.Errorf("ingest: applying delete: clearing the render_pending bit: the render debt counter: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
 		return fmt.Errorf("ingest: applying delete: clearing the render_pending bit: the 'render_pending' counter row is missing (migration 000015, runbooks §6)")
-	}
-	var discarded int64
-	if err := rows.Scan(&discarded); err != nil {
-		return fmt.Errorf("ingest: applying delete: clearing the render_pending bit: read: %w", err)
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("ingest: applying delete: clearing the render_pending bit: %w", err)
 	}
 	return nil
 }

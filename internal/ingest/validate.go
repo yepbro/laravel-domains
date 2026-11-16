@@ -381,12 +381,36 @@ type FileResult struct {
 	Failed bool
 }
 
+// overErrorRatio — the error-share threshold of the file verdict — the
+// single decision function behind Validator.Finish (T-287, 01#P2-1):
+// both the txt stream (streamStage) and the archive members
+// (streamArchive) take the Failed verdict from Finish, no caller
+// recomputes it. The parser rejections join the validator ones both in
+// the numerator and the denominator — the share is counted over ALL
+// meaningful lines of the file (a broken dump is exactly non-UTF-8,
+// docs/incoming-files.md §4, ING-P1-2). A file without meaningful rows
+// does not count as bad, a share equal to the threshold does not sink
+// it (spec 5.1).
+func overErrorRatio(ratio float64, validatorTotal, validatorRejected, parserRejected int) bool {
+	if total := validatorTotal + parserRejected; total > 0 {
+		return float64(validatorRejected+parserRejected)/float64(total) > ratio
+	}
+	return false
+}
+
 // Finish completes file validation and returns the outcome: the
-// counters and the verdict by the error share threshold. The threshold
-// is compared strictly: a share equal to the threshold does not fail
-// the file ("single bad lines", spec 5.1); a file without meaningful
-// lines is not considered invalid.
-func (v *Validator) Finish() FileResult {
+// counters and the verdict by the error share threshold — the single
+// decision function of the "file is bad" verdict (T-287, 01#P2-1):
+// both the txt stream (streamStage: the parser's st.Rejected) and the
+// archive members (streamArchive: the member's mst.Rejected) take
+// Failed from here. parserRejected — the per-line parser rejections of
+// the same content (invalid_utf8, line_len: the T-015 parser rejects
+// them before the validator sees them, they never reach Line and are
+// not in the validator's counters); a direct validator caller passes
+// 0. The threshold is compared strictly: a share equal to the
+// threshold does not fail the file ("single bad lines", spec 5.1); a
+// file without meaningful lines is not considered invalid.
+func (v *Validator) Finish(parserRejected int) FileResult {
 	rejected := v.total - v.accepted
 	return FileResult{
 		ValidatorStats: ValidatorStats{
@@ -395,7 +419,7 @@ func (v *Validator) Finish() FileResult {
 			Rejected: rejected,
 			Reasons:  v.reasons,
 		},
-		Failed: v.total > 0 && float64(rejected)/float64(v.total) > v.ratio,
+		Failed: overErrorRatio(v.ratio, v.total, rejected, parserRejected),
 	}
 }
 

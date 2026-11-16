@@ -31,7 +31,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"os"
 	"path"
 	"strings"
@@ -114,17 +113,6 @@ func junkMember(name string) bool {
 		if strings.HasPrefix(part, ".") || part == "__MACOSX" {
 			return true
 		}
-	}
-	return false
-}
-
-// overErrorRatio — the combined error-share threshold (parser plus
-// validator rejections, like a txt file in streamStage): a file without
-// meaningful rows does not count as bad, a share equal to the threshold
-// does not sink it (spec 5.1).
-func overErrorRatio(ratio float64, validatorTotal, validatorRejected, parserRejected int) bool {
-	if total := validatorTotal + parserRejected; total > 0 {
-		return float64(validatorRejected+parserRejected)/float64(total) > ratio
 	}
 	return false
 }
@@ -474,13 +462,6 @@ func (p *Pipeline) streamArchive(ctx context.Context, fh *os.File, f File, kind 
 		agg     archiveTotals
 		lineOff int64 // the archive's continuous row number: the batch's line_no grows
 	)
-	// The parser's per-row rejections are written to the same rejected
-	// log as the validator's (the streamStage style); a nil logger —
-	// records suppressed.
-	rejectLog := p.opts.RejectLog
-	if rejectLog == nil {
-		rejectLog = slog.New(slog.DiscardHandler)
-	}
 
 	produce := func(emit func(Row) error) error {
 		for {
@@ -508,25 +489,7 @@ func (p *Pipeline) streamArchive(ctx context.Context, fh *os.File, f File, kind 
 				return fmt.Errorf("ingest: the archive %s: %w", f.Path, verr)
 			}
 			prejects := make(map[Reason]int)
-			mst, perr := Parse(m.r, Options{
-				OnLine: func(l Line) error {
-					e, _, ok := v.Line(l.Num, l.Text)
-					if !ok {
-						return nil // the rejection is accounted for by the validator (the rejected log)
-					}
-					return p.emitRow(ctx, zoneIDs, emit, e, lineOff+int64(l.Num))
-				},
-				OnReject: func(rj Reject) error {
-					prejects[rj.Reason]++
-					rejectLog.Warn("line rejected",
-						"file", f.Path+"!"+m.name,
-						"line", rj.Num,
-						"text", rj.Text,
-						"reason", string(rj.Reason),
-					)
-					return nil
-				},
-			})
+			mst, perr := Parse(m.r, p.parseOptions(ctx, v, lineOff, zoneIDs, emit, prejects))
 			if m.closer != nil {
 				// A zip member's CRC is verified by reading to the end;
 				// Close is resource release, the error has already
@@ -544,9 +507,12 @@ func (p *Pipeline) streamArchive(ctx context.Context, fh *os.File, f File, kind 
 				}
 				return fmt.Errorf("member %s: %w", m.name, perr) // infrastructure
 			}
-			res := v.Finish()
+			res := v.Finish(mst.Rejected)
 			agg.add(mst, res, prejects)
-			if overErrorRatio(p.opts.MaxErrorRatio, res.Total, res.Rejected, mst.Rejected) {
+			// The verdict — from Finish (the single decision function,
+			// T-287): the member's parser rejections join the validator
+			// ones in the error share.
+			if res.Failed {
 				return fmt.Errorf("%w: %s!%s: the share of rejected lines %d of %d is above ingest.max_error_ratio (%g)",
 					errArchiveRejected, f.Path, m.name, res.Rejected+mst.Rejected, res.Total+mst.Rejected, p.opts.MaxErrorRatio)
 			}
@@ -575,6 +541,11 @@ func (p *Pipeline) streamArchive(ctx context.Context, fh *os.File, f File, kind 
 	}
 	out := archiveResult{
 		Stats: agg.stats,
+		// Failed is not set here: a member over the threshold fails the
+		// whole archive earlier (errArchiveRejected from the member's
+		// Finish verdict), so the aggregate of the processed members is
+		// always «not failed» (the verdict's single decision function —
+		// Validator.Finish, T-287).
 		Result: FileResult{ValidatorStats: ValidatorStats{
 			Total:    agg.content,
 			Accepted: agg.accepted,

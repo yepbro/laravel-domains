@@ -629,13 +629,19 @@ setting the flag in the result-write transaction (internal/httpworker); `−1` �
 clearing by the render catch-up pass and by applying a delete file (T-186: a deleted
 domain leaves the check cycle §13.1; the pass will not select it again),
 always in the same transaction as the
-bit transition (§3.4 — a rollback rolls back the pair). Applying a delete — TWO
+bit transition (§3.4 — a rollback rolls back the pair). Applying a delete — the
 statements of one transaction (T-269, the 08.11.2026 incident: the decrement based on
 the snapshot `had_render` was applied second, on top of a concurrent clearing by the
-catch-up pass — −36 in one pass): the status transition without touching flags
+catch-up pass — −36 in one pass; T-287 — the pair split by the
+`renderClearPendingTx` reference: the keys come from the locked row version, so
+a competitor's earlier clear drops the key at the status transition itself
+(EvalPlanQual); a 0-row guard stays a defensive quiet success — the counter is
+not touched, the transaction commits): the status transition without touching flags
 (the RETURNING of the update carries the "the bit was set" fact anchored to the
 row version the update was based on) and
-the guarded pair "bit clearing × −count(fact)" over the bit-string keys —
+the guarded pair "bit clearing × −count(fact)" over the bit-row keys as two
+statements — the guard UPDATE (RowsAffected is the fact count) and the counter
+delta by it —
 the delta is tied to the current version's transition fact; the "snapshot →
 lock" window is closed (mirroring the D7 guard). The initial value —
 the one-off

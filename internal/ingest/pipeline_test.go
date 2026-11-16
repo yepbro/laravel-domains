@@ -816,6 +816,55 @@ func TestPipelineDuplicate(t *testing.T) {
 	}
 }
 
+// TestPipelineDuplicateFirstDelivery — several journal rows match the
+// exact-redelivery triple (reachable for zone-less files: zone_id NULL
+// does not conflict in the unique, migration 000009 — parallel
+// instances may write several): the "already processed" log references
+// the FIRST delivery (known comes ORDER BY id, report.go), not the last
+// one the classification loop happened to see (T-287, 01#P3-2).
+func TestPipelineDuplicateFirstDelivery(t *testing.T) {
+	pt := newPipeTest(t)
+	content := "example.com\n"
+	abs := pt.addFile(t, "add/list.txt", content) // a zone-less file
+	sha := sha256.Sum256([]byte(content))
+	add := model.ActionAdd
+	first, second := "add/first.txt", "add/second.txt"
+	at1 := time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC)
+	at2 := time.Date(2026, 10, 2, 9, 0, 0, 0, time.UTC)
+	// The insertion order mirrors ORDER BY id (the earliest first).
+	pt.files = newFakeFileStore(
+		model.IngestFile{ID: 5, ZoneID: nil, Action: &add, Path: &first,
+			SHA256: sha[:], ProcessedAt: &at1},
+		model.IngestFile{ID: 9, ZoneID: nil, Action: &add, Path: &second,
+			SHA256: sha[:], ProcessedAt: &at2},
+	)
+	var buf bytes.Buffer
+	pipe, err := NewPipeline(pt.zones, pt.files, pt.pool, PipelineOptions{
+		Dir:       pt.dir,
+		BatchSize: 10,
+		Log:       slog.New(slog.NewTextHandler(&buf, nil)),
+		Now:       func() time.Time { return pt.now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := pipe.Process(context.Background(), abs)
+	if err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if out.Kind != OutcomeDuplicate {
+		t.Fatalf("the outcome = %s, want duplicate", out.Kind)
+	}
+	logged := buf.String()
+	if !strings.Contains(logged, "first_path="+first) {
+		t.Errorf("the duplicate log = %q, want the FIRST delivery %q in first_path", logged, first)
+	}
+	if strings.Contains(logged, "first_path="+second) {
+		t.Errorf("the duplicate log = %q, want the LAST delivery %q NOT referenced (the earliest delivery is the meaningful one)", logged, second)
+	}
+}
+
 // TestPipelineDuplicateOtherZoneWarn — a sha256 duplicate in another zone
 // with the same action (T-113): no exact redelivery, the file is applied
 // (the first delivery did not touch this zone's domains) — but a Warn is

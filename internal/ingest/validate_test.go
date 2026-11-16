@@ -190,7 +190,7 @@ func TestErrorRatioBoundary(t *testing.T) {
 		for i := 0; i < bad; i++ {
 			v.Line(good+i+1, "example.org") // not from the zone
 		}
-		return v.Finish()
+		return v.Finish(0)
 	}
 	t.Run("the share equals the threshold", func(t *testing.T) {
 		if res := run(t, 0.5, 2, 2); res.Failed {
@@ -212,8 +212,40 @@ func TestErrorRatioBoundary(t *testing.T) {
 	})
 	t.Run("a file without lines", func(t *testing.T) {
 		v, _ := newValidator(t, "com", 0.5)
-		if res := v.Finish(); res.Failed || res.Total != 0 {
+		if res := v.Finish(0); res.Failed || res.Total != 0 {
 			t.Errorf("an empty file is not bad, got %+v", res)
+		}
+	})
+}
+
+// The parser rejections join the verdict's threshold (T-287, 01#P2-1):
+// Finish is the SINGLE decision function of the "file is bad" verdict
+// for both the txt stream and the archive members — the per-line parser
+// rejections (invalid_utf8, line_len) never reach v.Line, so the caller
+// passes their count: a file of pure junk (the validator saw no lines
+// at all) must fail, not pass as successful (ING-P1-2,
+// docs/incoming-files.md §4).
+func TestFinishParserRejected(t *testing.T) {
+	t.Run("without parser rejections the verdict does not change", func(t *testing.T) {
+		v, _ := newValidator(t, "com", 0.5)
+		v.Line(1, "example.com")
+		v.Line(2, "example.org") // wrong_zone
+		if res := v.Finish(0); res.Failed {
+			t.Errorf("1 of 2 at the 0.5 threshold with 0 parser rejections: the file must not be bad: %+v", res)
+		}
+	})
+	t.Run("parser rejections push the share over the threshold", func(t *testing.T) {
+		v, _ := newValidator(t, "com", 0.5)
+		v.Line(1, "example.com")
+		v.Line(2, "example.org") // wrong_zone
+		if res := v.Finish(2); !res.Failed {
+			t.Errorf("3 of 4 at the 0.5 threshold (2 parser rejections): the file must be bad: %+v", res)
+		}
+	})
+	t.Run("a file of pure junk — all lines rejected by the parser", func(t *testing.T) {
+		v, _ := newValidator(t, "com", 0.1)
+		if res := v.Finish(5); !res.Failed {
+			t.Errorf("5 of 5 parser rejections: the file must be bad (ING-P1-2): %+v", res)
 		}
 	})
 }
@@ -226,7 +258,7 @@ func TestFinishStats(t *testing.T) {
 	for i, line := range lines {
 		v.Line(i+1, line)
 	}
-	res := v.Finish()
+	res := v.Finish(0)
 	if res.Total != 5 || res.Accepted != 2 || res.Rejected != 3 {
 		t.Errorf("the counters: total=%d accepted=%d rejected=%d, want 5/2/3",
 			res.Total, res.Accepted, res.Rejected)
@@ -367,7 +399,7 @@ func TestValidatorZoneless(t *testing.T) {
 		t.Errorf("a line without a domain = ok=%v reason %s, want no_domain", ok, reason)
 	}
 
-	res := v.Finish()
+	res := v.Finish(0)
 	if res.Accepted != len(cases)+1 || res.Rejected != 2 || res.Failed {
 		t.Errorf("Finish = %+v, want %d accepted, 2 rejected, not failed", res, len(cases)+1)
 	}
@@ -409,7 +441,7 @@ func TestValidatorZonelessNumericZone(t *testing.T) {
 	if _, reason, ok := v.Line(5, datesOnly); ok || reason != ReasonNoDomain {
 		t.Errorf("the line of dates = ok=%v reason %s, want no_domain", ok, reason)
 	}
-	res := v.Finish()
+	res := v.Finish(0)
 	if res.Accepted != 2 || res.Rejected != 3 || res.Failed {
 		t.Errorf("Finish = %+v, want 2 accepted, 3 rejected, not failed", res)
 	}

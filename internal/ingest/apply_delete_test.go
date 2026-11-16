@@ -2,16 +2,21 @@
 // zones_test.go style): the SQL text and arguments, the counters, the
 // "apply → clean" order, an empty batch, the retry idempotency
 // (spec 3.4), the pair "clearing the render_pending bit × decrementing
-// the debt counter" by two statements of one transaction
-// (T-186/T-269), carrying the bit row keys between the statements, the
-// step and cleanup errors, the ctx cancellation. The real behavior
-// against a live DB — the ingest integration tests (T-023) and renderbit
-// (the race of the 2026-11-08 incident, T-269).
+// the debt counter" by the guarded clear and the counter delta of one
+// transaction (T-186/T-269; T-287 — the pair split: a 0-row guard over
+// non-empty keys is a DEFENSIVE quiet success, not a counter error —
+// with the current key derivation it is not expected, the competitor's
+// earlier clear drops the key at moved itself, see the
+// applyClearRenderSQL comment), carrying the bit row keys between the
+// statements, the step and cleanup errors, the ctx cancellation. The
+// real behavior against a live DB — the ingest integration tests
+// (T-023) and renderbit (the race of the 2026-11-08 incident, T-269).
 package ingest
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -23,21 +28,25 @@ import (
 )
 
 // applyDeletePool — an ApplyDB for the delete application tests: the
-// Begin → applyDeleteSQL → applyClearRenderSQL → Commit transaction,
-// then the batch cleanup through the pool. Remembers the call order
-// with the SQL and the arguments; the statement answers are prepared
-// rows (a positional Scan, the cleanupFakeRows style). Step errors —
-// by named fields.
+// Begin → applyDeleteSQL → applyClearRenderSQL → applyRenderDebtDeltaSQL
+// → Commit transaction, then the batch cleanup through the pool.
+// Remembers the call order with the SQL and the arguments; the
+// application statement's answer is prepared rows (a positional Scan,
+// the cleanupFakeRows style), the pair's statements answer by
+// RowsAffected. Step errors — by named fields.
 type applyDeletePool struct {
 	ops  []string // the order: "begin", "query:<sql>", "commit", "exec:<sql>"
 	args [][]any  // the operation arguments in call order
 
 	applyRows *cleanupFakeRows // the applyDeleteSQL answer: deleted, not_found, render_zones, render_labels
-	clearRows *cleanupFakeRows // the applyClearRenderSQL answer: value
+
+	clearAffected int64 // the applyClearRenderSQL answer: RowsAffected (0 — a defensive no-clear answer)
+	deltaAffected int64 // the applyRenderDebtDeltaSQL answer: RowsAffected (0 — the counter row is missing)
 
 	beginErr     error
 	applyErr     error
 	clearRendErr error
+	deltaErr     error // the applyRenderDebtDeltaSQL statement failure
 	commitErr    error
 	clearErr     error // the batch cleanup (pool)
 
@@ -107,20 +116,31 @@ func (t *applyDeleteTx) Query(ctx context.Context, sql string, args ...any) (pgx
 			return nil, errors.New("applyDeletePool: the applyDeleteSQL response is not set")
 		}
 		return p.applyRows, nil
-	case applyClearRenderSQL:
-		if p.clearRendErr != nil {
-			return nil, p.clearRendErr
-		}
-		if p.clearRows == nil {
-			return nil, errors.New("applyDeletePool: the applyClearRenderSQL response is not set")
-		}
-		return p.clearRows, nil
 	}
 	return nil, errors.New("applyDeletePool: unexpected Query: " + sql)
 }
 
-func (t *applyDeleteTx) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
-	return pgconn.CommandTag{}, errors.New("applyDeletePool: Exec inside a transaction must not be called")
+// The pair's statements — Exec by RowsAffected (the renderClearPendingTx
+// protocol of httpworker, T-287): the guard's answer is clearAffected,
+// the delta's — deltaAffected; the statements' failures — clearRendErr
+// and deltaErr.
+func (t *applyDeleteTx) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	p := t.pool
+	p.ops = append(p.ops, "exec:"+sql)
+	p.args = append(p.args, args)
+	switch sql {
+	case applyClearRenderSQL:
+		if p.clearRendErr != nil {
+			return pgconn.CommandTag{}, p.clearRendErr
+		}
+		return pgconn.NewCommandTag(fmt.Sprintf("UPDATE %d", p.clearAffected)), nil
+	case applyRenderDebtDeltaSQL:
+		if p.deltaErr != nil {
+			return pgconn.CommandTag{}, p.deltaErr
+		}
+		return pgconn.NewCommandTag(fmt.Sprintf("UPDATE %d", p.deltaAffected)), nil
+	}
+	return pgconn.CommandTag{}, errors.New("applyDeletePool: unexpected Exec: " + sql)
 }
 
 func (t *applyDeleteTx) Commit(context.Context) error {
@@ -160,17 +180,19 @@ func wantApplyArgs(b Batch) []any {
 }
 
 // TestApplyDelete — the full application protocol with bit rows: the
-// transaction (the status move → the bit clearing with the counter over
-// the applyDeleteSQL keys → the commit), then the batch cleanup. The
-// bit row keys (render_zones/render_labels) are passed to the second
-// statement pair verbatim.
+// transaction (the status move → the bit clearing by the
+// applyDeleteSQL keys → the counter delta by the fact of the cleared →
+// the commit), then the batch cleanup. The bit row keys
+// (render_zones/render_labels) are passed to the guard verbatim, the
+// delta's argument — the guard's RowsAffected.
 func TestApplyDelete(t *testing.T) {
 	b := validDeleteBatch(t)
 	zones := []int16{7, 9}
 	labels := []string{"a.example", "b.example"}
 	pool := &applyDeletePool{
-		applyRows: cleanupRows([]any{int64(5), int64(2), zones, labels}),
-		clearRows: cleanupRows([]any{int64(3)}),
+		applyRows:     cleanupRows([]any{int64(5), int64(2), zones, labels}),
+		clearAffected: 2,
+		deltaAffected: 1,
 	}
 
 	res, err := ApplyDelete(context.Background(), pool, b)
@@ -181,9 +203,9 @@ func TestApplyDelete(t *testing.T) {
 		t.Errorf("the counters = %+v, want {5 2}", res)
 	}
 
-	// The order: begin → the application → the bit clearing → commit →
-	// the cleanup.
-	want := []string{"begin", "query:" + applyDeleteSQL, "query:" + applyClearRenderSQL, "commit", "exec:" + clearStageSQL}
+	// The order: begin → the application → the bit clearing → the
+	// counter delta → commit → the cleanup.
+	want := []string{"begin", "query:" + applyDeleteSQL, "exec:" + applyClearRenderSQL, "exec:" + applyRenderDebtDeltaSQL, "commit", "exec:" + clearStageSQL}
 	if !reflect.DeepEqual(pool.ops, want) {
 		t.Fatalf("the call order = %v, want %v", pool.ops, want)
 	}
@@ -193,8 +215,11 @@ func TestApplyDelete(t *testing.T) {
 	if !reflect.DeepEqual(pool.args[1], []any{zones, labels}) {
 		t.Errorf("the bit-clear arguments = %#v, want [%v %v]", pool.args[1], zones, labels)
 	}
-	if !reflect.DeepEqual(pool.args[2], []any{b.ID[:]}) {
-		t.Errorf("the cleanup arguments = %#v, want the batch identifier", pool.args[2])
+	if !reflect.DeepEqual(pool.args[2], []any{int64(2)}) {
+		t.Errorf("the delta arguments = %#v, want [2] (the fact of the cleared rows)", pool.args[2])
+	}
+	if !reflect.DeepEqual(pool.args[3], []any{b.ID[:]}) {
+		t.Errorf("the cleanup arguments = %#v, want the batch identifier", pool.args[3])
 	}
 	if pool.commits != 1 || pool.rollbacks != 0 {
 		t.Errorf("commit=%d rollback=%d, want 1/0", pool.commits, pool.rollbacks)
@@ -325,29 +350,26 @@ SELECT
 	}
 }
 
-// TestApplyClearRenderSQLContract — the exact text of the second pair:
-// the bit clearing by the GUARD of the current version (the
-// "snapshot → lock" window of the 2026-11-08 incident is closed: a
-// concurrent clearing yields 0 rows, the counter is not touched —
-// mirroring D7); the decrement — by the fact of the cleared rows (the
-// count from RETURNING, runbooks §6); the counter row is not touched by
-// files without flagged domains (the guard count > 0); the RETURNING —
-// the row presence check (migration 000015).
+// TestApplyClearRenderSQLContract — the exact texts of the second pair,
+// split by the renderClearPendingTx reference of httpworker (T-287):
+// the guard UPDATE clears the bits by the guard of the CURRENT row
+// version and does not touch the counter (RowsAffected — the fact
+// count: 0 over non-empty keys — a DEFENSIVE quiet success, not
+// reachable with the current key derivation — moved.had_render drops
+// the competitor-cleared keys, see the applyClearRenderSQL comment);
+// the delta decrements the counter by the parameter (the fact count
+// from the guard's RowsAffected) and does not touch domains. The
+// counter row is not touched by files without flagged domains (the
+// pair does not run at all — the Go side) and with nothing actually
+// cleared (the delta runs only over the fact > 0).
 func TestApplyClearRenderSQLContract(t *testing.T) {
-	want := `WITH cleared AS (
-	UPDATE domains AS d
-	SET flags = (d.flags & -3)::int2
-	FROM unnest($1::int2[], $2::text[]) AS k(zone_id, label)
-	WHERE d.zone_id = k.zone_id
-	  AND d.label = k.label
-	  AND (d.flags & 2) <> 0
-	RETURNING 1
-)
-UPDATE crawler_counters
-SET value = value - (SELECT count(*) FROM cleared)
-WHERE name = 'render_pending' AND (SELECT count(*) FROM cleared) > 0
-RETURNING value`
-	if applyClearRenderSQL != want {
+	wantGuard := `UPDATE domains AS d
+SET flags = (d.flags & -3)::int2
+FROM unnest($1::int2[], $2::text[]) AS k(zone_id, label)
+WHERE d.zone_id = k.zone_id
+  AND d.label = k.label
+  AND (d.flags & 2) <> 0`
+	if applyClearRenderSQL != wantGuard {
 		t.Errorf("applyClearRenderSQL = %q, want an exact match", applyClearRenderSQL)
 	}
 	// The bit guard — over the row's current version (the
@@ -356,10 +378,24 @@ RETURNING value`
 	if !strings.Contains(applyClearRenderSQL, "AND (d.flags & 2) <> 0") {
 		t.Errorf("the SQL = %q, want a guard of the current version's bit", applyClearRenderSQL)
 	}
-	// The delta — only by the rows actually cleared (the count from
-	// RETURNING), not by a prepared number.
-	if !strings.Contains(applyClearRenderSQL, "value - (SELECT count(*) FROM cleared)") {
-		t.Errorf("the SQL = %q, want a decrement by the actually cleared", applyClearRenderSQL)
+	// The guard does not touch the counter: the "no counter row"
+	// diagnosis is possible only by the fact of the cleared rows (the
+	// delta below), an empty guard must not fail the transaction (D7).
+	if strings.Contains(applyClearRenderSQL, "crawler_counters") {
+		t.Errorf("the SQL = %q, want the guard WITHOUT a counter touch (the D7 quiet success, T-287)", applyClearRenderSQL)
+	}
+
+	wantDelta := `UPDATE crawler_counters AS c
+SET value = c.value - $1::int8
+WHERE c.name = 'render_pending'`
+	if applyRenderDebtDeltaSQL != wantDelta {
+		t.Errorf("applyRenderDebtDeltaSQL = %q, want an exact match", applyRenderDebtDeltaSQL)
+	}
+	// The delta — only by the rows actually cleared (the parameter —
+	// the guard's RowsAffected), not by a prepared number; the
+	// renderCounterDeltaSQL shape of httpworker (T-175).
+	if !strings.Contains(applyRenderDebtDeltaSQL, "c.value - $1::int8") {
+		t.Errorf("the SQL = %q, want a decrement by the parameter (the fact of the cleared)", applyRenderDebtDeltaSQL)
 	}
 }
 
@@ -485,10 +521,19 @@ func TestApplyDeleteApplyError(t *testing.T) {
 	}
 }
 
-// TestApplyDeleteClearRenderError — the second pair's errors: a
-// statement failure and a missing counter row roll back the whole
-// application (a silent desync "the bit cleared — the counter not
-// moved" is unacceptable, the renderBumpDebtCounter philosophy).
+// TestApplyDeleteClearRenderError — the second pair's error paths: a
+// guard statement failure, a delta statement failure and a missing
+// counter row (with rows actually cleared — the delta's RowsAffected 0)
+// roll back the whole application (a silent desync "the bit cleared —
+// the counter not moved" is unacceptable, the renderBumpDebtCounter
+// philosophy). A guard WITHOUT cleared rows over non-empty keys — the
+// DEFENSIVE quiet success (T-287, the renderClearPendingTx parity): no
+// transition fact — the counter is not touched, the transaction
+// COMMITS (the move and the zone deltas are not lost). With the
+// current key derivation such an answer is not expected (the
+// competitor's earlier clear drops the key at moved itself) — the
+// branch protects a future change of the key derivation from turning a
+// competitor's win into a hard error.
 func TestApplyDeleteClearRenderError(t *testing.T) {
 	t.Run("an operator failure", func(t *testing.T) {
 		pool := &applyDeletePool{
@@ -506,10 +551,45 @@ func TestApplyDeleteClearRenderError(t *testing.T) {
 			t.Errorf("the calls = %v, want no commit/cleanup", pool.ops)
 		}
 	})
+	t.Run("a delta statement failure", func(t *testing.T) {
+		pool := &applyDeletePool{
+			applyRows:     cleanupRows([]any{int64(2), int64(0), []int16{7}, []string{"a"}}),
+			clearAffected: 1,
+			deltaErr:      errors.New("connection reset by peer"),
+		}
+		_, err := ApplyDelete(context.Background(), pool, validDeleteBatch(t))
+		if err == nil || !strings.Contains(err.Error(), "the render debt counter") {
+			t.Fatalf("err = %v, want the delta's error with the counter context", err)
+		}
+		if pool.commits != 0 || pool.rollbacks != 1 {
+			t.Errorf("commit=%d rollback=%d, want 0/1 (a rollback)", pool.commits, pool.rollbacks)
+		}
+	})
+	t.Run("a defensive 0-row guard (no transition fact)", func(t *testing.T) {
+		pool := &applyDeletePool{
+			applyRows:     cleanupRows([]any{int64(2), int64(0), []int16{7}, []string{"a"}}),
+			clearAffected: 0, // the guard cleared nothing — no transition fact
+		}
+		res, err := ApplyDelete(context.Background(), pool, validDeleteBatch(t))
+		if err != nil {
+			t.Fatalf("err = %v, want the defensive quiet success (no transition fact — the counter is not touched)", err)
+		}
+		if res != (DeleteResult{Deleted: 2, NotFound: 0}) {
+			t.Errorf("the counters = %+v, want {2 0}: the status move and the zone deltas are not lost", res)
+		}
+		if pool.commits != 1 || pool.rollbacks != 0 {
+			t.Errorf("commit=%d rollback=%d, want 1/0 (the transaction commits)", pool.commits, pool.rollbacks)
+		}
+		want := []string{"begin", "query:" + applyDeleteSQL, "exec:" + applyClearRenderSQL, "commit", "exec:" + clearStageSQL}
+		if !reflect.DeepEqual(pool.ops, want) {
+			t.Fatalf("the calls = %v, want the full protocol WITHOUT the counter delta (no fact — no decrement)", pool.ops)
+		}
+	})
 	t.Run("the counter row is missing", func(t *testing.T) {
 		pool := &applyDeletePool{
-			applyRows: cleanupRows([]any{int64(2), int64(0), []int16{7}, []string{"a"}}),
-			clearRows: cleanupRows(), // the RETURNING is empty — the row is missing
+			applyRows:     cleanupRows([]any{int64(2), int64(0), []int16{7}, []string{"a"}}),
+			clearAffected: 1,
+			deltaAffected: 0, // the delta's RowsAffected — the row is missing
 		}
 		_, err := ApplyDelete(context.Background(), pool, validDeleteBatch(t))
 		if err == nil || !strings.Contains(err.Error(), "counter row is missing") {

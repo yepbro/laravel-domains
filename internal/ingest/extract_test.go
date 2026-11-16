@@ -182,7 +182,7 @@ func TestLineNoDomainStats(t *testing.T) {
 	for i, line := range lines {
 		v.Line(i+1, line)
 	}
-	res := v.Finish()
+	res := v.Finish(0)
 	if res.Total != 3 || res.Accepted != 1 || res.Rejected != 2 {
 		t.Errorf("the counters: total=%d accepted=%d rejected=%d, want 3/1/2",
 			res.Total, res.Accepted, res.Rejected)

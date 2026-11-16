@@ -112,7 +112,7 @@ func corpusRun(t *testing.T, tc corpusCase) corpusResult {
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	out.res = v.Finish()
+	out.res = v.Finish(0)
 	return out
 }
 
