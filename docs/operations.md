@@ -1290,3 +1290,39 @@ why, and how to roll it back. Normal CD deploys are not recorded here
   `moli-v1.1.25-clean-oom-dmesg.log`, `moli-v1.1.25-memory-research.md`
   (+ the first run's `moli-v1125-*` set). The stand is back on chromium
   + the isolated DNS; moli stopped.
+
+### 2026-11-16 — T-247 (fin): the repro ladder — the burst localized: ONE page, hh.ru
+
+- The ladder (a subagent, the driver = the exact worker CDP pattern over
+  `internal/render`): idle-watch 15 min — flat (the internal-timer
+  hypothesis dead); the six suspect URLs × 3 and a parallel-3 × 30–48
+  tasks — flat, a saturating ~99 MB floor (the per-context retention
+  confirmed as the floor mechanism: +65–85 MB after a heavy page, no
+  return after dispose); the full hundred through the driver
+  (`-parallel 3 -pause 0s`, both engines capped at 2 GiB): **both runs
+  killed by OOM at exactly task 64 with hh.ru in flight** (peak
+  ~2.06 GB, total-vm 83.3 GB) — and the body-size flag
+  (`--http-max-response-size 67108864`) changed nothing: the same kill
+  at the same workload position. H-B (unbounded body buffers) rejected.
+- The single-page controls: **`https://hh.ru/` kills moli v1.1.25
+  3/3 from a cold start in 8–18 s** — including via a raw chromedp
+  navigate, no Fetch interception, no browser context: the defect is in
+  the page rendering itself; example.com is clean (sanity); **chromium
+  156 holds the same page at ~519 MiB** — moli-specific; 6/6 kills
+  across the day, hh.ru never finished once. The v1.1.21 control via
+  the worker path is impossible (Fetch.enable InvalidParams — it never
+  worked with interception).
+- Consequences: **no compensation exists** — `restart_every_pages` is
+  powerless (one page = one kill); liveness only via a restart policy +
+  worker retries, at the cost of in-flight tasks (the T-283 cascade);
+  the migration blocker is absolute until an upstream fix. Every
+  future moli retest must include hh.ru as a canary URL; a per-URL
+  skip-list / a fallback engine for it is a direction, not scheduled.
+  The upstream repro is one line: a single CDP navigation to
+  https://hh.ru/ under moli v1.1.25 → RSS ~2.06 GB in 8–18 s → a
+  memcg kill (chromium 156: ~0.5 GiB).
+- Artifacts: `var/fixtures-l2/moli-repro-summary.md` (§1–10),
+  `moli-hundred-{stock,capped}*`, `moli-hundred-stock-candidates.log`,
+  `moli-hh-controls.log` (the A–E controls), the drivers in
+  `moli-repro-driver/`. The stand canonical; the probe rebuilt the
+  `crawler/moli:v1.1.21` image locally (kept — it matches the pin).

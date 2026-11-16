@@ -108,6 +108,10 @@ package render
 //     artifact; moli remains not-ready, the pin reverted to v1.1.21
 //     (the journal docs/operations.md 2026-11-15, the artifacts in
 //     var/fixtures-l2/, the research doc moli-v1.1.25-memory-research).
+//     Post-script (2026-11-16): the trigger localized — ONE page,
+//     hh.ru: a single CDP navigation (even raw, without interception)
+//     bursts moli to ~2 GiB in seconds, deterministically; chromium
+//     holds the same page at ~0.5 GiB (docs/operations.md 2026-11-16).
 //   - lightpanda 1.0.2: one browser context per connection ("Cannot have
 //     more than one browser context at a time", also recorded by
 //     third-party measurements). The service tab of the starting context
