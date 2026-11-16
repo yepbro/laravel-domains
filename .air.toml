@@ -4,11 +4,14 @@
 # deploy/docker/scripts/air-entrypoint.sh script at container startup, so a
 # single file serves all Compose services.
 root = "."
-tmp_dir = "tmp"
+# var/air, not tmp/: clean_on_exit deletes tmp_dir on every container
+# exit (make up*), and tmp/ is shared scratch (review artifacts, subagent
+# drivers) — air was wiping it (D-023). var is already in exclude_dir.
+tmp_dir = "var/air"
 
 [build]
-cmd = "go build -o ./tmp/__SERVICE__ ./cmd/__SERVICE__"
-bin = "./tmp/__SERVICE__"
+cmd = "go build -o ./var/air/__SERVICE__ ./cmd/__SERVICE__"
+bin = "./var/air/__SERVICE__"
 # Rebuild only on Go code changes. The rules/ directory is excluded:
 # Laravel rules are reloaded via SIGHUP (make rules-reload), without a restart.
 include_ext = ["go"]
