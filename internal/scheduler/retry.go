@@ -39,7 +39,9 @@
 // starts from zero; before it is implemented the counter may
 // remain non-zero between episodes — the effect is conservative (fewer retries).
 //
-// Wiring in cmd/scheduler — a later task (the OnRun of framework T-012).
+// Wired in cmd/scheduler: run launches the RetryTempErrors loop as one of
+// the background goroutines of the same OnRun (next to the main EnqueueLoop)
+// — the scheduler.RetryTempErrors call in cmd/scheduler/main.go.
 
 package scheduler
 
@@ -354,6 +356,15 @@ type RetryResult struct {
 	// Finalized — domains with the recorded final status
 	// (delegated_no_address, temp_attempts → 0).
 	Finalized int
+	// Selected — candidates in the batch (the size of the candidate
+	// selection): the LIMIT is filled completely — mature ones remain beyond
+	// the batch, the RetryTempErrors drain continues with the next batch
+	// (the LeaseWatch/stalerequeue Selected style). The number of moves is
+	// not the stop criterion: candidates lost to the guard race (they left
+	// done between the selection and the lock) leave the set on their own,
+	// while rows beyond the LIMIT remain candidates — stopping by moves
+	// would freeze them until the next tick.
+	Selected int
 }
 
 // retryCandidate — a pass candidate: the domain key and the attempt counter.
@@ -436,6 +447,7 @@ func RetryOnce(ctx context.Context, pool RetryDB, opts RetryOptions) (RetryResul
 	}
 
 	var res RetryResult
+	res.Selected = len(candidates)
 	met := newRetryMetrics(o.Metrics)
 	if len(requeueZones) > 0 {
 		n, err := retryDecide(ctx, pool, retryRequeueSQL, retryRequeueMatureSQL, "retry assignment", requeueZones, requeueIDs,
@@ -728,9 +740,14 @@ func RetryTempErrors(ctx context.Context, pool RetryDB, opts RetryOptions) error
 	// one tick processes all ripened batches, not one — otherwise
 	// the retry queue would dissipate at the rate of BatchSize per interval
 	// (1000/hour by default: a mass DNS failure would stay in temp_error
-	// for months). Batches repeat while they come back full; rows moved
-	// to pending are not selected again — the drain is finite, the moves
-	// are picked up by the main enqueue loop (T-028).
+	// for months). Batches repeat while the candidate selection comes back
+	// full (the LIMIT is filled); the stop criterion is the selection size,
+	// not the number of moves (the LeaseWatch style, T-296): a candidate
+	// lost to the guard race leaves the set on its own, but rows beyond
+	// the LIMIT remain candidates — stopping by moves would freeze them
+	// until the next tick. Rows moved to pending are not selected again —
+	// the drain is finite, the moves are picked up by the main enqueue
+	// loop (T-028).
 	// A batch error does not wreck the drain (T-268: the Nov 07 16:04 incident — a WARN
 	// of a single batch left 118k domains unprocessed until
 	// the next tick): the batch is retried (a 40P01 of the decision is absorbed by the
@@ -762,12 +779,12 @@ func RetryTempErrors(ctx context.Context, pool RetryDB, opts RetryOptions) error
 			fails = 0
 			total.Requeued += res.Requeued
 			total.Finalized += res.Finalized
-			if res.Requeued+res.Finalized < o.BatchSize {
+			if res.Selected < o.BatchSize {
 				if total.Requeued > 0 || total.Finalized > 0 {
 					log.Info("temp_error recheck drain",
 						"requeued", total.Requeued, "finalized", total.Finalized)
 				}
-				return // an incomplete batch — the set is exhausted
+				return // an incomplete selection — the set is exhausted
 			}
 		}
 	}

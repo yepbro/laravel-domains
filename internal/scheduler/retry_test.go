@@ -94,7 +94,25 @@ func (r *retryFakeRows) Scan(dest ...any) error {
 			target.Set(reflect.Zero(target.Type()))
 			continue
 		}
-		target.Set(reflect.ValueOf(row[i]))
+		val := reflect.ValueOf(row[i])
+		// A pointer destination — a nullable column (the NULL zone of the
+		// recheck pass statement's LEFT JOIN row, T-296): the fake stores
+		// the bare value, the scan allocates the pointer. A type mismatch
+		// (the triage tests feed deliberately broken rows) — an error,
+		// not a reflect panic.
+		if target.Kind() == reflect.Pointer {
+			if val.Type() != target.Type().Elem() {
+				return fmt.Errorf("retryFakeRows: %s destination, %s column", target.Type(), val.Type())
+			}
+			p := reflect.New(target.Type().Elem())
+			p.Elem().Set(val)
+			target.Set(p)
+			continue
+		}
+		if val.Type() != target.Type() {
+			return fmt.Errorf("retryFakeRows: %s destination, %s column", target.Type(), val.Type())
+		}
+		target.Set(val)
 	}
 	return nil
 }
@@ -686,8 +704,9 @@ func TestRetryOnceSQLAndFlow(t *testing.T) {
 		t.Errorf("final status args = %v, want %v", finalizeTx.calls[0].args, want)
 	}
 
-	// The counters — by the rows actually affected (the guard blocked 1/11).
-	if want := (RetryResult{Requeued: 2, Finalized: 2}); res != want {
+	// The counters — by the rows actually affected (the guard blocked 1/11);
+	// Selected — the whole candidate batch (5), the drain's stop criterion.
+	if want := (RetryResult{Selected: 5, Requeued: 2, Finalized: 2}); res != want {
 		t.Errorf("result = %+v, want %+v", res, want)
 	}
 	for _, tx := range []*retryFakeTx{selTx, requeueTx, finalizeTx} {
@@ -857,16 +876,16 @@ func TestRetryOnceAttemptBoundaries(t *testing.T) {
 			}
 			tx := pool.txs[1] // the update transaction — the second one
 			if tt.wantRequeue {
-				if res != (RetryResult{Requeued: 1}) {
-					t.Errorf("result = %+v, want one check retried", res)
+				if res != (RetryResult{Selected: 1, Requeued: 1}) {
+					t.Errorf("result = %+v, want one selected check retried", res)
 				}
 				if len(tx.calls) != 2 || tx.calls[0].sql != wantRetryRequeue ||
 					tx.calls[1].sql != retryRequeueMatureSQL {
 					t.Errorf("calls = %d, want the move + the bucket decrement", len(tx.calls))
 				}
 			} else {
-				if res != (RetryResult{Finalized: 1}) {
-					t.Errorf("result = %+v, want a single final status", res)
+				if res != (RetryResult{Selected: 1, Finalized: 1}) {
+					t.Errorf("result = %+v, want a single selected final status", res)
 				}
 				if len(tx.calls) != 1 || tx.calls[0].sql != wantRetryFinalize {
 					t.Errorf("calls = %d, want the final status only", len(tx.calls))
@@ -901,8 +920,8 @@ func TestRetryOnceRepeatPasses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the first pass: %v", err)
 	}
-	if first.Requeued != 1 {
-		t.Fatalf("the first pass = %+v, want 1 retry", first)
+	if first.Requeued != 1 || first.Selected != 1 {
+		t.Fatalf("the first pass = %+v, want 1 selected retry", first)
 	}
 
 	second, err := RetryOnce(context.Background(), pool, RetryOptions{})
@@ -923,9 +942,10 @@ func TestRetryOnceRepeatPasses(t *testing.T) {
 }
 
 // TestRetryOnceGuardedAway — the UPDATE guard blocked all candidates
-// (the domains left done bypassing the pass): the counters are zero; the
-// update transaction commits without effect — an empty key set does not
-// open the tail bucket decrement (T-267).
+// (the domains left done bypassing the pass): the move counters are zero,
+// but the selection saw the candidate — Selected reports it (the drain's
+// stop criterion, T-296); the update transaction commits without effect —
+// an empty key set does not open the tail bucket decrement (T-267).
 func TestRetryOnceGuardedAway(t *testing.T) {
 	pool := &retryFakePool{
 		selects:  []*retryFakeRows{retryRows([]any{int16(1), int64(10), int16(0)})},
@@ -936,8 +956,8 @@ func TestRetryOnceGuardedAway(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RetryOnce: %v", err)
 	}
-	if res != (RetryResult{}) {
-		t.Errorf("result = %+v, want zero: the guard fought off the candidate", res)
+	if res != (RetryResult{Selected: 1}) {
+		t.Errorf("result = %+v, want Selected=1: the guard fought off the candidate, the selection saw it", res)
 	}
 	if !pool.txs[1].committed {
 		t.Error("the update transaction is not committed: an empty RETURNING is not an error")
@@ -1479,6 +1499,63 @@ func TestRetryTempErrorsDrain(t *testing.T) {
 	// committed.
 	if st.begins != 5 || st.commits != 5 {
 		t.Errorf("transactions %d, commits %d, want 5 and 5", st.begins, st.commits)
+	}
+}
+
+// TestRetryTempErrorsDrainRaceFiltered — the drain's stop criterion is the
+// selection size, not the number of moves (T-296, the bulk review 10#P2-1):
+// a full candidate batch (the LIMIT filled) with every candidate filtered
+// out by the UPDATE guard (they left done between the selection and the
+// lock) must NOT stop the drain — mature candidates may remain beyond the
+// LIMIT, and stopping would freeze them until the next hourly tick. The
+// former criterion (Requeued+Finalized < BatchSize) stopped after the first
+// pass: 0+0 < 1.
+func TestRetryTempErrorsDrainRaceFiltered(t *testing.T) {
+	buf := &syncBuf{}
+	logger := slog.New(slog.NewTextHandler(buf, nil))
+
+	// Batch 1 — the selection is full (1 of BatchSize 1), the guard blocked
+	// the candidate; batch 2 — a full selection with a move; batch 3 — an
+	// empty selection: the set is exhausted.
+	pool := &retryFakePool{
+		selects: []*retryFakeRows{
+			retryRows([]any{int16(1), int64(10), int16(0)}),
+			retryRows([]any{int16(2), int64(20), int16(0)}),
+			retryRows(),
+		},
+		requeues: []*retryFakeRows{
+			retryRows(), // the guard fought off candidate 1/10
+			retryRows([]any{int16(2), int64(20), retryDay}),
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- RetryTempErrors(ctx, pool, RetryOptions{
+			BatchSize: 1,
+			Interval:  time.Hour, // the tick never comes: the drain must process everything
+			Log:       logger,
+		})
+	}()
+
+	// Three selections — the proof the drain went beyond the guard-filtered
+	// batch to exhaustion.
+	deadline := time.Now().Add(2 * time.Second)
+	for pool.stats().selects < 3 {
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatalf("the drain stopped on a guard-filtered batch: %+v", pool.stats())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("RetryTempErrors: %v", err)
+	}
+	if log := buf.String(); !strings.Contains(log, "requeued=1") {
+		t.Errorf("the drain outcome does not contain the second batch's move:\n%s", log)
 	}
 }
 

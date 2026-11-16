@@ -670,12 +670,12 @@ func TestLeaseNullTriageSelectSwallow(t *testing.T) {
 // the moved count).
 func TestRecheckTriageRowsErrors(t *testing.T) {
 	p := &triRecheckPool{recheckFakePool: &recheckFakePool{},
-		rows: retryRows([]any{int16(1), int64(2)})} // more columns than the receiver
+		rows: retryRows([]any{int64(1), int16(2), int16(3)})} // more columns than the receiver
 	if _, err := RecheckOnce(context.Background(), p, RecheckOptions{}); err == nil {
 		t.Error("the recheck Scan error swallowed")
 	}
 	p = &triRecheckPool{recheckFakePool: &recheckFakePool{},
-		rows: &retryFakeRows{rows: [][]any{{int16(1)}}, err: errors.New("drop")}}
+		rows: &retryFakeRows{rows: [][]any{{int64(1), int16(2)}}, err: errors.New("drop")}}
 	if _, err := RecheckOnce(context.Background(), p, RecheckOptions{}); err == nil {
 		t.Error("the recheck's tail rows.Err() error swallowed")
 	}

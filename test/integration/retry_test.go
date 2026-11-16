@@ -474,7 +474,9 @@ func TestRetryTempErrorPass(t *testing.T) {
 			if r.err != nil {
 				t.Fatalf("RetryOnce: %v", r.err)
 			}
-			if want := (scheduler.RetryResult{Requeued: 1, Finalized: 1}); r.res != want {
+			// Selected=2: the candidate batch held both rows — the drain's
+			// stop criterion counts the selection, not the moves (T-296).
+			if want := (scheduler.RetryResult{Selected: 2, Requeued: 1, Finalized: 1}); r.res != want {
 				t.Errorf("outcome = %+v, want %+v", r.res, want)
 			}
 		case <-time.After(10 * time.Second):

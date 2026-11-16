@@ -107,8 +107,15 @@ const (
 //
 // The zone counter deltas (checked −n / pending +n) — the CTE zc of the same
 // statement over the RETURNING zone_id of the moved rows (T-178, incremental-counters spec §6.2:
-// the predicate pins the old done state); the outer SELECT returns
-// the zone_id of the moved rows — RecheckOnce counts the outcome by it.
+// the predicate pins the old done state); the outer SELECT pairs every moved
+// row with the size of the selection batch b — count over the same CTE the
+// UPDATE reads: one snapshot of the statement, the number matches the very
+// batch that fed the move (a separate count query could race with the pass
+// itself). The LEFT JOIN guarantees a row even for an empty move: a batch
+// the guard filtered out entirely still reports its selection size — the
+// RecheckDaily drain decides exhaustion by the selection (rows remain beyond
+// the LIMIT), not by moves (the LeaseWatch/stalerequeue res.Selected style,
+// T-296). zone_id is NULL on the synthetic row of an empty move.
 var recheckUpdateSQL = fmt.Sprintf(
 	"WITH b AS (SELECT zone_id, id FROM domains "+
 		"WHERE check_state = %[1]d AND status <> %[2]d AND status <> %[3]d AND last_checked_at < $2 "+
@@ -123,7 +130,8 @@ var recheckUpdateSQL = fmt.Sprintf(
 		"domains_pending = z.domains_pending + c.n "+
 		"FROM (SELECT zone_id, count(*) AS n FROM upd GROUP BY zone_id) AS c "+
 		"WHERE z.id = c.zone_id) "+
-		"SELECT zone_id FROM upd",
+		"SELECT k.selected, u.zone_id FROM (SELECT count(*) AS selected FROM b) AS k "+
+		"LEFT JOIN upd AS u ON true",
 	int16(model.CheckStateDone), int16(model.StatusDeleted), int16(model.StatusInvalid))
 
 // RecheckOptions — recheck parameters; zero values are replaced
@@ -163,8 +171,19 @@ func (o RecheckOptions) withDefaults() RecheckOptions {
 
 // RecheckResult — the outcome of one RecheckOnce pass.
 type RecheckResult struct {
-	// Domains — domains moved to pending (no more than the batch size).
+	// Domains — domains moved to pending by THIS pass: counted by the move's
+	// RETURNING (no more than the batch and no more than the selection — the
+	// outer guard could have filtered out rows whose fate changed between
+	// the selection and the lock).
 	Domains int64
+	// Selected — rows in the selection batch b: the LIMIT is filled
+	// completely — ripened ones remain beyond the batch, the RecheckDaily
+	// drain continues with the next batch (the LeaseWatch/stalerequeue
+	// Selected style). The number of moves is not the stop criterion: one
+	// row lost to the race with a concurrent writer (filtered out by the
+	// outer guard) would otherwise freeze the rows beyond the LIMIT until
+	// the next daily tick.
+	Selected int64
 }
 
 // RecheckOnce performs one pass (spec 5.3): up to opts.BatchSize domains
@@ -195,18 +214,22 @@ func RecheckOnce(ctx context.Context, pool db.DB, opts RecheckOptions) (RecheckR
 	}
 	defer rows.Close()
 
-	var n int64
+	var n, selected int64
 	for rows.Next() {
-		var zoneID int16
-		if err := rows.Scan(&zoneID); err != nil {
+		// zone_id is NULL on the synthetic row of an empty move (the LEFT
+		// JOIN tail) — such a row carries only the selection size.
+		var zoneID *int16
+		if err := rows.Scan(&selected, &zoneID); err != nil {
 			return RecheckResult{}, fmt.Errorf("scheduler: domain recheck: read: %w", err)
 		}
-		n++
+		if zoneID != nil {
+			n++
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return RecheckResult{}, fmt.Errorf("scheduler: domain recheck: %w", err)
 	}
-	return RecheckResult{Domains: n}, nil
+	return RecheckResult{Domains: n, Selected: selected}, nil
 }
 
 // RecheckDaily — the daily recheck cycle (spec 5.3: "once a day"):
@@ -232,8 +255,14 @@ func RecheckDaily(ctx context.Context, pool db.DB, opts RecheckOptions) error {
 		"interval", o.Interval.String(),
 		"batch", o.BatchSize)
 
-	// drain moves all ripened domains: batches repeat while they
-	// come back full; an incomplete batch — the set is exhausted.
+	// drain moves all ripened domains: batches repeat while the selection
+	// comes back full (the LIMIT is filled — ripened ones remain beyond it);
+	// an incomplete selection — the set is exhausted. The criterion is the
+	// selection size, not the number of moves (the LeaseWatch style, T-296):
+	// a row lost to the race with a concurrent writer (the outer guard
+	// re-checks the state at the lock) leaves the set on its own, but rows
+	// beyond the LIMIT remain candidates — stopping by moves would freeze
+	// them until the next daily tick.
 	drain := func() {
 		var total int64
 		for {
@@ -248,7 +277,7 @@ func RecheckDaily(ctx context.Context, pool db.DB, opts RecheckOptions) error {
 				return
 			}
 			total += res.Domains
-			if res.Domains < int64(o.BatchSize) {
+			if res.Selected < int64(o.BatchSize) {
 				if total > 0 {
 					log.Info("daily domain recheck drain", "domains", total)
 				}

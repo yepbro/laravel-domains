@@ -847,4 +847,38 @@ P3-3: таблица TestDictDecompressSizeCap переведена с map на 
 internal/content/content.go (maxDecodeSize), dict.go (NewDict),
 pack.go (readPackBlockAt, Get); content_test.go, dict_test.go,
 pack_test.go (TestPackReadBlockLenCap); docs/content.md;
-klauspost/compress v1.20.3 zstd/ decoder.go, framedec.go.
+=======
+### D-039 — T-296: критерий исчерпания дрэнов RecheckDaily/RetryTempErrors — размер выборки, а не число перемещённых строк
+Дата: 2026-11-16.
+Проблема: дрэны решали «множество исчерпано» по числу ПЕРЕМЕЩЁННЫХ строк
+(res.Domains / res.Requeued+res.Finalized), хотя идемпотентные guard'ы
+проходов сознательно допускают состояние «выбрано BatchSize, перемещено
+меньше»: строка, изменившая состояние между подзапросом выборки и
+блокировкой UPDATE (параллельная запись результата, crawlerctl recheck,
+возврат лизы, delete-файл), отфильтровывается внешним guard'ом. Одна
+такая строка останавливала дрэн до следующего тика — на 24 ч для
+RecheckDaily и на 1 ч для RetryTempErrors; lease-проход и stalerequeue
+уже были переведены на res.Selected (T-200/T-270).
+Решение: (1) RecheckResult.Selected — счётчик CTE b в том же выражении
+прохода: внешний SELECT отдаёт пары (count(b), zone_id) через LEFT JOIN —
+одна строка гарантирована даже при пустом перемещении (NULL zone_id),
+второй запрос не нужен (отдельный count гонялся бы с самим проходом и
+мерил бы чужой батч); (2) RetryResult.Selected = len(candidates);
+(3) критерий исчерпания в обоих дрэнах — res.Selected < BatchSize
+(эталон lease.go / stalerequeue.go). Конечность дрэна сохраняется:
+отфильтрованная guard'ом строка сама покидает множество кандидатов (guard
+повторяет предикаты выборки), строки за LIMIT остаются кандидатами.
+Регрессионные тесты: выбран батч BatchSize, guard'ом отфильтрована
+строка → дрэн обязан сделать следующий проход
+(TestRecheckDailyDrainRaceFiltered, TestRetryTempErrorsDrainRaceFiltered;
+BDD — красный на старом критерии подтверждён). Попутно (10#P3-2)
+обновлены три устаревших комментария о wiring (retry.go, lease.go,
+enqueue.go: wiring давно сделан в cmd/scheduler/main.go, гейт —
+queue.NewWatermarkPublisher). Проверки: make test / make lint /
+make test-race — зелёные.
+Ссылки: T-296; bulk-ревью 10#P2-1, 10#P3-2 (tmp/review/stage-report.md);
+internal/scheduler/{recheck.go,retry.go,lease.go,enqueue.go},
+{recheck_test.go,retry_test.go,triage_test.go}; docs/services.md;
+эталоны internal/scheduler/lease.go (LeaseResult.Selected, T-200),
+stalerequeue.go (res.Selected); ревью фикса tmp/review/29-t296.md.
+>>>>>>> 7686be5 (fix: scheduler — RecheckDaily/RetryTempErrors drains decide exhaustion by the batch selection size (Selected), not by moved rows; update stale wiring comments (T-296))

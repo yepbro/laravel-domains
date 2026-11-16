@@ -66,7 +66,9 @@
 // to the right of the threshold and the cursor; deleted rows to the left of the cursor are skipped
 // forever — they are not supposed to be returned anyway.
 //
-// Wiring in cmd/scheduler — the service assembly (T-028/later tasks).
+// Wired in cmd/scheduler: run launches the LeaseWatch loop (with the FR-1.2
+// repair pass of leasenull.go on the same tick) as a background goroutine of
+// the same OnRun — the scheduler.LeaseWatch call in cmd/scheduler/main.go.
 
 package scheduler
 

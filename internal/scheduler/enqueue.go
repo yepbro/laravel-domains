@@ -265,10 +265,12 @@ const (
 	// the config.
 	DefaultEnqueueBatch = 1000
 
-	// DefaultEnqueueInterval — the pause between batches. So far the only
-	// throttle of the q:dns fill rate: the queue-length
-	// backpressure gate is T-026 (a parallel task),
-	// the TODO below in EnqueueLoop.
+	// DefaultEnqueueInterval — the pause between batches. One of the two
+	// throttles of the q:dns fill rate: the queue-length backpressure gate
+	// (queue.NewWatermarkPublisher in cmd/scheduler, T-026) holds publishing
+	// at the high watermark; this interval paces the batches between the
+	// gate's decisions — a steady fill rate instead of bursts up to the
+	// watermark.
 	DefaultEnqueueInterval = time.Second
 
 	// DefaultEnqueueIdleWait — waiting for pending replenishment on an empty

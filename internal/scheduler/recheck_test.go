@@ -32,15 +32,25 @@ type recheckCall struct {
 	args []any
 }
 
-// recheckFakePool — a db.DB without a DB: the queue of Query results (the
-// number of moved rows — the zone_id rows of the pass statement's outer
-// SELECT, T-178) and errors, the call protocol. Everything under a lock: the
-// RecheckDaily loop runs in a goroutine; the test waits for progress by
-// counters.
+// recheckBatch — one pass's stub: the selection size (the b batch of the
+// pass statement) and the rows the move's RETURNING actually produced. The
+// difference selected−moved — the rows filtered out by the outer guard (a
+// race between the selection and the row lock); the pass statement reports
+// both numbers (T-296).
+type recheckBatch struct {
+	selected int64
+	moved    int64
+}
+
+// recheckFakePool — a db.DB without a DB: the queue of pass outcomes
+// (the selection size and the moved rows of the pass statement's outer
+// SELECT, T-178/T-296) and errors, the call protocol. Everything under a
+// lock: the RecheckDaily loop runs in a goroutine; the test waits for
+// progress by counters.
 type recheckFakePool struct {
 	mu       sync.Mutex
-	tags     []int64 // the queue of response row counts (ran out — 0: an empty set)
-	execErrs []error // the queue of Query errors (nil — a call without an error)
+	batches  []recheckBatch // the queue of pass outcomes (ran out — an empty set)
+	execErrs []error        // the queue of Query errors (nil — a call without an error)
 	queries  []recheckCall
 }
 
@@ -63,14 +73,20 @@ func (p *recheckFakePool) Query(_ context.Context, sql string, args ...any) (pgx
 			return nil, err
 		}
 	}
-	n := int64(0)
-	if len(p.tags) > 0 {
-		n = p.tags[0]
-		p.tags = p.tags[1:]
+	b := recheckBatch{}
+	if len(p.batches) > 0 {
+		b = p.batches[0]
+		p.batches = p.batches[1:]
 	}
-	rows := make([][]any, n)
-	for i := range rows {
-		rows[i] = []any{int16(1)} // zone_id: the value does not matter for row counting
+	var rows [][]any
+	if b.moved == 0 {
+		// an empty move — the single LEFT JOIN row with a NULL zone_id
+		rows = [][]any{{b.selected, nil}}
+	} else {
+		rows = make([][]any, b.moved)
+		for i := range rows {
+			rows[i] = []any{b.selected, int16(1)} // zone_id: the value does not matter for row counting
+		}
 	}
 	return retryRows(rows...), nil
 }
@@ -102,7 +118,8 @@ const wantRecheckUpdate = "WITH b AS (SELECT zone_id, id FROM domains " +
 	"domains_pending = z.domains_pending + c.n " +
 	"FROM (SELECT zone_id, count(*) AS n FROM upd GROUP BY zone_id) AS c " +
 	"WHERE z.id = c.zone_id) " +
-	"SELECT zone_id FROM upd"
+	"SELECT k.selected, u.zone_id FROM (SELECT count(*) AS selected FROM b) AS k " +
+	"LEFT JOIN upd AS u ON true"
 
 // recheckFixedClock — a clock with a fixed "now" (the pass threshold
 // reproducible to the nanosecond).
@@ -118,7 +135,7 @@ func recheckFixedClock() (time.Time, func() time.Time) {
 // now() − interval boundary and the batch size.
 func TestRecheckOnceSQL(t *testing.T) {
 	now, clock := recheckFixedClock()
-	pool := &recheckFakePool{tags: []int64{42}}
+	pool := &recheckFakePool{batches: []recheckBatch{{selected: 42, moved: 42}}}
 
 	res, err := RecheckOnce(context.Background(), pool, RecheckOptions{
 		Interval:  2190 * time.Hour,
@@ -144,8 +161,28 @@ func TestRecheckOnceSQL(t *testing.T) {
 	if !reflect.DeepEqual(calls[0].args, wantArgs) {
 		t.Errorf("args = %v, want %v", calls[0].args, wantArgs)
 	}
-	if res.Domains != 42 {
-		t.Errorf("result = %+v, want Domains=42 (the outer SELECT rows)", res)
+	if res.Domains != 42 || res.Selected != 42 {
+		t.Errorf("result = %+v, want Domains=42 Selected=42 (the outer SELECT rows)", res)
+	}
+}
+
+// TestRecheckOnceGuardFiltered — a race between the selection and the row
+// lock (a concurrent writer changed the row's state after the b subquery
+// read it): the outer guard does not move the row, the pass reports the
+// selection size separately from the moves (T-296) — the drain decides
+// exhaustion by the selection, not by moves.
+func TestRecheckOnceGuardFiltered(t *testing.T) {
+	pool := &recheckFakePool{batches: []recheckBatch{{selected: 5, moved: 4}}}
+
+	res, err := RecheckOnce(context.Background(), pool, RecheckOptions{})
+	if err != nil {
+		t.Fatalf("RecheckOnce: %v", err)
+	}
+	if want := (RecheckResult{Domains: 4, Selected: 5}); res != want {
+		t.Errorf("result = %+v, want %+v (one row of the full batch lost to the guard)", res, want)
+	}
+	if n := pool.stats(); n != 1 {
+		t.Errorf("statements = %d, want 1", n)
 	}
 }
 
@@ -190,7 +227,11 @@ func TestRecheckOnceEmpty(t *testing.T) {
 // again (the selection condition is in the SQL itself): each pass is its own statement;
 // after exhaustion — a zero outcome.
 func TestRecheckOnceRepeatPasses(t *testing.T) {
-	pool := &recheckFakePool{tags: []int64{5000, 3, 0}}
+	pool := &recheckFakePool{batches: []recheckBatch{
+		{selected: 5000, moved: 5000},
+		{selected: 3, moved: 3},
+		{selected: 0, moved: 0},
+	}}
 
 	first, err := RecheckOnce(context.Background(), pool, RecheckOptions{})
 	if err != nil {
@@ -207,6 +248,10 @@ func TestRecheckOnceRepeatPasses(t *testing.T) {
 	if first.Domains != 5000 || second.Domains != 3 || third.Domains != 0 {
 		t.Errorf("passes = %d, %d, %d; want 5000, 3, 0",
 			first.Domains, second.Domains, third.Domains)
+	}
+	if first.Selected != 5000 || second.Selected != 3 || third.Selected != 0 {
+		t.Errorf("selections = %d, %d, %d; want 5000, 3, 0",
+			first.Selected, second.Selected, third.Selected)
 	}
 	if n := pool.stats(); n != 3 {
 		t.Errorf("statements = %d, want 3 (one per pass)", n)
@@ -291,7 +336,7 @@ func TestRecheckOptionsDefaults(t *testing.T) {
 // TestRecheckDailyImmediateDrain — the first drain runs immediately at
 // start, without waiting a day: it picks up what ripened during the downtime.
 func TestRecheckDailyImmediateDrain(t *testing.T) {
-	pool := &recheckFakePool{tags: []int64{7}} // an incomplete batch — the drain is finished
+	pool := &recheckFakePool{batches: []recheckBatch{{selected: 7, moved: 7}}} // an incomplete batch — the drain is finished
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -332,7 +377,10 @@ func TestRecheckDailyLoop(t *testing.T) {
 	// Drain 1 (start): a DB error — a Warn. Drain 2 (tick): a full batch +
 	// an incomplete one — an Info with the sum. Then — empty sets.
 	pool := &recheckFakePool{
-		tags:     []int64{DefaultRecheckBatch, 3},
+		batches: []recheckBatch{
+			{selected: int64(DefaultRecheckBatch), moved: int64(DefaultRecheckBatch)},
+			{selected: 3, moved: 3},
+		},
 		execErrs: []error{errors.New("db unavailable")},
 	}
 
@@ -400,18 +448,18 @@ func TestRecheckDailyCancelDuringDrain(t *testing.T) {
 // does not hinder the passes — the outcome must be tallied.
 func TestRecheckDailyDrainTotals(t *testing.T) {
 	tests := []struct {
-		name string
-		tags []int64
-		want string // a substring of the drain's Info outcome; "" — the outcome is not logged
+		name    string
+		batches []recheckBatch
+		want    string // a substring of the drain's Info outcome; "" — the outcome is not logged
 	}{
-		{"an incomplete batch of one", []int64{1}, "domains=1"},
-		{"a zero drain", []int64{0}, ""},
+		{"an incomplete batch of one", []recheckBatch{{selected: 1, moved: 1}}, "domains=1"},
+		{"a zero drain", []recheckBatch{{selected: 0, moved: 0}}, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var buf bytes.Buffer
 			logger := slog.New(slog.NewTextHandler(&buf, nil))
-			pool := &recheckFakePool{tags: tt.tags}
+			pool := &recheckFakePool{batches: tt.batches}
 
 			ctx, cancel := context.WithCancel(context.Background())
 			cancel() // the starting drain is synchronous and independent of the tick
@@ -430,6 +478,45 @@ func TestRecheckDailyDrainTotals(t *testing.T) {
 				t.Errorf("log does not contain %q:\n%s", tt.want, log)
 			}
 		})
+	}
+}
+
+// TestRecheckDailyDrainRaceFiltered — the drain's stop criterion is the
+// selection size, not the number of moves (T-296, the bulk review 10#P2-1):
+// a full selection (the LIMIT filled) with a row filtered out by the guard
+// (a concurrent writer changed it between the selection and the lock) must
+// NOT stop the drain — ripened rows remain beyond the LIMIT, and one lost
+// row would otherwise freeze them until the next daily tick. The former
+// criterion (res.Domains < BatchSize) stopped after the first pass: 3 < 4.
+func TestRecheckDailyDrainRaceFiltered(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+
+	// Batch 1 — the selection is full (4 of BatchSize 4), the guard filtered
+	// one row; batch 2 — an incomplete selection: the set is exhausted.
+	pool := &recheckFakePool{batches: []recheckBatch{
+		{selected: 4, moved: 3},
+		{selected: 2, moved: 2},
+	}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the starting drain is synchronous and independent of the tick
+	done := make(chan error, 1)
+	go func() {
+		done <- RecheckDaily(ctx, pool, RecheckOptions{
+			BatchSize: 4,
+			Log:       logger,
+		})
+	}()
+
+	if err := <-done; err != nil {
+		t.Fatalf("RecheckDaily: %v, want nil", err)
+	}
+	if n := pool.stats(); n != 2 {
+		t.Errorf("statements = %d, want 2: a full selection with a guard-filtered row — the drain continues", n)
+	}
+	if log := buf.String(); !strings.Contains(log, "domains=5") {
+		t.Errorf("the drain outcome does not sum both batches:\n%s", log)
 	}
 }
 

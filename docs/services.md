@@ -434,7 +434,13 @@ candidates of the next pass; a batch error does not break the hourly
 drain —
 up to three failures in a row, then until the next tick (T-268, the
 07.11 incident:
-118k domains waited for a tick because of a single WARN). The lease
+118k domains waited for a tick because of a single WARN). The drains of
+both recheck loops (`RecheckDaily`, `RetryTempErrors`) stop by the size of
+the candidate selection (`Selected` in the pass result, T-296), not by
+the number of moves: a row filtered out by a guard race (a concurrent
+result write between the selection and the row lock) leaves the candidate
+set on its own, while rows beyond `LIMIT` remain candidates — stopping by
+moves would freeze them until the next tick (24 h / 1 h). The lease
 return pass is TWO statements in one
 transaction: a SELECT of the batch by the `domains_lease_idx` key
 (T-104) with
