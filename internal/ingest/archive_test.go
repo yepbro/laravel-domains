@@ -1021,3 +1021,44 @@ func TestPipelineArchiveStageError(t *testing.T) {
 		t.Error("no journal record is written on a load failure")
 	}
 }
+
+// TestPipelineArchiveProducerPanic — a producer panic inside an archive:
+// the members are parsed in the same stageStream producer goroutine, and
+// the recovered panic must classify as an infrastructure failure, not an
+// archive rejection — the error is wrapped as "parsing the archive"
+// (not errArchiveRejected), the archive stays in incoming for a retry
+// (at-least-once, spec 3.4), the batch is discarded (T-316; the review
+// P3-1 coverage gap: without the recover parity the panic would kill the
+// process, a misclassification would move the archive to failed/).
+func TestPipelineArchiveProducerPanic(t *testing.T) {
+	pt := newPipeTest(t)
+	abs := filepath.Join(pt.dir, "add", "list.zip")
+	buildZip(t, abs, archEntry{"one.txt", "example.com\n"})
+	// A zone-less archive: the zone is resolved lazily by the member's
+	// lines inside the producer goroutine (emitRow → EnsureZone).
+	pt.zones.byNamePanic = "the zone store blew up"
+
+	out, err := pt.pipe.Process(context.Background(), abs)
+	if err == nil || !strings.Contains(err.Error(), "parsing the archive add/list.zip") ||
+		!strings.Contains(err.Error(), "producer panic") ||
+		!strings.Contains(err.Error(), "the zone store blew up") {
+		t.Fatalf("err = %v, want the archive producer panic error to the caller", err)
+	}
+	if out.Kind != OutcomeLeft {
+		t.Errorf("the outcome = %s, want left (not a failed/ archive rejection)", out.Kind)
+	}
+	if !exists(t, abs) {
+		t.Error("the archive must stay in incoming for a retry (spec 3.4)")
+	}
+	// The Stage cleanup → no COPY (the panic is earlier than the first
+	// emit) → the batch discard (best effort).
+	if strings.Join(pt.pool.ops, "\n") != strings.Join([]string{
+		"exec:" + clearStageSQL,
+		"exec:" + clearStageSQL,
+	}, "\n") {
+		t.Errorf("the calls = %v, want cleanup → discard", pt.pool.ops)
+	}
+	if len(pt.files.records) != 0 {
+		t.Error("no journal record is written on a producer panic")
+	}
+}

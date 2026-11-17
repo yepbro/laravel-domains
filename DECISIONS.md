@@ -1778,3 +1778,36 @@ T-175 (счётчик долга в транзакции очистки — се
 честно повторяет двумя Exec); internal/httpworker/renderq.go
 (renderClearPendingTx), internal/httpworker/renderq_test.go
 (TestRequeueRenderPendingZoneCycle).
+
+### D-058 — T-316: recover в producer-горутине stageStream (ingest) — паника парсинга становится инфраструктурной ошибкой
+Дата: 2026-11-17.
+Проблема: находка bulk-ревью hy4 01-ingest#P3-1 — асимметрия
+panic-защиты: OnRun (internal/service) и delivery-горутины воркеров
+(renderworker, httpworker) ловят панику и превращают её в ошибку с
+логом стека, а producer-горутина stageStream (парсинг/валидация/
+emitRow, включая ленивый EnsureZone беззонных файлов) не защищена:
+паника в produce убивала бы весь процесс мимо graceful shutdown, а
+канал rows остался бы незакрытым — потребитель Stage завис на чтении.
+Достижимый panic-путь ревьюер не нашёл (hardening, не баг).
+Решение: defer recover в producer-горутине симметрично service.serve:
+паника → Error-лог со стеком (debug.Stack, как у OnRun и воркеров) и
+отправка «ingest: producer panic: %v» в done (буфер 1 — потребитель
+гарантированно читает его после Stage); rows закрывается отдельным
+defer, поэтому потребитель завершается по io.EOF, а не висит на
+канале. Дальше ошибка идёт штатным путём produceErr → streamStage/
+streamArchive → OutcomeLeft: файл остаётся в incoming (at-least-once,
+спека 3.4), батч дискардится, процесс живёт. Порядок defer: recover
+регистрируется после close(rows) и выполняется первым, close(rows) —
+вторым в обоих путях (нормальном и панике). Тесты: инъекция паники
+через новый хук byNamePanic фейка ZoneStore (беззонный файл — EnsureZone
+вызывается лениво именно внутри producer-горутины) + прямой юнит-тест
+stageStream (строки до паники загружены, stageErr nil, produceErr
+несёт панику) + по ревью (deepseek, P3-1) архивный путь: беззонный
+zip с одним членом (TestPipelineArchiveProducerPanic) — обёртка
+«parsing the archive», а не errArchiveRejected (файл не уезжает в
+failed/), файл остаётся в incoming. Заметка об инварианте —
+docs/services.md (Liveness). Проверки: make test, make lint — зелёные.
+Ссылки: hy4 bulk-ревью 01-ingest#P3-1; T-316; internal/ingest/pipeline.go
+(stageStream), internal/service/service.go (serve — образец),
+internal/ingest/pipeline_test.go (TestPipelineProducerPanic,
+TestStageStreamProducerPanic), docs/services.md.

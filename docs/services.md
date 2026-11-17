@@ -122,7 +122,11 @@ renderworker): an Error log with the stack, the circuit-breaker counter +1,
 and delivery without XACK returns via claim — the unit survives the panic
 of a single task (specification and coverage boundaries —
 `internal/httpworker/readerstate.go`, `internal/renderworker/
-readerstate.go`).
+readerstate.go`). The ingest stage producer (`stageStream`, the
+parsing/emit goroutine of `internal/ingest`) carries the same recover
+parity (T-316): a panic turns into a producer error — an Error log with
+the stack, the load finishes by io.EOF instead of hanging, the file
+stays in incoming for a retry (at-least-once), the process lives on.
 
 `/healthz` is not in the compose-healthcheck (T-110): workers pull tasks
 from Redis streams themselves — there is no "admit traffic" router, and

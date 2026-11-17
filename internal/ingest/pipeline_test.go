@@ -1338,6 +1338,97 @@ func TestPipelineStageError(t *testing.T) {
 	}
 }
 
+// TestPipelineProducerPanic — a panic of the stageStream producer (the
+// parsing/emit path) does not kill the process and does not hang the
+// load (the recover parity with OnRun, internal/service, T-316): the
+// panic turns into a producer error, the outcome is left — the file
+// stays in incoming as on any infrastructure failure (at-least-once,
+// spec 3.4), the batch is discarded. The panic is injected through the
+// zone store: a zone-less file resolves zones lazily inside the
+// producer goroutine (emitRow → EnsureZone).
+func TestPipelineProducerPanic(t *testing.T) {
+	pt := newPipeTest(t)
+	abs := pt.addFile(t, "add/list.txt", "example.com\n")
+	pt.zones.byNamePanic = "the zone store blew up"
+
+	var buf strings.Builder
+	pipe, err := NewPipeline(pt.zones, pt.files, pt.pool, PipelineOptions{
+		Dir:       pt.dir,
+		BatchSize: 10,
+		Log:       slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelError})),
+		Now:       func() time.Time { return pt.now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := pipe.Process(context.Background(), abs)
+	if err == nil || !strings.Contains(err.Error(), "producer panic") ||
+		!strings.Contains(err.Error(), "the zone store blew up") {
+		t.Fatalf("err = %v, want the producer panic error to the caller", err)
+	}
+	if out.Kind != OutcomeLeft {
+		t.Errorf("the outcome = %s, want left", out.Kind)
+	}
+	if !exists(t, abs) {
+		t.Error("the file must stay in incoming for a retry (spec 3.4)")
+	}
+	// The panic is logged with the stack — the same invariant as the
+	// OnRun goroutine and the workers' deliveries.
+	if logged := buf.String(); !strings.Contains(logged, "stage producer panic") ||
+		!strings.Contains(logged, "stack=") {
+		t.Errorf("the log = %q, want a producer panic record with a stack", logged)
+	}
+	// The Stage cleanup → no COPY (the panic is earlier than the first
+	// emit) → the batch discard (best effort).
+	if strings.Join(pt.pool.ops, "\n") != strings.Join([]string{
+		"exec:" + clearStageSQL,
+		"exec:" + clearStageSQL,
+	}, "\n") {
+		t.Errorf("the calls = %v, want cleanup → discard", pt.pool.ops)
+	}
+	if len(pt.files.records) != 0 {
+		t.Error("no journal record is written on a producer panic")
+	}
+}
+
+// TestStageStreamProducerPanic — the stageStream contract on a producer
+// panic (T-316): the panic turns into produceErr (the call returns
+// instead of crashing the process), the consumer is not left hanging on
+// the channel — rows is closed, Stage finishes by io.EOF (stageErr nil),
+// and the lines sent before the panic are loaded.
+func TestStageStreamProducerPanic(t *testing.T) {
+	pt := newPipeTest(t)
+	id, err := NewBatchID()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	staged, serr, perr := pt.pipe.stageStream(context.Background(),
+		Batch{ID: id, ZoneID: 1, Action: model.ActionAdd},
+		func(emit func(Row) error) error {
+			for i := 1; i <= 3; i++ {
+				if err := emit(Row{Label: fmt.Sprintf("example%d", i), LineNo: int64(i)}); err != nil {
+					return err
+				}
+			}
+			panic("boom")
+		})
+	if serr != nil {
+		t.Fatalf("stageErr = %v, want nil — the load finished by io.EOF", serr)
+	}
+	if perr == nil || !strings.Contains(perr.Error(), "producer panic") ||
+		!strings.Contains(perr.Error(), "boom") {
+		t.Fatalf("produceErr = %v, want the producer panic error", perr)
+	}
+	if staged != 3 {
+		t.Errorf("staged = %d, want 3 — the lines before the panic are loaded", staged)
+	}
+	if len(pt.pool.copyVals) != 3 {
+		t.Errorf("COPY rows = %d, want 3", len(pt.pool.copyVals))
+	}
+}
+
 // TestPipelineApplyError — an add apply failure: the file stays, the report
 // is not written (the apply did not happen as a whole), the batch is
 // discarded.

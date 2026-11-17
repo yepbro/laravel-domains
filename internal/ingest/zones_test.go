@@ -25,12 +25,13 @@ import (
 
 // fakeZoneStore — an in-memory zone store with a call protocol.
 type fakeZoneStore struct {
-	zones      map[string]model.Zone
-	nextID     int16
-	byNameErr  error    // the ZoneByName error, if set
-	createErr  error    // the CreateZone error, if set
-	calls      []string // the protocol: "byName:<name>", "create:<name>"
-	createdUni *string  // name_unicode of the last CreateZone
+	zones       map[string]model.Zone
+	nextID      int16
+	byNameErr   error    // the ZoneByName error, if set
+	byNamePanic any      // the ZoneByName panic, if set (a stageStream producer panic injection, T-316)
+	createErr   error    // the CreateZone error, if set
+	calls       []string // the protocol: "byName:<name>", "create:<name>"
+	createdUni  *string  // name_unicode of the last CreateZone
 }
 
 func newFakeZoneStore(zones ...model.Zone) *fakeZoneStore {
@@ -46,6 +47,9 @@ func newFakeZoneStore(zones ...model.Zone) *fakeZoneStore {
 
 func (f *fakeZoneStore) ZoneByName(_ context.Context, name string) (model.Zone, error) {
 	f.calls = append(f.calls, "byName:"+name)
+	if f.byNamePanic != nil {
+		panic(f.byNamePanic)
+	}
 	if f.byNameErr != nil {
 		return model.Zone{}, f.byNameErr
 	}

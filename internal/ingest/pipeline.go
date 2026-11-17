@@ -29,6 +29,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -564,7 +565,10 @@ func (p *Pipeline) streamStage(ctx context.Context, r io.Reader, f File, batch B
 // consumer closes stop, the producer finishes without a leak. Load and
 // producer errors are returned separately: a producer stopped by the
 // consumer (errStopped) is not an error, the cause is in stageErr.
-// The producer counters stay in its closures (by the time of the
+// A producer panic does not kill the process (the recover parity with
+// OnRun, internal/service, T-316): it turns into produceErr, rows is
+// closed — the consumer finishes by io.EOF without a hang. The
+// producer counters stay in its closures (by the time of the
 // return the goroutine has finished — reading is safe).
 func (p *Pipeline) stageStream(ctx context.Context, batch Batch, produce func(emit func(Row) error) error) (staged int64, stageErr, produceErr error) {
 	rows := make(chan Row, stageChanSize)
@@ -572,6 +576,24 @@ func (p *Pipeline) stageStream(ctx context.Context, batch Batch, produce func(em
 	done := make(chan error, 1)
 
 	go func() {
+		defer close(rows)
+		// A producer panic must not kill the process bypassing the
+		// graceful shutdown — the recover parity with the OnRun
+		// goroutine (internal/service) and the workers' delivery
+		// goroutines (renderworker, httpworker): the panic turns into
+		// a producer error and goes into done (the buffer is 1 — the
+		// consumer reads it after Stage), rows is closed by the defer
+		// above, so the consumer finishes by io.EOF instead of hanging
+		// on the channel. Above, streamStage/streamArchive wrap the
+		// error as an infrastructure failure: the file stays in
+		// incoming for a retry (at-least-once, spec 3.4). The stack —
+		// in the log, as in service.serve.
+		defer func() {
+			if r := recover(); r != nil {
+				p.log.Error("stage producer panic", "panic", r, "stack", string(debug.Stack()))
+				done <- fmt.Errorf("ingest: producer panic: %v", r)
+			}
+		}()
 		done <- produce(func(r Row) error {
 			select {
 			case rows <- r:
@@ -580,7 +602,6 @@ func (p *Pipeline) stageStream(ctx context.Context, batch Batch, produce func(em
 				return errStopped
 			}
 		})
-		close(rows)
 	}()
 
 	staged, serr := Stage(ctx, p.pool, batch, p.opts.BatchSize, func() (Row, error) {
