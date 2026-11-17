@@ -292,8 +292,29 @@ func (s *Server) Run(ctx context.Context, listen string) error {
 		defer func() { _ = os.Remove(listen) }()
 	}
 	srv := &http.Server{
-		Handler:           s.Handler(),
-		ReadHeaderTimeout: 10 * time.Second, // slowloris cap (§9)
+		Handler: s.Handler(),
+		// Server timeouts (14#P3-2 of the bulk review; before — only
+		// ReadHeaderTimeout). The values are observable only through
+		// connection behavior over seconds-long pauses — not hermetically
+		// testable (the dashboard T-M11 precedent, dashboard spec §6.3).
+		// ReadHeader — the slowloris cap (spec §9). Read — the whole
+		// request incl. the form body: the body is bounded by the 4 KiB
+		// MaxBytesReader and is read by the handler at once, so 30 s cuts
+		// only a client trickling it byte-by-byte, not a legit one.
+		// Write — web.timeout + 8 s, derived from the config (the review
+		// P2-1 of T-297: a fixed 75 s cut valid answers — config.Validate
+		// allows web.timeout up to 10 min and the config tests use 90 s —
+		// the handler budget is fetchStored + a live check capped by
+		// web.timeout + the 3 s journal window + the response write, so
+		// the deadline must follow the configured cap, not a constant).
+		// The nginx proxy_read_timeout in front (75 s in the sample,
+		// deploy/nginx) stays the operator-side limit — a slower answer
+		// is dropped by the proxy itself, and raising it there is a
+		// deploy decision. Idle — the keep-alive cap.
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      s.cfg.Web.Timeout.D() + 8*time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 	done := make(chan error, 1)
 	go func() {

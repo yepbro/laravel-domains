@@ -882,3 +882,53 @@ internal/scheduler/{recheck.go,retry.go,lease.go,enqueue.go},
 {recheck_test.go,retry_test.go,triage_test.go}; docs/services.md;
 эталоны internal/scheduler/lease.go (LeaseResult.Selected, T-200),
 stalerequeue.go (res.Selected); ревью фикса tmp/review/29-t296.md.
+### D-040 — T-297: web_checks хранит сырой ввод (контракт 000012), WriteTimeout=75s выровнен с nginx, stored-ветка пишет вердикт ответа
+Дата: 2026-11-16.
+Проблема: три интерпретационных развилки фиксов стадии 14 bulk-ревью
+(web). (1) 14#P2-1: карточка предлагала либо записывать сырой ввод в
+`domain` (обрезка ~512 байт), либо — как альтернативу из ревью — убрать
+колонку и править комментарий схемы. (2) 14#P3-2: таймауты публичного
+сервера — добавить IdleTimeout/ReadTimeout, а WriteTimeout «осторожно»
+( live-чек до 60 s) либо зафиксировать делегирование nginx. (3)
+14#P3-3: консистентность журнала stored-ветки — «признак источника
+(live|stored) и/или stored-значения».
+Решение: (1) Записываем сырой ввод — комментарий схемы и есть контракт,
+менять схему ради кода нельзя. `recordCheck(ctx, raw, punycode, …)`;
+INSERT `(domain, punycode_domain) = (journalRawDomain(raw), punycode)`.
+Кап 512 байт именно по границе рун: body ограничен MaxBytesReader'ом
+4 КиБ, валидация режет >2048 только ПОСЛЕ трима — паддированный ввод
+(600 пробелов + имя) проходит валидацию и доходит до журнала длиннее
+любого легального имени, поэтому кап достижим и покрыт HTTP-тестом;
+байтовый разрез посреди многобайтной руны (IDN) дал бы invalid UTF-8 —
+`text`-колонка PostgreSQL такой INSERT отвергла бы целиком, хелпер
+отступает к границе. Хранится именно req.Domain «как введено» (без
+трима): регистр, точка, IDN-написание, префикс http:// — это и есть
+материал typo-triage. (2) WriteTimeout выведен из конфига —
+`web.timeout + 8 s`, а не константа: валидный диапазон web.timeout —
+1 s…10 min (config.Validate, config-тесты сами используют 90 s), и
+фиксированные 75 s (первый вариант, выровненный с nginx
+`proxy_read_timeout 75s`) резали бы легитимные ответы на поднятом
+web.timeout — это нашёл ревьюер (P2-1 раунда T-297), вариант
+отклонён; +8 s покрывают журнальное окно 3 s, запись ответа и
+stored-запрос до live-чека, deadline следует за капом автоматически.
+nginx proxy_read_timeout остаётся операторским пределом (медленнее
+ответ дропнет сам прокси; поднять его — deploy-решение). ReadTimeout=30
+s не задевает легитимных клиентов: тело формы ≤4 КиБ и читается
+хендлером сразу; IdleTimeout=60 s. Hermetic-тест таймаутов невозможен
+(секундные паузы; прецедент дашборда T-M11) — значения и обоснование
+в комментарии и docs/services.md.
+(3) Без миграций (интеграционные проверки в worktree запрещены, объём
+задачи — internal/web): признак источника отдельной колонкой не
+заводился; в stored-ветке (live упал, stored != nil, ответ 200
+stored_only) журнал получает found/score ИЗ stored-эпизода — строка
+аудита соответствует тому, что увидел посетитель; JSON-ответ не меняется
+(top-level found/score — контракт live-чека лендинг-клиента, менять его
+— смена API-контракта вне находки), duration_ms остаётся 0 (живого
+замера не было); «live или stored» различается метрикой
+`crawler_web_checks_total{result=stored_only}` того же запроса.
+Ссылки: T-297; bulk-ревью 14#P2-1, 14#P3-2, 14#P3-3, 14#P3-4
+(tmp/review/stage-report.md); internal/web/api.go (recordCheck,
+journalRawDomain, handleCheckDomainLive), web.go (Run);
+internal/web/api_test.go, unix_test.go, web_test.go (webCheckRows);
+docs/services.md; migrations/000012 (контракт web_checks, без правок).
+

@@ -1579,7 +1579,19 @@ its own `http.Server` inside OnRun with graceful stop on ctx
 cancellation: the framework gives one HTTP port per service and hangs
 `/metrics` on it,
 which must not be exposed (spec §9) — the precedent of lifecycle
-management inside OnRun. The landing pages it served until L-08 (the
+management inside OnRun. The server timeouts (T-297):
+ReadHeader 10 s (the slowloris cap, spec §9), Read 30 s (the form body
+is bounded by the 4 KiB MaxBytesReader and read by the handler at once —
+only a client trickling it byte-by-byte is cut), Write —
+`web.timeout` + 8 s, derived from the config: it covers the whole
+handler budget (a stored lookup, a live check capped by `web.timeout`,
+the journal window, the response write) and follows the configured cap
+automatically — a fixed constant would cut valid answers on a raised
+`web.timeout` (the config ceiling is 10 min; the review P2-1). The
+nginx `proxy_read_timeout` in front (75 s in the sample, deploy/nginx)
+stays the operator-side limit — a slower answer is dropped by the proxy
+itself, and raising it is a deploy decision; Idle 60 s (the keep-alive
+cap). The landing pages it served until L-08 (the
 locale SSR, the static assets, robots/sitemap) moved to the static
 ld-landing repo; the former routes (`GET /`, `/{locale}`, `/static/*`,
 `/robots.txt`, `/sitemap.xml`) are the router's honest 404. Routes:
@@ -1592,7 +1604,18 @@ with a small UDP pool, a shared Fetcher, a rule cache, one
 render.Manager —
 assembled by the first check, closed on service stop; concurrent checks
 are limited by `web.live_concurrency`; overload —
-a fast 503 with `Retry-After`); `GET /api/v1/landing/stats` —
+a fast 503 with `Retry-After`; each non-overload request with a valid
+client address goes to the `web_checks` journal (an overload and a peer
+without an IP are not written) with the schema contract of
+migrations/000012 (T-297): `domain` — the raw input as entered by the
+operator, capped at 512 bytes on a rune boundary (typo triage; the raw
+visitor input is stored as entered — a pasted URL keeps its path and
+query — and the table has no rotation, migrations/000012),
+`punycode_domain` — its `idn.Normalize` form; in the stored_only branch
+(the live check failed, the domain is known — a 200 from the stored
+data) the row records the stored `found`/`score` carried in the
+`stored` block of the answer, not the zeros of the failed live branch);
+`GET /api/v1/landing/stats` —
 the landing statistics as JSON for the static landing of the separate
 ld-landing repo (L-03, TZ-ld-landing §7.1: the same single
 `FetchLandingData` pass — the counters, the top-50 zone cloud with the

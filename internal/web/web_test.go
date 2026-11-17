@@ -52,7 +52,14 @@ type fakeDB struct {
 
 	mu      sync.Mutex
 	queries []string
-	execs   []string
+	execs   []execCall
+}
+
+// execCall — a recorded Exec: the SQL and its arguments (the web_checks
+// INSERT contract: the raw domain vs the punycode, found/score — T-297).
+type execCall struct {
+	sql  string
+	args []any
 }
 
 func (d *fakeDB) Ping(context.Context) error { return d.ping }
@@ -61,10 +68,10 @@ func (d *fakeDB) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFro
 	return 0, errors.New("CopyFrom must not be called")
 }
 
-func (d *fakeDB) Exec(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+func (d *fakeDB) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.execs = append(d.execs, sql)
+	d.execs = append(d.execs, execCall{sql: sql, args: args})
 	if d.execErr != nil {
 		return pgconn.CommandTag{}, d.execErr
 	}
@@ -76,12 +83,29 @@ func (d *fakeDB) webCheckInserts() int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	n := 0
-	for _, sql := range d.execs {
-		if strings.Contains(sql, "INSERT INTO web_checks") {
+	for _, c := range d.execs {
+		if strings.Contains(c.sql, "INSERT INTO web_checks") {
 			n++
 		}
 	}
 	return n
+}
+
+// webCheckRows — the argument rows of the web_checks INSERTs in order:
+// (domain, punycode_domain, ip_address, found, score, duration_ms). The
+// fake carries no INSERT semantics, so the journal contract is asserted
+// on the arguments (the raw input vs the punycode — the schema contract
+// of migrations/000012, T-297).
+func (d *fakeDB) webCheckRows() [][]any {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var rows [][]any
+	for _, c := range d.execs {
+		if strings.Contains(c.sql, "INSERT INTO web_checks") {
+			rows = append(rows, c.args)
+		}
+	}
+	return rows
 }
 
 func (d *fakeDB) Query(ctx context.Context, sql string, _ ...any) (pgx.Rows, error) {

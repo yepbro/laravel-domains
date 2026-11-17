@@ -29,6 +29,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -231,7 +232,23 @@ func (s *Server) handleCheckDomainLive(w http.ResponseWriter, r *http.Request) {
 	// non_ip metric), not silent.
 	if !errors.Is(liveErr, errLiveOverloaded) {
 		if isIP {
-			s.recordCheck(r.Context(), normalized, resp.Found, resp.Score, resp.DurationMS, ip)
+			// The journal records the answer the visitor got (14#P3-3):
+			// in the stored_only branch (the live check failed, the
+			// domain is known to the pipeline — a 200 built from the
+			// stored episode) the live-branch fields are zeros, while
+			// the answer carries the stored verdict — the row takes the
+			// stored found/score (the duration stays 0: there was no
+			// live measurement). The stored-only rows are told from the
+			// live ones by the stored_only outcome metric of the same
+			// request.
+			jFound, jScore := resp.Found, resp.Score
+			if liveErr != nil && resp.Stored != nil {
+				jFound = resp.Stored.Score != nil
+				if resp.Stored.Score != nil {
+					jScore = *resp.Stored.Score
+				}
+			}
+			s.recordCheck(r.Context(), req.Domain, normalized, jFound, jScore, resp.DurationMS, ip)
 		} else {
 			s.opt.Log.Warn("form: the web_checks journal entry skipped — the client address is not an IP (a peer without a valid proxy header)",
 				"domain", normalized)
@@ -344,19 +361,48 @@ func (s *Server) fetchStored(ctx context.Context, domain string) *storedSummary 
 // up to web.timeout), while the log is the audit of "who/what/when
 // checked": the INSERT lives in its own short window independent of the
 // client disconnect (P3-5 of the T-221 review).
-func (s *Server) recordCheck(ctx context.Context, punycode string, found bool, score float64, durMS int64, ip string) {
+//
+// The columns follow the schema contract of migrations/000012: domain —
+// the input as entered by the operator, before normalization (typo
+// triage: the case, the trailing dot, an IDN spelling, a typo),
+// punycode_domain — the idn.Normalize form for matching against the
+// pipeline data (14#P2-1 of the bulk review: before, both columns
+// received the punycode and the raw input was lost).
+func (s *Server) recordCheck(ctx context.Context, raw, punycode string, found bool, score float64, durMS int64, ip string) {
 	jctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
 	defer cancel()
 	if _, err := s.db.Exec(jctx,
 		"INSERT INTO web_checks (domain, punycode_domain, ip_address, found, score, duration_ms) "+
 			"VALUES ($1::text, $2::text, $3::inet, $4, $5::real, $6::int4)",
-		punycode, punycode, ip, found, score, int32(durMS)); err != nil {
+		journalRawDomain(raw), punycode, ip, found, score, int32(durMS)); err != nil {
 		// The domain and the cause — without the visitor address (no
 		// personal data in the log; the address stays only in
 		// web_checks).
 		s.opt.Log.Warn("form: the web_checks journal entry was not written", "domain", punycode, "err", err)
 		s.met.Failure(checkErrJournal)
 	}
+}
+
+// journalRawCap — the web_checks.domain cap: the raw form input is kept
+// as entered, but a padded or prefixed input (validation trims and cuts
+// schemes only after its own checks) can be longer than any legal name —
+// the audit keeps the beginning, where the operator's typos are. The
+// body itself is bounded by the 4 KiB MaxBytesReader.
+const journalRawCap = 512
+
+// journalRawDomain — the raw input for the web_checks.domain column,
+// capped at journalRawCap bytes on a rune boundary: a byte cut in the
+// middle of a multi-byte rune (an IDN input) would be rejected by the
+// text column itself, so the helper steps back to the boundary.
+func journalRawDomain(raw string) string {
+	if len(raw) <= journalRawCap {
+		return raw
+	}
+	raw = raw[:journalRawCap]
+	for len(raw) > 0 && !utf8.ValidString(raw) {
+		raw = raw[:len(raw)-1]
+	}
+	return raw
 }
 
 // unixLocalKey — the rate limit bucket key for a unix-socket peer
@@ -508,11 +554,4 @@ func (l *tokenBucketLimiter) allow(ip string, now time.Time) bool {
 	}
 	st.tokens--
 	return true
-}
-
-func min(a, b float64) float64 {
-	if a < b {
-		return a
-	}
-	return b
 }

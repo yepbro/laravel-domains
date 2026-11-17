@@ -203,7 +203,7 @@ func TestRecordCheckClientCanceled(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	srv.recordCheck(ctx, "example.com", true, 0.5, 10, "198.51.100.1")
+	srv.recordCheck(ctx, "Example.COM.", "example.com", true, 0.5, 10, "198.51.100.1")
 
 	if got := db.webCheckInserts(); got != 1 {
 		t.Fatalf("the INSERT web_checks with the client context canceled: %d, want 1 (the journal lives in its own window)", got)
