@@ -311,6 +311,12 @@ func limitChanRelease(ch chan struct{}) { <-ch }
 // waits for it (refs) — the map does not grow with the number of checked
 // IPs; its size is bounded by transport activity (concurrency).
 //
+// The entry key is the unmapped address (Unmap on entry into acquire and
+// drop): an IPv4-in-IPv6 literal (from a Location URL or a DNS answer)
+// and the plain IPv4 of the same host are one physical IP — two keys
+// would double the effective PerIPConns. The same normalization as
+// limitFor and AddrIsInternal.
+//
 // Override prefixes (T-165): an entry is created with the limit of the
 // prefix containing the IP (limitFor, longest-prefix) instead of the
 // common limit — the queue wait for parking IPs is observable (onWait,
@@ -354,8 +360,11 @@ func (m *limitIPMap) limitFor(ip netip.Addr) int {
 // thread-safe and idempotent (calling it twice breaks nothing). The queue
 // wait (including an instant one) is observed by onWait after a
 // successful slot grant (T-165): a cancelled wait does not become an
-// observation.
+// observation. The map key is the unmapped address (see limitIPMap):
+// acquire normalizes on entry, and the release closure carries the same
+// normalized key to drop.
 func (m *limitIPMap) acquire(ctx context.Context, ip netip.Addr) (func(), error) {
+	ip = ip.Unmap()
 	m.mu.Lock()
 	e, ok := m.entries[ip]
 	if !ok {
@@ -387,8 +396,10 @@ func (m *limitIPMap) acquire(ctx context.Context, ip netip.Addr) (func(), error)
 // drop decrements the entry's interest counter and removes the emptied
 // entry from the map. Removal is by entry identity: between refs hitting
 // zero and the removal, a new entry for the same IP could have been
-// created.
+// created. The key is the unmapped address — the same normalization as
+// acquire (idempotent: an already unmapped addr passes unchanged).
 func (m *limitIPMap) drop(ip netip.Addr, e *limitIPEntry) {
+	ip = ip.Unmap()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	e.refs--

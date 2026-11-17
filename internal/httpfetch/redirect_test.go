@@ -1095,6 +1095,91 @@ func TestRedirectResolveIPLiteral(t *testing.T) {
 	}
 }
 
+// TestRedirectResolvePortRange: url.Parse accepts any digit-only port
+// (:99999) without a range check, but TCP ports are 1..65535 — a
+// Location beyond the range is broken and must not be followed, for
+// name hosts and IP literals alike; the boundaries 1 and 65535 pass,
+// 0/65536/99999 and a digit string longer than int do not.
+func TestRedirectResolvePortRange(t *testing.T) {
+	base := &url.URL{Scheme: "http", Host: "start.example-test.net", Path: "/page"}
+	cases := []struct {
+		raw  string
+		want string
+		ok   bool
+	}{
+		{"http://port.example.net:8080/next", "http://port.example.net:8080/next", true},
+		{"http://port.example.net:1/", "http://port.example.net:1/", true},
+		{"http://port.example.net:65535/", "http://port.example.net:65535/", true},
+		{"http://port.example.net:0/", "", false},
+		{"http://port.example.net:65536/", "", false},
+		{"http://port.example.net:99999/", "", false},
+		{"http://port.example.net:111111111111111111111111/", "", false}, // Atoi overflow
+		{"http://192.0.2.10:99999/p", "", false},                         // an IPv4 literal
+		{"http://[2001:db8::1]:0/", "", false},                           // an IPv6 literal
+		{"http://[2001:db8::1]:65535/p", "http://[2001:db8::1]:65535/p", true},
+	}
+	for _, c := range cases {
+		u, ok := redirectResolve(base, c.raw)
+		if ok != c.ok {
+			t.Errorf("redirectResolve(%q): ok=%v, %v expected", c.raw, ok, c.ok)
+			continue
+		}
+		if ok && u.String() != c.want {
+			t.Errorf("redirectResolve(%q) = %q, %q expected", c.raw, u, c.want)
+		}
+	}
+}
+
+// TestFetchChainLocationBadPortStops: a hop target with an out-of-range
+// port — in a 302 Location header and in a 200 meta refresh alike (both
+// entry paths into redirectResolve) — is broken: the chain must not
+// follow it (no resolve, no dial of :99999 — a transport error would
+// reach the worker as Available=false instead of the "do not follow a
+// broken Location" contract) — the response itself is the final outcome.
+func TestFetchChainLocationBadPortStops(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+		handle func(w http.ResponseWriter)
+	}{
+		{"location-header", http.StatusFound, "STOP-302", func(w http.ResponseWriter) {
+			w.Header().Set("Location", "http://badport.example.net:99999/land")
+			w.WriteHeader(http.StatusFound)
+			_, _ = fmt.Fprint(w, "STOP-302")
+		}},
+		{"meta-refresh", http.StatusOK, "STAY-META", func(w http.ResponseWriter) {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = fmt.Fprint(w, `<html><head><meta http-equiv="refresh"`+
+				` content="0; url=http://badport.example.net:99999/land"></head><body>STAY-META</body></html>`)
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				c.handle(w)
+			}))
+			defer srv.Close()
+
+			f := NewFetcher(Options{Resolver: redirectResolverFail})
+			got, err := FetchChain(context.Background(), f, FetchRequest{
+				URL: redirectReqURL(srv.URL, "badport-start.example.net", "/start"), Addrs: loopbackAddr()})
+			if err != nil {
+				t.Fatalf("FetchChain: %v (a broken hop target must not become a fetch error)", err)
+			}
+			if got.Result == nil || got.Result.StatusCode != c.status {
+				t.Fatalf("the %d response itself expected as the final one, got: %+v", c.status, got.Result)
+			}
+			if body := redirectReadBody(t, got); !strings.Contains(body, c.body) {
+				t.Errorf("final body: %q, %q expected in it", body, c.body)
+			}
+			if len(got.Chain) != 1 {
+				t.Errorf("chain: %+v, 1 step expected (no hop)", got.Chain)
+			}
+		})
+	}
+}
+
 // TestFetchChainIPv6LiteralLocation: a Location with an IPv6 literal is an
 // ordinary chain hop: the [::1] host is taken literally (lookup does not
 // touch the resolver), the outcome is the page over IPv6.

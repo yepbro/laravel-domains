@@ -301,6 +301,70 @@ func TestLimitIPMapQueueAndCancel(t *testing.T) {
 	}
 }
 
+// TestLimitIPMapUnmapKey: the semaphore key is the unmapped address — the
+// plain IPv4 form and the IPv4-in-IPv6 form of one IP share a single
+// entry and its cap (a 4-in-6 literal from Location or a DNS answer must
+// not double the effective PerIPConns); the emptied entry is removed
+// under the unmapped key.
+func TestLimitIPMapUnmapKey(t *testing.T) {
+	m := limitIPMap{limit: 2, entries: make(map[netip.Addr]*limitIPEntry)}
+	ctx := context.Background()
+	v4 := netip.MustParseAddr("192.0.2.9")
+	in6 := netip.MustParseAddr("::ffff:192.0.2.9")
+
+	r1, err := m.acquire(ctx, v4)
+	if err != nil {
+		t.Fatalf("the IPv4 form: %v", err)
+	}
+	r2, err := m.acquire(ctx, in6)
+	if err != nil {
+		t.Fatalf("the 4-in-6 form: %v", err)
+	}
+
+	// Both forms held — one entry, keyed by the unmapped IPv4.
+	m.mu.Lock()
+	entries := len(m.entries)
+	_, keyed := m.entries[v4]
+	m.mu.Unlock()
+	if entries != 1 || !keyed {
+		t.Fatalf("the per-IP map: %d entries, keyed by the unmapped IPv4: %v", entries, keyed)
+	}
+
+	// The cap 2 is shared: a third acquire in either form queues.
+	queued := make(chan func(), 1)
+	go func() {
+		rel, err := m.acquire(ctx, in6)
+		if err != nil {
+			t.Errorf("the third connection: %v", err)
+			rel = func() {}
+		}
+		queued <- rel
+	}()
+	select {
+	case <-queued:
+		t.Fatal("a third slot through the 4-in-6 form at the shared cap 2")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// A release from the IPv4 form wakes the 4-in-6 waiter — one semaphore.
+	r1()
+	select {
+	case rel := <-queued:
+		rel()
+	case <-time.After(time.Second):
+		t.Fatal("the shared-semaphore queue did not wake")
+	}
+	r2()
+
+	// The entry is cleaned up — no residue under a 4-in-6 key either.
+	m.mu.Lock()
+	entries = len(m.entries)
+	m.mu.Unlock()
+	if entries != 0 {
+		t.Errorf("the per-IP entries are not cleaned up: %d", entries)
+	}
+}
+
 // TestLimitStateAcquireDial: the per-IP → global order; the global cap
 // queues; a cancellation in the queue is an error; a release wakes.
 func TestLimitStateAcquireDial(t *testing.T) {

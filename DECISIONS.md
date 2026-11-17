@@ -1095,3 +1095,37 @@ YAML .nan-кейс не добавлен — путь эквивалентен e
 load.go (setFloat — источник достижимости NaN через env);
 internal/service/service.go (newMetricsServer); config_test.go,
 service_test.go; docs/configuration.md, docs/services.md.
+
+### D-043 — T-299: httpfetch — порт из Location проверяется на диапазон 1..65535; ключ per-IP семафора — Unmap-нормализованный адрес
+Дата: 2026-11-16.
+Проблема: (1) redirectResolve не проверял диапазон порта из
+Location/meta refresh: net/url.Parse допускает любой цифровой порт
+(:99999), такой Location считался пригодным для перехода, и цепочка
+умирала транспортной ошибкой на dial ip:99999 (worker видел
+Available=false) — вместо контракта «не следовать за сломанным
+Location, текущий ответ финальный» (redirect.go, worker.go
+checkScheme); (2) ключ per-IP семафора не нормализовался Unmap:
+::ffff:1.2.3.4 (из Location/DNS-ответа, filterInternalAddrs после
+Unmap пропускает 4-in-6 как внешний) и 1.2.3.4 давали два семафора
+одного физического IP — эффективный per_ip_limit ×2; limitFor и
+AddrIsInternal уже делали Unmap, acquire/drop — нет.
+Решение: (1) в redirectResolve после u.Port() — strconv.Atoi и диапазон
+1..65535; невалидный порт (включая строку длиннее int — err из Atoi) →
+nil, false; проверка до развилки punycode, связывает имена и IP-литералы
+одинаково; (2) ip = ip.Unmap() на входе limitIPMap.acquire и drop —
+нормализованное значение и есть ключ карты; acquireDial покрыт
+транзитивно (единственное использование addr — передача в acquire),
+двойная нормализация избыточна; release-замыкание несёт уже
+нормализованный ключ в drop. Регрессионные тесты:
+TestRedirectResolvePortRange (границы 1/65535, невалидные
+0/65536/99999/переполнение Atoi, IPv4- и IPv6-литералы),
+TestFetchChainLocationBadPortStops (контракт цепочки: 302 с битым
+портом — финальный ответ, без резолва/dial),
+TestLimitIPMapUnmapKey (одна запись и общий кап на обе формы адреса,
+пробуждение очереди через форму, очистка записи); BDD — красный на
+исходном коде подтверждён по всем трём. Проверки: make test /
+make lint — зелёные.
+Ссылки: T-299; bulk-ревью 02#P2-1, 02#P2-2 (tmp/review/stage-report.md);
+internal/httpfetch/{redirect.go,limits.go},
+{redirect_test.go,limits_test.go}; эталоны limitFor (Unmap) и
+AddrIsInternal (transport.go); ревью фикса tmp/review/29-t299.md.

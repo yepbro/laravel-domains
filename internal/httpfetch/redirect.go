@@ -150,7 +150,7 @@ func FetchChainOpts(ctx context.Context, f *Fetcher, req FetchRequest, opts Chai
 	// punycode; normalization guards against unexpected unicode.
 	start, ok := redirectResolve(req.URL, req.URL.String())
 	if !ok {
-		return nil, fmt.Errorf("httpfetch: the start URL %s: the scheme or host does not normalize", req.URL)
+		return nil, fmt.Errorf("httpfetch: the start URL %s: the scheme, host or port does not normalize", req.URL)
 	}
 	startHost := start.Hostname()
 	visited := map[string]struct{}{redirectKey(start): {}}
@@ -236,8 +236,9 @@ func redirectIsHTTPStatus(code int) bool {
 
 // redirectNext determines the next chain URL from the response. A second
 // value of false means the response is final. A response with a broken or
-// foreign Location (not a URL, a non-http/https scheme, an invalid host)
-// is not followed: the response itself is the outcome, like a browser
+// foreign Location (not a URL, a non-http/https scheme, an invalid host,
+// an out-of-range port) is not followed: the response itself is the
+// outcome, like a browser
 // without a hop. For a 200 HTML response the body is scanned (and wrapped
 // in redirectBody — no bytes are lost).
 func redirectNext(res *FetchResult) (*url.URL, bool) {
@@ -271,8 +272,8 @@ func redirectNext(res *FetchResult) (*url.URL, bool) {
 // do not need HostToASCII and IPv6 fails on it (T-009) — they pass as is:
 // url.URL.Hostname() yields the literal without brackets, ready for
 // dialing. false — the string cannot be followed: not a URL, a foreign
-// scheme, no host, or an invalid name (broken punycode, UTS-46 forbidden
-// characters).
+// scheme, no host, an out-of-range port, or an invalid name (broken
+// punycode, UTS-46 forbidden characters).
 func redirectResolve(base *url.URL, raw string) (*url.URL, bool) {
 	ref, err := url.Parse(raw)
 	if err != nil {
@@ -286,13 +287,26 @@ func redirectResolve(base *url.URL, raw string) (*url.URL, bool) {
 	if host == "" {
 		return nil, false
 	}
+	// A port outside the TCP range 1..65535 is a broken Location: net/url
+	// validates only that the port is digit-only, so :99999 parses (and a
+	// digit string longer than int overflows Atoi), while the dialer
+	// rejects the address — following it would die as a transport error
+	// (the worker would see Available=false) instead of this contract: do
+	// not follow, the response is final. The check binds name hosts and
+	// IP literals alike — before the punycode split.
+	port := u.Port()
+	if port != "" {
+		if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
+			return nil, false
+		}
+	}
 	if _, err := netip.ParseAddr(host); err != nil {
 		// A name (not an IP literal): punycode and lower case.
 		ascii, err := idn.HostToASCII(host)
 		if err != nil {
 			return nil, false
 		}
-		if port := u.Port(); port != "" {
+		if port != "" {
 			u.Host = net.JoinHostPort(ascii, port)
 		} else {
 			u.Host = ascii
