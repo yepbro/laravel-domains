@@ -870,9 +870,19 @@ a repeated run is idempotent (changes nothing). The source — `--url`
 stdlib net/http with a timeout) or a pre-downloaded file `--file`
 (the offline mode: production without outbound internet). `--deactivate-missing`
 additionally disables the DB zones missing from the slice (retired TLDs) —
-the disabled names are printed in the report; without the flag the DB zones are not touched.
+gated like `zones collapse` (T-311): without `--apply` it is a dry-run of the
+disabling only (the candidates are listed, nothing is disabled — the insert
+of new zones still runs), `--apply` performs the disabling (the disabled
+names are printed in the report). A sanity guard refuses to
+disable more than 10% of the active zones in one run (an incomplete slice
+source; the real IANA retirements are units of zones) — `--force` bypasses it
+(only with `--deactivate-missing --apply`). Without the flag at all the DB
+zones are not touched.
 The dev/testbed limitation: the scenario test zones (`crawl.test`,
-`co.test`…) are not in the IANA slice — `--deactivate-missing` would disable them too
+`co.test`…) are not in the IANA slice — `--deactivate-missing --apply` would disable
+them too; in a testbed catalog where the scenario zones are the bulk of the
+active ones the sanity guard trips (the share is near 100%) — such a
+deliberate cleanup requires `--force`
 (the zone files are still accepted, but the scheduler does not select the domains
 of a disabled zone). The way back — one zone per call: `crawlerctl zones
 enable crawl.test` (and the other scenario zones; enable takes a single
@@ -888,7 +898,7 @@ only through ingest (`var/incoming`). An offline sync example:
 ```
 curl -o /tmp/tlds.txt https://data.iana.org/TLD/tlds-alpha-by-domain.txt
 docker compose run --rm -v /tmp/tlds.txt:/tlds.txt:ro tools \
-    go run ./cmd/crawlerctl zones sync --file /tlds.txt --deactivate-missing
+    go run ./cmd/crawlerctl zones sync --file /tlds.txt --deactivate-missing --apply
 ```
 
 `recheck <domain> [domain …]` (T-084, spec 4.1) — force-scheduling

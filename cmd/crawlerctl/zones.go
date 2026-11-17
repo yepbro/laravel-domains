@@ -40,7 +40,7 @@ Usage:
   crawlerctl zones list
   crawlerctl zones enable <zone>
   crawlerctl zones disable <zone>
-  crawlerctl zones sync [--file PATH] [--url URL] [--deactivate-missing]
+  crawlerctl zones sync [--file PATH] [--url URL] [--deactivate-missing] [--apply] [--force]
   crawlerctl zones collapse [--apply] [--skip-reconcile] [--force]
 
 A zone — a name in any form (unicode/punycode, case, a trailing dot),
@@ -58,7 +58,7 @@ like the incoming/<zone> directory; punycode is stored in the DB (spec 5.2).
                       domains themselves, their states and results are not
                       changed (spec 13.1), the zone's file ingest keeps
                       working as before
-  sync [--file PATH] [--url URL] [--deactivate-missing]
+  sync [--file PATH] [--url URL] [--deactivate-missing] [--apply] [--force]
                       populate the zone catalog from the slice of the IANA
                       root zone registry (tlds-alpha-by-domain.txt, ~1460
                       TLDs, IDNs already in punycode). New zones are added
@@ -70,7 +70,14 @@ like the incoming/<zone> directory; punycode is stored in the DB (spec 5.2).
                       pre-downloaded file --file (offline mode, production
                       without outbound internet). --deactivate-missing
                       additionally disables the DB zones missing from the
-                      slice (retired TLD), with their list in the report.
+                      slice (retired TLD), gated like zones collapse
+                      (T-311): without --apply — a dry-run, the candidates
+                      are listed and nothing is disabled; --apply performs
+                      the disabling (the disabled list in the report). The
+                      sanity guard refuses to disable more than 10% of the
+                      active zones in one run (an incomplete slice source)
+                      — --force bypasses it (only with --apply); the insert
+                      of new zones runs regardless of the gate.
                       This is a catalog of TLD names, not a source of domains:
                       domains — only through ingest (var/incoming)
   collapse [--apply] [--skip-reconcile] [--force]

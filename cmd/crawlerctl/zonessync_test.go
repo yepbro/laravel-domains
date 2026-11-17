@@ -1,13 +1,17 @@
-// Unit tests for crawlerctl zones sync (T-125, stage 14) on a fake pool
-// (db.DB) and an httptest server — without a DB and the network. Checked:
-// the IANA slice parsing (the version from the first comment, upper case,
+// Unit tests for crawlerctl zones sync (T-125, stage 14; the
+// --deactivate-missing gate — T-311) on a fake pool (db.DB) and an
+// httptest server — without a DB and the network. Checked: the IANA
+// slice parsing (the version from the first comment, upper case,
 // unicode→punycode, dedup, junk with a line number), the exact SQL texts
-// and parameters (a contract, the zones_test.go style) and the fake's live
-// semantics: the batch insert adds only new zones enabled, existing ones
-// are not touched at all, without --deactivate-missing DB zones are not
-// disabled, with the flag the ones missing from the slice are disabled
-// (idempotently, with a report); the e2e run() — exit codes and error
-// contexts modeled on the neighboring commands. Behavior against live
+// and parameters (a contract, the zones_test.go style) and the fake's
+// live semantics: the batch insert adds only new zones enabled, existing
+// ones are not touched at all, without --deactivate-missing DB zones are
+// not disabled, with the flag but without --apply — a dry-run (the
+// candidates listed, the disabling UPDATE not executed), with --apply —
+// the ones missing from the slice are disabled (idempotently, with a
+// report); the large-share sanity guard: a refusal without --force, the
+// bypass with it; the e2e run() — exit codes and error contexts modeled
+// on the neighboring commands. Behavior against live
 // PostgreSQL/data.iana.org — the dev environment (make shell).
 package main
 
@@ -46,10 +50,15 @@ const wantZonesDeactivateMissing = "UPDATE zones SET is_active = false " +
 	"WHERE is_active AND name <> ALL($1::text[]) " +
 	"RETURNING id, name, coalesce(name_unicode, '') AS name_unicode"
 
+const wantZonesDeactivateCandidates = "SELECT z.id, z.name, coalesce(z.name_unicode, '') AS name_unicode, a.active_total " +
+	"FROM zones AS z CROSS JOIN (SELECT count(*) AS active_total FROM zones WHERE is_active) AS a " +
+	"WHERE z.is_active AND z.name <> ALL($1::text[]) ORDER BY z.name"
+
 func TestZonesSyncSQLContract(t *testing.T) {
 	for sql, want := range map[string]string{
-		zonesSyncInsertSQL:        wantZonesSyncInsert,
-		zonesDeactivateMissingSQL: wantZonesDeactivateMissing,
+		zonesSyncInsertSQL:           wantZonesSyncInsert,
+		zonesDeactivateMissingSQL:    wantZonesDeactivateMissing,
+		zonesDeactivateCandidatesSQL: wantZonesDeactivateCandidates,
 	} {
 		if sql != want {
 			t.Errorf("the SQL contract:\ngot %s\nwant %s", sql, want)
@@ -291,6 +300,32 @@ func (p *syncPool) Query(_ context.Context, sql string, args ...any) (pgx.Rows, 
 		return nil, p.queryErr
 	}
 	switch sql {
+	case zonesDeactivateCandidatesSQL:
+		// The preview (T-311): the same predicate as the disabling
+		// UPDATE, read-only — the pool state does not change; every row
+		// carries the total of the active zones (the guard share).
+		inFile := make(map[string]bool, len(args[0].([]string)))
+		for _, n := range args[0].([]string) {
+			inFile[n] = true
+		}
+		total := 0
+		for i := range p.zones {
+			if p.zones[i].active {
+				total++
+			}
+		}
+		var off [][]any
+		for i := range p.zones {
+			if p.zones[i].active && !inFile[p.zones[i].name] { // the is_active guard
+				off = append(off, []any{p.zones[i].id, p.zones[i].name, p.zones[i].nameUnicode, int64(total)})
+			}
+		}
+		// ORDER BY name — the SQL promise the listing relies on.
+		sort.Slice(off, func(i, j int) bool { return off[i][1].(string) < off[j][1].(string) })
+		// The rows — exactly the SELECT columns (id, name, name_unicode,
+		// active_total): the fake mirrors the SQL, not the Scan
+		// destinations — a desync fails the test here, not on the live DB.
+		return statusRowsOf(off...), nil
 	case zonesDeactivateMissingSQL:
 		inFile := make(map[string]bool, len(args[0].([]string)))
 		for _, n := range args[0].([]string) {
@@ -349,7 +384,7 @@ func TestZonesSyncRun(t *testing.T) {
 	list := syncSampleList(t)
 
 	var stdout bytes.Buffer
-	if err := zonesSyncRun(context.Background(), pool, list, false, &stdout); err != nil {
+	if err := zonesSyncRun(context.Background(), pool, list, zonesSyncOpts{}, &stdout); err != nil {
 		t.Fatalf("zonesSyncRun: %v", err)
 	}
 	got := stdout.String()
@@ -400,9 +435,9 @@ func TestZonesSyncRun(t *testing.T) {
 	}
 
 	// Without the flag the DB zones missing from the slice are not
-	// disabled — no UPDATE was executed.
+	// disabled — neither the preview nor the disabling UPDATE ran.
 	for _, q := range pool.queries {
-		if q.sql == zonesDeactivateMissingSQL {
+		if q.sql == zonesDeactivateMissingSQL || q.sql == zonesDeactivateCandidatesSQL {
 			t.Errorf("without --deactivate-missing there must be no disabling: %v", q)
 		}
 	}
@@ -410,7 +445,7 @@ func TestZonesSyncRun(t *testing.T) {
 	// Idempotency: a repeated run with the same slice — 0 inserts, the
 	// pool state unchanged.
 	stdout.Reset()
-	if err := zonesSyncRun(context.Background(), pool, list, false, &stdout); err != nil {
+	if err := zonesSyncRun(context.Background(), pool, list, zonesSyncOpts{}, &stdout); err != nil {
 		t.Fatalf("a repeated zonesSyncRun: %v", err)
 	}
 	if !strings.Contains(stdout.String(), "added 0, already existed 5") {
@@ -421,45 +456,241 @@ func TestZonesSyncRun(t *testing.T) {
 	}
 }
 
-func TestZonesSyncRunDeactivateMissing(t *testing.T) {
+// syncWideSample — a pool and a slice over the newSyncPool seed plus
+// extra active zones present in the slice: crawl.test stays the only
+// candidate, but its share of the active zones (1 of 5 = 20% in the bare
+// seed after the insert) falls below the sanity guard — the "normal"
+// deactivation path without the guard interference.
+func syncWideSample(t *testing.T, extra int) (*syncPool, zoneListFile) {
+	t.Helper()
 	pool := newSyncPool()
-	list := syncSampleList(t)
+	var b strings.Builder
+	b.WriteString("# Version 2026101900, Last Updated Sun Oct 19 07:07:01 2026 UTC\n" +
+		"COM\nEXAMPLE.TEST\nXN--80ADXHKS\norg\nрф\n")
+	for i := 0; i < extra; i++ {
+		name := fmt.Sprintf("w%02d.test", i)
+		b.WriteString(strings.ToUpper(name) + "\n")
+		pool.zones = append(pool.zones, zoneRow{id: pool.nextID, name: name, active: true})
+		pool.nextID++
+	}
+	list, err := parseZoneList([]byte(b.String()))
+	if err != nil {
+		t.Fatalf("parseZoneList: %v", err)
+	}
+	return pool, list
+}
+
+// callsOf — the recorded Query calls with the given SQL, in order.
+func callsOf(pool *syncPool, sql string) []subCall {
+	var res []subCall
+	for _, q := range pool.queries {
+		if q.sql == sql {
+			res = append(res, q)
+		}
+	}
+	return res
+}
+
+// TestZonesSyncRunDeactivateMissingDryRun — --deactivate-missing without
+// --apply (T-311): the candidates are listed ("would disable"), the
+// disabling UPDATE is not executed, the pool state does not change.
+func TestZonesSyncRunDeactivateMissingDryRun(t *testing.T) {
+	pool, list := syncWideSample(t, 20) // 1 candidate of 22 active — below the guard
 
 	var stdout bytes.Buffer
-	if err := zonesSyncRun(context.Background(), pool, list, true, &stdout); err != nil {
+	if err := zonesSyncRun(context.Background(), pool, list,
+		zonesSyncOpts{deactivateMissing: true}, &stdout); err != nil {
 		t.Fatalf("zonesSyncRun --deactivate-missing: %v", err)
 	}
 	got := stdout.String()
-	// crawl.test is in the DB but not in the slice — disabled and listed;
-	// example.test is not in the slice but is already disabled — the
-	// is_active guard, it does not get into the report.
+	// crawl.test is in the DB but not in the slice — the candidate is
+	// listed; example.test is not in the slice but is already disabled —
+	// the is_active guard, it does not get into the listing.
+	if !strings.Contains(got, "would disable missing from the slice (retired TLD): 1: crawl.test") {
+		t.Errorf("the output does not contain the candidate list:\n%s", got)
+	}
+	if !strings.Contains(got, "dry-run: no zones disabled; the disabling will be done by crawlerctl zones sync --deactivate-missing --apply") {
+		t.Errorf("the output does not contain the dry-run hint:\n%s", got)
+	}
+	if strings.Contains(got, "disabled missing from the slice") {
+		t.Errorf("the dry-run reports a performed disabling:\n%s", got)
+	}
+	if strings.Contains(got, "sanity guard") {
+		t.Errorf("below the guard threshold there must be no guard warning:\n%s", got)
+	}
+	// The preview SELECT ran once with the full zone list of the slice;
+	// the disabling UPDATE did not run at all — crawl.test stays enabled.
+	preview := callsOf(pool, zonesDeactivateCandidatesSQL)
+	if len(preview) != 1 {
+		t.Fatalf("preview SELECTs %d, want 1", len(preview))
+	}
+	if want := list.Zones; !reflect.DeepEqual(preview[0].args[0], want) {
+		t.Errorf("the preview argument = %v, want the full slice list %v", preview[0].args[0], want)
+	}
+	if n := len(callsOf(pool, zonesDeactivateMissingSQL)); n != 0 {
+		t.Errorf("disabling UPDATEs %d, want 0 (dry-run writes nothing)", n)
+	}
+	if i := pool.zoneIndex("crawl.test"); i < 0 || !pool.zones[i].active {
+		t.Error("the dry-run must not disable crawl.test")
+	}
+}
+
+// TestZonesSyncRunDeactivateMissingApply — --deactivate-missing --apply:
+// the disabling UPDATE runs after the preview and disables the candidate;
+// a repeated run is idempotent.
+func TestZonesSyncRunDeactivateMissingApply(t *testing.T) {
+	pool, list := syncWideSample(t, 20) // 1 candidate of 22 active — below the guard
+
+	var stdout bytes.Buffer
+	if err := zonesSyncRun(context.Background(), pool, list,
+		zonesSyncOpts{deactivateMissing: true, apply: true}, &stdout); err != nil {
+		t.Fatalf("zonesSyncRun --deactivate-missing --apply: %v", err)
+	}
+	got := stdout.String()
 	if !strings.Contains(got, "disabled missing from the slice (retired TLD): 1: crawl.test") {
 		t.Errorf("the output does not contain the disabled list:\n%s", got)
 	}
 	if i := pool.zoneIndex("crawl.test"); i < 0 || pool.zones[i].active {
 		t.Error("crawl.test must be disabled")
 	}
-	// The UPDATE is executed once with the full zone list of the slice.
-	var deact []subCall
-	for _, q := range pool.queries {
-		if q.sql == zonesDeactivateMissingSQL {
-			deact = append(deact, q)
-		}
+	// The preview SELECT runs before the disabling UPDATE with the full
+	// zone list of the slice (the candidates feed the listing and the
+	// guard; the UPDATE's RETURNING — the report).
+	preview := callsOf(pool, zonesDeactivateCandidatesSQL)
+	deact := callsOf(pool, zonesDeactivateMissingSQL)
+	if len(preview) != 1 || len(deact) != 1 {
+		t.Fatalf("preview SELECTs %d and disabling UPDATEs %d, want 1 and 1", len(preview), len(deact))
 	}
-	if len(deact) != 1 {
-		t.Fatalf("disabling UPDATEs %d, want 1", len(deact))
-	}
-	if want := []string{"com", "example.test", "xn--80adxhks", "org", "xn--p1ai"}; !reflect.DeepEqual(deact[0].args[0], want) {
-		t.Errorf("the disabling argument = %v, want %v", deact[0].args[0], want)
+	if want := list.Zones; !reflect.DeepEqual(deact[0].args[0], want) {
+		t.Errorf("the disabling argument = %v, want the full slice list %v", deact[0].args[0], want)
 	}
 
-	// A repeated run — idempotent: nothing left to disable.
+	// A repeated run — idempotent: nothing left to disable, the UPDATE of
+	// the first run is not repeated.
 	stdout.Reset()
-	if err := zonesSyncRun(context.Background(), pool, list, true, &stdout); err != nil {
+	if err := zonesSyncRun(context.Background(), pool, list,
+		zonesSyncOpts{deactivateMissing: true, apply: true}, &stdout); err != nil {
 		t.Fatalf("a repeated zonesSyncRun: %v", err)
 	}
 	if !strings.Contains(stdout.String(), "no active zones missing from the slice") {
 		t.Errorf("the repeated run does not report \"no active ones\":\n%s", stdout.String())
+	}
+	if n := len(callsOf(pool, zonesDeactivateMissingSQL)); n != 1 {
+		t.Errorf("disabling UPDATEs after the repeat %d, want still 1 (idempotency)", n)
+	}
+}
+
+// TestZonesSyncRunDeactivateGuard — the large-share sanity guard (T-311):
+// the bare newSyncPool seed with the sample slice leaves 1 candidate of 5
+// active zones after the insert (20% — above the 10% threshold). Without
+// --apply — a warning in the dry-run; with --apply — a refusal without a
+// single disabling UPDATE; --force — the bypass with the disabling
+// performed.
+func TestZonesSyncRunDeactivateGuard(t *testing.T) {
+	list := syncSampleList(t)
+
+	// Dry-run: the warning names the share and the bypass, nothing is
+	// disabled (the candidates are still listed).
+	pool := newSyncPool()
+	var stdout bytes.Buffer
+	if err := zonesSyncRun(context.Background(), pool, list,
+		zonesSyncOpts{deactivateMissing: true}, &stdout); err != nil {
+		t.Fatalf("zonesSyncRun dry-run over the guard: %v", err)
+	}
+	got := stdout.String()
+	if !strings.Contains(got, "would disable missing from the slice (retired TLD): 1: crawl.test") {
+		t.Errorf("the dry-run over the guard must still list the candidate:\n%s", got)
+	}
+	if !strings.Contains(got, "warning: 1 of 5 active zones (20%) — above the 10% sanity guard") {
+		t.Errorf("the dry-run does not warn about the guard:\n%s", got)
+	}
+	if !strings.Contains(got, "dry-run: no zones disabled") {
+		t.Errorf("the dry-run over the guard must still end with the dry-run line:\n%s", got)
+	}
+	if n := len(callsOf(pool, zonesDeactivateMissingSQL)); n != 0 {
+		t.Errorf("disabling UPDATEs %d, want 0 (dry-run)", n)
+	}
+
+	// --apply without --force: a refusal, the disabling UPDATE is not
+	// executed, the zone stays enabled.
+	pool = newSyncPool()
+	err := zonesSyncRun(context.Background(), pool, list,
+		zonesSyncOpts{deactivateMissing: true, apply: true}, &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "above the 10% sanity guard") {
+		t.Fatalf("the guard error = %v, want the sanity guard refusal", err)
+	}
+	if !strings.Contains(err.Error(), "repeat with --force") {
+		t.Errorf("the guard error does not name the bypass:\n%v", err)
+	}
+	if n := len(callsOf(pool, zonesDeactivateMissingSQL)); n != 0 {
+		t.Errorf("disabling UPDATEs %d, want 0 (the guard refuses before the write)", n)
+	}
+	if i := pool.zoneIndex("crawl.test"); i < 0 || !pool.zones[i].active {
+		t.Error("the guard refusal must leave crawl.test enabled")
+	}
+
+	// --apply --force: the bypass — the disabling is performed.
+	pool = newSyncPool()
+	stdout.Reset()
+	if err := zonesSyncRun(context.Background(), pool, list,
+		zonesSyncOpts{deactivateMissing: true, apply: true, force: true}, &stdout); err != nil {
+		t.Fatalf("zonesSyncRun --apply --force: %v", err)
+	}
+	got = stdout.String()
+	if !strings.Contains(got, "continuing with --force: the large-share sanity guard is bypassed") {
+		t.Errorf("the output does not note the guard bypass:\n%s", got)
+	}
+	if !strings.Contains(got, "disabled missing from the slice (retired TLD): 1: crawl.test") {
+		t.Errorf("the output does not contain the disabled list:\n%s", got)
+	}
+	if i := pool.zoneIndex("crawl.test"); i < 0 || pool.zones[i].active {
+		t.Error("--force must disable crawl.test")
+	}
+}
+
+// TestZonesDeactivateGuardTripped — the guard boundary (the hy4 review of
+// T-311, P3-4): the trigger is the STRICT > of the exact ratio — exactly
+// 10% does not trip, a share above it does, however slightly; without
+// candidates the verdict is false (the early-exit path of zonesSyncRun).
+func TestZonesDeactivateGuardTripped(t *testing.T) {
+	cases := []struct {
+		candidates, activeTotal int
+		want                    bool
+	}{
+		{0, 1, false},     // no candidates — the early-exit path
+		{1, 10, false},    // exactly 10% — the strict > boundary
+		{10, 100, false},  // exactly 10% — the strict > boundary
+		{1, 9, true},      // 11.1%
+		{11, 100, true},   // 11%
+		{147, 1460, true}, // 10.07% — above, though a truncated print would say 10
+	}
+	for _, tc := range cases {
+		if got := zonesDeactivateGuardTripped(tc.candidates, tc.activeTotal); got != tc.want {
+			t.Errorf("zonesDeactivateGuardTripped(%d, %d) = %v, want %v",
+				tc.candidates, tc.activeTotal, got, tc.want)
+		}
+	}
+}
+
+// TestZonesDeactivateGuardPercent — the displayed share is rounded UP
+// (the hy4 review of T-311, P2-1): 10.07% prints as 11, never as the
+// self-contradictory "10% — above the 10% sanity guard"; an exact 10%
+// stays 10.
+func TestZonesDeactivateGuardPercent(t *testing.T) {
+	cases := []struct {
+		candidates, activeTotal, want int
+	}{
+		{1, 10, 10},     // exactly 10%
+		{10, 100, 10},   // exactly 10%
+		{147, 1460, 11}, // 10.07% — the ceiling, not the truncation
+		{1, 9, 12},      // 11.1% → 12
+		{1, 3, 34},      // 33.3% → 34
+	}
+	for _, tc := range cases {
+		if got := zonesDeactivateGuardPercent(tc.candidates, tc.activeTotal); got != tc.want {
+			t.Errorf("zonesDeactivateGuardPercent(%d, %d) = %d, want %d",
+				tc.candidates, tc.activeTotal, got, tc.want)
+		}
 	}
 }
 
@@ -468,16 +699,19 @@ func TestZonesSyncRunErrors(t *testing.T) {
 
 	pool := newSyncPool()
 	pool.execErr = errors.New("a write failure")
-	err := zonesSyncRun(context.Background(), pool, list, false, &bytes.Buffer{})
+	err := zonesSyncRun(context.Background(), pool, list, zonesSyncOpts{}, &bytes.Buffer{})
 	if err == nil || !strings.Contains(err.Error(), "zone insert") {
 		t.Fatalf("the insert error = %v, want the \"zone insert\" context", err)
 	}
 
+	// The deactivation path reads the candidates first (T-311): a Query
+	// failure surfaces with the preview context, before the UPDATE.
 	pool = newSyncPool()
 	pool.queryErr = errors.New("connection failure")
-	err = zonesSyncRun(context.Background(), pool, list, true, &bytes.Buffer{})
-	if err == nil || !strings.Contains(err.Error(), "disabling the zones missing from the slice") {
-		t.Fatalf("the disabling error = %v, want the disabling context", err)
+	err = zonesSyncRun(context.Background(), pool, list,
+		zonesSyncOpts{deactivateMissing: true, apply: true}, &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "selecting the zones missing from the slice") {
+		t.Fatalf("the preview error = %v, want the preview context", err)
 	}
 }
 
@@ -516,6 +750,10 @@ func TestRunZonesSyncExecution(t *testing.T) {
 			code: exitError, inErr: "no zones in the file"},
 		{name: "sync --file and --url are incompatible", args: []string{"zones", "sync", "--file", good, "--url", "http://example.invalid/tlds.txt"},
 			code: exitUsage, inErr: "incompatible"},
+		{name: "sync --apply without --deactivate-missing", args: []string{"zones", "sync", "--apply"},
+			code: exitUsage, inErr: "--apply complements --deactivate-missing"},
+		{name: "sync --force without --apply", args: []string{"zones", "sync", "--deactivate-missing", "--force"},
+			code: exitUsage, inErr: "--force complements"},
 		{name: "sync an extra argument", args: []string{"zones", "sync", "foo"},
 			code: exitUsage, inErr: "extra arguments"},
 		{name: "sync an unknown flag", args: []string{"zones", "sync", "--nope"},

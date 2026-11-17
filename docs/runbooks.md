@@ -1926,8 +1926,14 @@ messages carry a stale `zone_id`.
 disables database zones missing from the IANA snapshot — along with
 the junk 2LD zones it also deactivates the allowlist's test zones
 (`crawl.test` in the dev/testbed configs; the production allowlist is
-empty — production records have no such problem). In dev, after
-`--deactivate-missing`, restore the test zones one per call
+empty — production records have no such problem). The disabling is
+gated (T-311): without `--apply` — a dry-run of the disabling only (the
+candidates are listed, the insert of new zones still runs), `--apply`
+performs it; the sanity guard refuses to disable more than 10% of the
+active zones in one run (an incomplete slice source; in a testbed
+catalog of mostly scenario zones the guard trips by design) — `--force`
+bypasses it. In dev, after `--deactivate-missing --apply`,
+restore the test zones one per call
 (`zones enable` takes a single zone):
 `crawlerctl zones enable crawl.test`, then the remaining scenario
 zones from `ingest.allowed_zone_paths`.

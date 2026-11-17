@@ -12,7 +12,14 @@
 // as ingest auto-creation does, spec 5.1: an empty zone is indifferent to
 // the scheduler, DispatchBatch goes from domains) and, by the explicit
 // --deactivate-missing flag, disabling of DB zones missing from the slice
-// (retired TLDs). sync does not update existing rows at all: is_active is
+// (retired TLDs). The disabling is gated (T-311, D-060 — the zones
+// collapse --apply model): without --apply it is a dry-run — the
+// candidates are listed, nothing is disabled; --apply performs it; the
+// sanity guard (zonesDeactivateGuardShare) refuses a suspiciously large
+// share of the active zones (an incomplete --file) — --force bypasses it.
+// The insert is not gated: it is additive and idempotent (new empty
+// zones), the plain sync without the flags keeps the former behavior.
+// sync does not update existing rows at all: is_active is
 // the operator's ownership (zones enable/disable), the counters are
 // monitor's (T-078). Idempotent: a repeated run changes nothing.
 
@@ -86,6 +93,27 @@ const zonesSyncInsertSQL = "INSERT INTO zones (name, name_unicode, is_active) " 
 const zonesDeactivateMissingSQL = "UPDATE zones SET is_active = false " +
 	"WHERE is_active AND name <> ALL($1::text[]) " +
 	"RETURNING id, name, coalesce(name_unicode, '') AS name_unicode"
+
+// zonesDeactivateCandidatesSQL — the read-only preview of
+// --deactivate-missing (T-311): the same predicate as the disabling
+// UPDATE (the active zones missing from the slice), plus the total number
+// of active zones carried in every row (CROSS JOIN of a single aggregate
+// row) — the denominator of the sanity guard share. ORDER BY name — the
+// listing order is set here in SQL (the UPDATE's RETURNING order is not
+// defined, that path keeps sorting in Go).
+const zonesDeactivateCandidatesSQL = "SELECT z.id, z.name, coalesce(z.name_unicode, '') AS name_unicode, a.active_total " +
+	"FROM zones AS z CROSS JOIN (SELECT count(*) AS active_total FROM zones WHERE is_active) AS a " +
+	"WHERE z.is_active AND z.name <> ALL($1::text[]) ORDER BY z.name"
+
+// zonesDeactivateGuardShare — the sanity guard threshold of the
+// deactivation (T-311, D-060): refusing to disable more than this share
+// of the active zones in one run. Real IANA retirements are units of
+// zones over years (~0.1% of the ~1460), while an incomplete or
+// truncated --file misses tens of percent; 10% sits an order of magnitude
+// above any legitimate retirement wave and still catches a grossly
+// incomplete slice. The bypass is --force (the collapse precondition
+// pattern).
+const zonesDeactivateGuardShare = 10 // percent of the active zones
 
 // ---------------------------------------------------------------- parser
 
@@ -236,6 +264,61 @@ func zonesSyncInsert(ctx context.Context, pool db.DB, list zoneListFile) (int64,
 	return tag.RowsAffected(), nil
 }
 
+// zonesDeactivateCandidates — the read-only preview of
+// --deactivate-missing (T-311): the active zones missing from the slice
+// (the disabling candidates) and the total number of active zones (the
+// guard share denominator). The dry-run listing and the guard decision
+// run before the UPDATE; in the --apply path the UPDATE's RETURNING
+// remains the authoritative report (a zone may change between the read
+// and the write — only the actually disabled rows are reported there).
+//
+// activeTotal is meaningful only with a non-empty result: the aggregate
+// row reaches the scan only through a candidate row, so with no
+// candidates 0 is returned even if active zones exist — callers must
+// check len(cands) == 0 before any share arithmetic (the early exit of
+// zonesSyncRun does; the hy4 review of T-311, P3-3).
+func zonesDeactivateCandidates(ctx context.Context, pool db.DB, names []string) ([]zoneRow, int64, error) {
+	rows, err := pool.Query(ctx, zonesDeactivateCandidatesSQL, names)
+	if err != nil {
+		return nil, 0, fmt.Errorf("selecting the zones missing from the slice: %w", err)
+	}
+	defer rows.Close()
+	var cands []zoneRow
+	var activeTotal int64
+	for rows.Next() {
+		// Four destinations — exactly the SELECT columns (id, name,
+		// name_unicode, active_total): pgx rejects a desync.
+		var z zoneRow
+		if err := rows.Scan(&z.id, &z.name, &z.nameUnicode, &activeTotal); err != nil {
+			return nil, 0, fmt.Errorf("selecting the zones missing from the slice: reading: %w", err)
+		}
+		cands = append(cands, z)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("selecting the zones missing from the slice: %w", err)
+	}
+	return cands, activeTotal, nil
+}
+
+// zonesDeactivateGuardTripped — the sanity guard verdict (T-311): the
+// candidates exceed zonesDeactivateGuardShare of the active zones. An
+// integer percent comparison without division; on this path
+// activeTotal >= candidates > 0 (the candidates are active zones), so
+// the share percent in messages divides safely.
+func zonesDeactivateGuardTripped(candidates, activeTotal int) bool {
+	return 100*candidates > zonesDeactivateGuardShare*activeTotal
+}
+
+// zonesDeactivateGuardPercent — the candidates' share of the active
+// zones for the guard messages, rounded UP. The trigger is the strict >
+// over the exact ratio, so a truncated display could print "10%" next to
+// "above the 10% sanity guard" (147 of 1460 = 10.07%); the ceiling keeps
+// the messages self-consistent (the hy4 review of T-311, P2-1). The same
+// precondition as the trigger: candidates > 0, activeTotal >= candidates.
+func zonesDeactivateGuardPercent(candidates, activeTotal int) int {
+	return (100*candidates + activeTotal - 1) / activeTotal
+}
+
 // zonesDeactivateMissing disables DB zones missing from the slice
 // (zonesDeactivateMissingSQL) and returns their rows for the report
 // (sorted by name — the RETURNING order is not defined).
@@ -263,10 +346,24 @@ func zonesDeactivateMissing(ctx context.Context, pool db.DB, names []string) ([]
 	return off, nil
 }
 
+// zonesSyncOpts — the zones sync write switches (T-311): the insert of
+// new zones always runs (additive, idempotent); the disabling of the
+// zones missing from the slice is gated — a dry-run listing without
+// apply, performed with it, and force bypasses the large-share sanity
+// guard (the collapse Options pattern).
+type zonesSyncOpts struct {
+	deactivateMissing bool
+	apply             bool
+	force             bool
+}
+
 // zonesSyncRun — writes the reference table: the insert of new zones, the
 // read/added/already existed report; by the flag — disabling of the zones
-// missing from the slice, with their list.
-func zonesSyncRun(ctx context.Context, pool db.DB, list zoneListFile, deactivateMissing bool, stdout io.Writer) error {
+// missing from the slice, gated by --apply: the candidates are read and
+// listed before the write, the large-share sanity guard refuses a
+// suspiciously incomplete slice (T-311; the zones collapse model —
+// dry-run by default, --apply performs, --force bypasses the guard).
+func zonesSyncRun(ctx context.Context, pool db.DB, list zoneListFile, opts zonesSyncOpts, stdout io.Writer) error {
 	inserted, err := zonesSyncInsert(ctx, pool, list)
 	if err != nil {
 		return err
@@ -274,8 +371,46 @@ func zonesSyncRun(ctx context.Context, pool db.DB, list zoneListFile, deactivate
 	existed := int64(len(list.Zones)) - inserted
 	out(stdout, "zones read %d (duplicates in the file %d), added %d, already existed %d\n",
 		len(list.Zones), list.Duplicates, inserted, existed)
-	if !deactivateMissing {
+	if !opts.deactivateMissing {
 		return nil
+	}
+	// The candidates are read before the write (T-311): the dry-run
+	// listing and the guard share come from here; --apply then disables
+	// exactly this predicate (the UPDATE's RETURNING stays the report).
+	cands, activeTotal, err := zonesDeactivateCandidates(ctx, pool, list.Zones)
+	if err != nil {
+		return err
+	}
+	if len(cands) == 0 {
+		out(stdout, "no active zones missing from the slice\n")
+		return nil
+	}
+	tripped := zonesDeactivateGuardTripped(len(cands), int(activeTotal))
+	if !opts.apply {
+		names := make([]string, len(cands))
+		for i, z := range cands {
+			names[i] = zoneDesc(z)
+		}
+		out(stdout, "would disable missing from the slice (retired TLD): %d: %s\n",
+			len(cands), strings.Join(names, ", "))
+		// The hint follows the guard verdict (the hy4 review of T-311,
+		// P3-2): a plain --apply would be refused on this slice, so the
+		// tripped branch points at --apply --force right away.
+		hint := "dry-run: no zones disabled; the disabling will be done by crawlerctl zones sync --deactivate-missing --apply\n"
+		if tripped {
+			out(stdout, "warning: %d of %d active zones (%d%%) — above the %d%% sanity guard; check the slice source (an incomplete --file?)\n",
+				len(cands), activeTotal, zonesDeactivateGuardPercent(len(cands), int(activeTotal)), zonesDeactivateGuardShare)
+			hint = "dry-run: no zones disabled; with this slice --apply will be refused by the sanity guard — crawlerctl zones sync --deactivate-missing --apply --force bypasses it\n"
+		}
+		out(stdout, "%s", hint)
+		return nil
+	}
+	if tripped && !opts.force {
+		return fmt.Errorf("%d of %d active zones (%d%%) are missing from the slice — above the %d%% sanity guard (an incomplete --file?); check the slice source, run without --apply to list the candidates, or repeat with --force",
+			len(cands), activeTotal, zonesDeactivateGuardPercent(len(cands), int(activeTotal)), zonesDeactivateGuardShare)
+	}
+	if tripped {
+		out(stdout, "continuing with --force: the large-share sanity guard is bypassed\n")
 	}
 	off, err := zonesDeactivateMissing(ctx, pool, list.Zones)
 	if err != nil {
@@ -307,7 +442,11 @@ func zonesSync(args []string, stdout, stderr io.Writer) error {
 	file := fs.String("file", "", "the IANA registry slice file (offline; instead of --url)")
 	listURL := fs.String("url", "", "the registry slice URL (default "+zoneListURL+")")
 	deactivate := fs.Bool("deactivate-missing", false,
-		"disable the DB zones missing from the slice (retired TLD)")
+		"disable the DB zones missing from the slice (retired TLD); without --apply — the candidate list only (dry-run)")
+	apply := fs.Bool("apply", false,
+		"perform the disabling of --deactivate-missing (without the flag — dry-run; the insert of new zones runs regardless)")
+	force := fs.Bool("force", false,
+		"with --deactivate-missing --apply: bypass the large-share sanity guard (only with --apply)")
 	if handled, err := parseFlags(fs, zonesHelp, args, stdout); handled {
 		return err
 	}
@@ -316,6 +455,12 @@ func zonesSync(args []string, stdout, stderr io.Writer) error {
 	}
 	if *file != "" && *listURL != "" {
 		return usagef("zones sync: --file and --url are incompatible — specify one source")
+	}
+	if *apply && !*deactivate {
+		return usagef("zones sync: --apply complements --deactivate-missing (the plain sync inserts new zones without it)")
+	}
+	if *force && !*apply {
+		return usagef("zones sync: --force complements --deactivate-missing --apply (dry-run disables nothing)")
 	}
 
 	// A one-off CLI command: Ctrl-C/SIGTERM interrupt the download/write.
@@ -356,7 +501,11 @@ func zonesSync(args []string, stdout, stderr io.Writer) error {
 		return fmt.Errorf("zones sync: %w", err)
 	}
 	defer pool.Close()
-	if err := zonesSyncRun(ctx, pool, list, *deactivate, stdout); err != nil {
+	if err := zonesSyncRun(ctx, pool, list, zonesSyncOpts{
+		deactivateMissing: *deactivate,
+		apply:             *apply,
+		force:             *force,
+	}, stdout); err != nil {
 		return fmt.Errorf("zones sync: %w", err)
 	}
 	return nil

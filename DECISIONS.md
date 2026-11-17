@@ -1852,3 +1852,46 @@ test-race (monitor входит в RACE_PKGS) — зелёные.
 (hourlyAggSQL, hourCurBoundSQL), internal/status/status.go
 (throughputSQL — комментарий), internal/monitor/zonestats_test.go
 (TestHourlyAggSQLCurWindowBound), docs/schema.md, docs/services.md.
+
+### D-060 — T-311: zones sync --deactivate-missing — dry-run по умолчанию, --apply для записи и предохранитель на большую долю отключаемых зон
+Дата: 2026-11-17.
+Проблема: находка bulk-ревью hy4-flash-free 2026-11-16
+(tmp/review/hy4bulk/17-cli-testbed.md, №6) —
+cmd/crawlerctl/zonessync.go: --deactivate-missing одним UPDATE
+отключал все активные зоны вне списка из --file/--url без предпросмотра;
+единственная защита — отклонение пустого списка в парсере. Неполный или
+устаревший --file (обрыв загрузки, не тот файл) молча замораживал проверки
+всех отсутствующих зон (обратимо через zones enable, но массово и незаметно).
+Решение: гейт по образцу zones collapse --apply (UX-паттерн стадии):
+--deactivate-missing без --apply — dry-run (кандидаты читаются отдельным
+read-only SELECT zonesDeactivateCandidatesSQL — тот же предикат, что и
+UPDATE, плюс count активных зон в каждой строке — знаменатель доли; печать
+«would disable …», UPDATE не исполняется); --apply выполняет отключение
+(INSERT новых зон не гейтится — аддитивен и идемпотентен, обычный sync без
+флагов не меняет поведение — осознанная смена опасного поведения по решению
+владельца из ТЗ). Предохранитель: отказ, если кандидаты превышают 10%
+активных зон (zonesDeactivateGuardShare, сравнение целочисленное без
+деления) — реальные выводы из строя зон IANA это единицы зон за годы
+(~0.1% от ~1460), неполный срез теряет десятки процентов; 10% — на порядок
+выше легитимной волны выводов и ловит грубо неполный файл; обход — --force
+(паттерн предусловия collapse: в dry-run предупреждение, в apply без force
+— ошибка, с force — строка «continuing with --force»). Валидация флагов:
+--apply только с --deactivate-missing, --force только с --apply (стиль
+«--skip-reconcile complements --apply»). Поведенческий разрыв для скриптов:
+старое «сразу UPDATE» исчезает — пример в docs/dev-environment.md дополнен
+--apply; grep по deploy/ скриптов с --deactivate-missing не нашёл
+(только docs и tasks/TZ). Тесты: контракт нового SQL
+(wantZonesDeactivateCandidates), фейк-пул с рид-онли веткой превью;
+TestZonesSyncRunDeactivateMissingDryRun (кандидаты напечатаны, UPDATE
+нет, состояние пула не меняется), …Apply (UPDATE после превью, отчет,
+идемпотентность повтора), …Guard (dry-run предупреждение; apply без force
+— отказ без UPDATE; с force — обход и отключение), юзаж-кейсы run()
+(--apply без --deactivate-missing, --force без --apply — код 2).
+Интеграционного теста zones sync в test/integration нет и не добавлялось
+(юнит-паттерн на фейк-пуле — установленный для этого файла). Проверки:
+make test, make lint — зелёные (crawlerctl не в RACE_PKGS).
+Ссылки: ревью hy4bulk 17-cli-testbed.md №6; T-311;
+cmd/crawlerctl/zonessync.go (zonesDeactivateCandidatesSQL,
+zonesDeactivateGuardShare, zonesSyncOpts, zonesSyncRun),
+cmd/crawlerctl/zonessync_test.go, cmd/crawlerctl/zones.go (справка),
+docs/dev-environment.md, docs/runbooks.md.
