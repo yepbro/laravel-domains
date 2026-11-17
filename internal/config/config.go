@@ -249,6 +249,63 @@ type DNS struct {
 	// it equals concurrency: a pool smaller than the planned parallelism
 	// itself becomes a limiter below the configured one.
 	UDPPoolSize int `yaml:"udp_pool_size"`
+	// Fallback — the dns.fallback subsection (T-300): the switching
+	// policy of the resolver chain (dnsclient.FallbackResolver): which
+	// primary answers count as a failure for the switch and how fast the
+	// switch is. Both switches are off by default — the behavior of the
+	// pipeline before T-300 (an RCODE answer is the final result; the
+	// primary pays its full retry cycle before the backup). The style —
+	// the render.fallback subsection (FR-14).
+	Fallback DNSFallback `yaml:"fallback"`
+}
+
+// DNSFallback — the dns.fallback subsection: escalation to the reserves on
+// "bad" RCODEs of the primary and a fast switch of transport failures
+// (T-300, the bulk review 04#P2-1/P2-2). The default policy of the chain is
+// a deliberate compromise — a mass crawl of millions of domains must not
+// shoot every primary SERVFAIL at the public reserves (the incident
+// 24.10: 491K domains through the local unbound's SERVFAIL showed the price
+// of NOT switching; the avalanche shows the price of switching without a
+// budget) — so both changes are opt-in with a rate ceiling on the escalated
+// exchanges; false keeps the previous behavior byte for byte.
+type DNSFallback struct {
+	// EscalateRCodes — also switch when the primary ANSWERS with
+	// SERVFAIL/REFUSED (T-300, 04#P2-1): the answer of a live but degraded
+	// local resolver is not final, the question is repeated along
+	// dns.fallback_resolvers until a useful answer (any other RCODE,
+	// including NXDOMAIN; the semantics of the manual check chain —
+	// internal/checker/resolve.go). Without the budget the mass crawl
+	// would unload its full dns.max_qps onto the public resolvers in a
+	// SERVFAIL storm — every escalation spends a token of EscalateQPS;
+	// above the budget the primary's answer stays the result (the current
+	// behavior, visible by the primary servfail metric). NXDOMAIN and
+	// NOERROR are never escalated — the consumer semantics (T-036/T-039)
+	// do not change. false (the default) — an RCODE answer is the final
+	// result, as before.
+	EscalateRCodes bool `yaml:"escalate_rcodes"`
+	// EscalateQPS — the ceiling of RCODE-escalated exchanges per second
+	// (the avalanche guard): a token bucket, non-blocking — an exchange
+	// without a token is NOT escalated (the primary's answer is returned).
+	// The value is validated regardless of EscalateRCodes (the
+	// monitor.alerts style: the ceiling is meaningful before the enabling).
+	// The default 100 ≈ 1% of the planned dns.max_qps: the reserve drains
+	// the backlog slowly but surely, without knocking on the public DNS
+	// with the whole crawl. 0 — the default.
+	EscalateQPS float64 `yaml:"escalate_qps"`
+	// FastSwitch — the first transport error of a resolver moves the
+	// question to the next one in the chain instead of the internal retry
+	// loop of dns.retries attempts (T-300, 04#P2-2): the retry budget
+	// moves to the chain as a whole (each resolver — one attempt, the
+	// redundancy is the chain order; with the default two reserves the
+	// budget equals the previous primary-only one: 3 exchanges). The
+	// price: a single lost UDP datagram is no longer absorbed by the
+	// retry loop — it goes to the reserve at once. Requires
+	// dns.fallback_resolvers (validation); applies to the chain clients
+	// of the DNS stage — the mass pipeline (dns-worker) and the manual
+	// check (dnsclient.NewChainOptions); the standalone redirect-host
+	// resolver of http-worker is built via dnsclient.NewOptions (no
+	// chain) and keeps its retry loop.
+	FastSwitch bool `yaml:"fast_switch"`
 }
 
 // HTTP — the parameters of the HTTP stage (spec 5.5, the limits table).
@@ -1017,6 +1074,14 @@ func Default() *Config {
 			// = concurrency: the pool must not cut the planned
 			// parallelism.
 			UDPPoolSize: 2000,
+			// The switching policy (T-300): off — the behavior before
+			// T-300; the escalation ceiling is set even with the
+			// switches off (valid regardless of the enabling).
+			Fallback: DNSFallback{
+				EscalateRCodes: false,
+				EscalateQPS:    100,
+				FastSwitch:     false,
+			},
 		},
 		HTTP: HTTP{
 			Concurrency:    2000,
@@ -1728,6 +1793,23 @@ func (c *Config) Validate() error {
 	// dnsclient.MaxRetries.
 	if !inRange(c.DNS.Retries, 1, 10) {
 		problems = append(problems, rangeMsg("dns.retries", c.DNS.Retries, 1, 10)+"; minimum 1 — spec 5.4 requires retries")
+	}
+	// dns.fallback (T-300). The ceiling is validated regardless of the
+	// enabling (the monitor.alerts style: thresholds are valid before the
+	// delivery is on). The form !(v > 0 && v <= max), not v < 0 || v > max:
+	// NaN is insensitive to comparisons and would silently disable the
+	// avalanche guard (the T-298 lesson, render.fallback.share_percent).
+	if v := c.DNS.Fallback.EscalateQPS; v != 0 && !(v > 0 && v <= 100000) {
+		problems = append(problems, fmt.Sprintf(
+			"dns.fallback.escalate_qps: expected 0 (the default 100) or (0..100000], got %v", v))
+	}
+	if c.DNS.Fallback.EscalateRCodes && len(c.DNS.FallbackResolvers) == 0 {
+		problems = append(problems,
+			"dns.fallback.escalate_rcodes: dns.fallback_resolvers is empty — there is no reserve to escalate to")
+	}
+	if c.DNS.Fallback.FastSwitch && len(c.DNS.FallbackResolvers) == 0 {
+		problems = append(problems,
+			"dns.fallback.fast_switch: dns.fallback_resolvers is empty — a fail-fast primary without a reserve only loses the retry budget")
 	}
 	if c.DNS.RetryDelay <= 0 {
 		problems = append(problems, nonPositiveDur("dns.retry_delay", c.DNS.RetryDelay))

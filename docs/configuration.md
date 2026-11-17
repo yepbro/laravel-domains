@@ -407,6 +407,9 @@ separated by commas: `CRAWLER_SCHEDULER_ZONE_WEIGHTS="com=5, xn--p1ai=2"`.
 | `retries` | `CRAWLER_DNS_RETRIES` | integer | `2` (range 1..10) |
 | `retry_delay` | `CRAWLER_DNS_RETRY_DELAY` | duration | `200ms` |
 | `udp_pool_size` | `CRAWLER_DNS_UDP_POOL_SIZE` | integer | `2000` |
+| `fallback.escalate_rcodes` | `CRAWLER_DNS_FALLBACK_ESCALATE_RCODES` | boolean | `false` (T-300) |
+| `fallback.escalate_qps` | `CRAWLER_DNS_FALLBACK_ESCALATE_QPS` | number | `100` (T-300; `0` — the default) |
+| `fallback.fast_switch` | `CRAWLER_DNS_FALLBACK_FAST_SWITCH` | boolean | `false` (T-300) |
 
 `timeout`/`tcp_timeout`/`retries`/`retry_delay`/`udp_pool_size` —
 transport parameters of `internal/dnsclient` (T-034, spec 5.4):
@@ -456,10 +459,14 @@ refusal. Switching happens on every exchange, without remembering a
 at the price of each exchange's latency growing by the failed one's
 retry cycle (`timeout` × `retries`+1) while it is silent. At startup
 the dns-worker probes the chain with a synthetic probe (the root NS,
-bypassing the limiter): if part of it is silent — a Warn is logged
-(the chain keeps working by switching); if all are silent — a startup
-error (fail-fast: a pipeline without resolvers would dump domains into
-`temp_error`). Switches are observable via the
+bypassing the limiter): alive is NOERROR with records; a silent or
+degraded (a bad root NS answer) resolver — a Warn; nobody usable — a
+startup error (fail-fast: a pipeline without resolvers would dump
+domains into `temp_error`); a degraded primary without
+`fallback.escalate_rcodes` is also a startup error — the default
+switching does not bypass an answering resolver, so the pipeline would
+be useless while "a part of the chain responds" (the 24.10 incident
+composition, T-300). Switches are observable via the
 `crawler_dns_fallback_switches_total` metric (exchanges answered by
 the backup) and `crawler_dns_fallback_exhausted_total` (nobody
 answered — a future `temp_error`); analysis of degraded behavior —
@@ -471,6 +478,55 @@ publicly reachable anycast resolvers of two independent operators
 (Cloudflare, Quad9), as in spec 5.10; an empty list disables the
 backup (isolated environments, the dev config — there will be no
 backup probes at all).
+
+The `fallback` subsection (T-300, the bulk review 04#P2-1/P2-2) makes the
+two deliberate compromises of the switching policy opt-in — the defaults
+keep the previous behavior byte for byte:
+
+- `escalate_rcodes: true` — a SERVFAIL/REFUSED *answer* of the primary is
+  not final either: the question is re-asked along
+  `fallback_resolvers` until a useful answer (any other RCODE, including
+  NXDOMAIN — the semantics of the manual check chain,
+  internal/checker/resolve.go). Motivation — the 24.10 incident: a local
+  unbound SERVFAILing everything pushed 491K domains into `temp_error`
+  while the public reserves were alive. The counterweight is
+  `escalate_qps`: every reserve QUERY of an escalation spends a token of
+  the budget (a non-blocking token bucket — a walk of N reserves is N
+  queries, N tokens; without a token the walk stops and the primary's
+  answer stays the result — no waiting, the exchange holds the limiter
+  slot), so a SERVFAIL storm cannot unload the whole `max_qps` onto the
+  public DNS; `0` means the default 100 ≈ 1% of the planned rate. An
+  abandoned escalation (no reserve gave a useful answer) returns the
+  primary's own answer — its SERVFAIL → `temp_error` stays the
+  consumer's decision. NXDOMAIN/NOERROR of the primary are never
+  escalated.
+- `fast_switch: true` — the first transport error of a resolver moves the
+  question to the next one in the chain instead of its internal retry
+  loop (`retries` attempts × `timeout`): the retry budget belongs to the
+  chain (each resolver one attempt; with the default two reserves the
+  budget equals the previous primary-only one — 3 exchanges). The price:
+  a single lost UDP datagram is no longer absorbed by the retry loop —
+  it goes to the reserve at once. Requires a non-empty
+  `fallback_resolvers` (validation); applies to the chain clients of the
+  DNS stage — the mass pipeline (dns-worker) and the manual check
+  (checker); the standalone redirect-host resolver of http-worker is
+  built without a chain and keeps its retry loop. The time paid to
+  the failed primary is exported regardless of the switches —
+  `crawler_dns_fallback_primary_fail_seconds_total`.
+
+Observability (both modes): `crawler_dns_fallback_primary_servfail_total`
+/ `_primary_refused_total` count the "bad" answers of the primary (the
+incident metric without any enabling), `_escalated_total` — the reserve
+queries granted by the budget, `_primary_fail_seconds_total` — the
+time paid to the primary when it did not produce the final answer. The
+startup probe asks the root NS and
+counts a resolver alive only on NOERROR with records (T-300, 04#P3-1): a
+server answering SERVFAIL to the root NS is transport-alive but cannot
+resolve — a Warn; nobody usable — a startup error (fail-fast instead of
+poisoning domains with `temp_error`), and a degraded primary without
+`fallback.escalate_rcodes` is a startup error too (the default switching
+does not bypass an answering resolver); the dev testbed unbound serves
+the probe from a `local-data` record, deploy/docker/unbound.
 
 ### `http` (spec 5.5, the limits table)
 
@@ -1798,7 +1854,9 @@ Everything is checked at once; the error lists problems of the form
 - `dns.timeout`/`dns.tcp_timeout`/`dns.retry_delay` are positive;
   `dns.retries` 1..10 (spec 5.4: retries are mandatory);
   `dns.udp_pool_size`
-  1..100000;
+  1..100000; `dns.fallback.escalate_qps` 0 (the default) or (0..100000]
+  (NaN is rejected, T-300); `dns.fallback.escalate_rcodes`/`fast_switch`
+  require a non-empty `dns.fallback_resolvers`;
 - `http.user_agent` non-empty, up to 512 bytes, no line breaks or
   control characters;
 - `render.contexts` 1..16; `restart_every_pages` 1..1000000,

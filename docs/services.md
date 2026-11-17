@@ -563,12 +563,16 @@ writers of the column — the scheduler, workers, ingest, crawlerctl) —
   manual (runbook 2.4);
 - exchanges — the `dnsclient.FallbackResolver` chain (a local `Client`
   with a pool of UDP sockets, T-034, plus backup clients
-  `dns.fallback_resolvers`,
-  switching on a transport failure, T-107) under the `LimitResolver`
+  `dns.fallback_resolvers`, switching on a transport failure, T-107) under the `LimitResolver`
   (`dns.concurrency`/`dns.max_qps`, adaptive, `dns.ipv6`, T-035); the
-  service start — a synthetic probe of the chain (fail-fast when all are
-  dead, a Warn
-  on partial failure, T-107); the `q:http` publication — under the
+  `dns.fallback` subsection (T-300) opts the chain into escalation over
+  SERVFAIL/REFUSED answers of the primary (within the
+  `fallback.escalate_qps` budget — an avalanche guard for the public
+  reserves) and into a fast switch (one transport attempt per resolver,
+  the chain order is the retry budget); the service start — a synthetic
+  probe of the chain (fail-fast when nobody answers the root NS with
+  NOERROR records, a Warn on partial failure or a degraded — non-usable —
+  answer, T-107/T-300); the `q:http` publication — under the
   backpressure gate
   (`WatermarkPublisher`, T-026).
 

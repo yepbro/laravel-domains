@@ -1201,3 +1201,79 @@ make lint — зелёные.
 internal/httpfetch/{redirect.go,limits.go},
 {redirect_test.go,limits_test.go}; эталоны limitFor (Unmap) и
 AddrIsInternal (transport.go); ревью фикса tmp/review/29-t299.md.
+### D-044 — T-300: dns.fallback (эскалация SERVFAIL/REFUSED с бюджетом, fast_switch), проба требует NOERROR root NS, Discard удалён
+Дата: 2026-11-17.
+Проблема: четыре находки стадии 04-dns bulk-ревью. Обе P2 — осознанные
+компромиссы «защита публичного DNS от лавины» (fallback.go:8-16), поэтому
+решения строго config-gated, дефолт сохраняет поведение. (1) 04#P2-1:
+SERVFAIL/REFUSED от primary не эскалируется на backup (инцидент 24.10 —
+491K доменов в temp_error при живых публичных резолверах; политика ручной
+проверки checker/resolve.go противоположна). (2) 04#P2-2: при падении
+primary каждый обмен платит полный ретрай-цикл (3×2s+задержки ≈ 6.4s),
+удерживая слот лимитера; адаптив не видит деградации (err==nil от backup).
+(3) 04#P3-1: стартовая проба считает живым любой RCODE — SERVFAIL-ящий
+unbound проходит проверку, сервис поднимается и перекладывает всё в
+temp_error. (4) 04#P3-2: UDPPool.Discard — мёртвый код (только тесты).
+Решение: (1) Подраздел `dns.fallback` (стиль render.fallback):
+`escalate_rcodes` (дефолт false) — SERVFAIL/REFUSED-ответ primary
+переспрашивается по цепочке до первого полезного ответа (любой другой
+RCODE; семантика checker escalateResolver); `escalate_qps` (дефолт 100,
+0..100000, NaN отвергается формой `!(v>0&&v<=max)` — урок T-298) —
+не-blocking token bucket (свой escalateBudget с lazy-refill и
+инъекцией часов, burst = 1s ставки): без токена ответ primary остаётся
+результатом, ожидание запрещено — обмен уже держит слот T-035. Брошенная
+эскалация возвращает ответ primary (его SERVFAIL → temp_error остаётся
+решением потребителя), Exhausted НЕ растёт (primary ответил). Счётчики
+«SERVFAIL/REFUSED от primary» работают в ОБОИХ режимах (требование
+карточки) + `_escalated_total` (наблюдаемая работа бюджета) +
+`_primary_fail_seconds_total` (латентность, которую скрывает рабочий
+backup). (2) `fast_switch` (дефолт false) — «бюджет ретраев на цепочку»:
+Options.FastFail у Client (первая транспортная ошибка = конец Exchange),
+выставляется в NewOptions только при непустом fallback_resolvers
+(валидация требует список; fail-fast primary без резерва лишь теряет
+бюджет). Применяется к клиентам всей стадии DNS (масс-цепочка
+dns-worker + цепочка ручной проверки — NewOptions общий) — задокументировано.
+(3) Проба: живость = NOERROR + непустой ответ на root NS; деградировавший
+(servfail/refused/пустой NOERROR) — Warn; никто не полезен — ошибка
+старта (fail-fast). Обязательное следствие — testbed: сегодня unbound
+testbed-режима форвардит «.» в coredns, который отвечает SERVFAIL (замер
+на живом dev-стеке), т.е. строгая проба ложила бы dev/e2e; добавлен
+`local-zone "." transparent` + `local-data '. 60 IN NS a.root-servers.test.'`
+в unbound.testbed.conf — поведение проверено на выбрасываемом контейнере
+(root NS → NOERROR+1 RR локально; остальные имена форвардятся как раньше).
+Интеграционные проверки в worktree запрещены — риск снят замером, финальный
+контроль за make test-integration в основном дереве. (4) Discard удалён
+вместе с lazy-dial веткой Get и счётчиком live (инвариант |free| ≤ size,
+пулы полностью населены при создании, сокеты никогда не изымаются):
+подключение по «реальному признаку сломанности» (повторяющийся ECONNRESET)
+отклонено — для connected-UDP сокетов признак почти не достижим на write,
+ретрай-луп клиента и так поглощает редкие сбросы, а stateful-путь ради
+мёртвой ветки усложняет пул. P3-идеи вне объёма: предупреждение при
+включённом escalate_qps > 1% max_qps не делается (валидация уже
+ограничивает диапазон); счётчик D3 (checker apex.Status без DNSMS) — вне стадии.
+Проверки: make test / make lint / make test-race (dnsclient, dnsworker,
+config, cmd/dns-worker) — зелёные.
+Ревью (один раунд, deepseek, tmp/review/30-t300.md): P0/P1 нет; принято
+P2-1 — fast_switch через общий NewOptions задевал безцепочечный клиент
+http-worker (потеря ретраев молча): NewOptions возвращён к чистому
+транспортному маппингу, FastFail выставляет новый NewChainOptions
+(только сборщики цепочек: dns-worker, checker; http-worker не
+затронут); P2-2 — бюджет считался на эскалацию, а не на запрос к
+публичному резолверу (потолок ×длина цепочки): токен списывается на
+каждый запрос резерва, Escalated = выданные запросы; P2-3 — «SERVFAIL
+на пробе = Warn» не ловил композицию инцидента 24.10 при дефолтной
+политике: деградировавший primary без escalate_rcodes теперь ошибка
+старта (ProbeChain принимает политику, probeOnce различает деградацию
+и тишину; сообщение называет рычаг), тексты main/runbooks исправлены;
+P3-1 — PrimaryFailNanos приведён к определению (учитывается и при
+брошенной эскалации); P3-2 — эскалация с пустым списком резервов
+гасится в конструкторе (счётчики не врут); P3-3 — docs/docker.md
+(оговорка про root NS local-data в testbed) и устаревший абзац пробы в
+configuration.md обновлены. Отклонённых находок нет.
+Ссылки: T-300; bulk-ревью 04#P2-1, 04#P2-2, 04#P3-1, 04#P3-2
+(tmp/review/stage-report.md); internal/dnsclient/{fallback,client,probe,
+pool}.go + тесты; internal/dnsworker/fallbackmetrics.go; internal/config
+(config.go, load.go); cmd/dns-worker/main.go;
+deploy/docker/unbound/unbound.testbed.conf; config.example.yaml;
+docs/{configuration,services,runbooks}.md; инцидент 24.10
+(internal/dnsworker/result.go:205-208).

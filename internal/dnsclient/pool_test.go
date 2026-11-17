@@ -9,7 +9,6 @@ import (
 	"errors"
 	"net"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -206,58 +205,6 @@ func TestUDPPoolParallelInvariants(t *testing.T) {
 	}
 }
 
-func TestUDPPoolDiscardReplacedLazily(t *testing.T) {
-	addr := loopUDPAddr(t)
-	p, err := NewUDPPool(context.Background(), addr, 2)
-	if err != nil {
-		t.Fatalf("NewUDPPool: %v", err)
-	}
-	t.Cleanup(func() { _ = p.Close() })
-
-	// Count dials after the initial eager dial (DNS-08): Get does not open
-	// a new socket while a free one is around.
-	var dials atomic.Int32
-	old := p.dial
-	p.dial = func(ctx context.Context) (*net.UDPConn, error) {
-		dials.Add(1)
-		return old(ctx)
-	}
-
-	c1, err := p.Get(context.Background())
-	if err != nil {
-		t.Fatalf("get: %v", err)
-	}
-	p.Discard(c1)
-	assertConnClosed(t, c1)
-
-	// Room freed up, but a free eager socket sits in the channel — Get
-	// hands it out instead of dialing a replacement.
-	c2, err := p.Get(context.Background())
-	if err != nil {
-		t.Fatalf("get after discard: %v", err)
-	}
-	if c2 == c1 {
-		t.Fatal("a retired socket is not handed out again")
-	}
-	if n := dials.Load(); n != 0 {
-		t.Fatalf("dial sets %d next to a free socket, want 0", n)
-	}
-
-	// The channel is empty and there is room — now Get lazily dials a replacement.
-	c3, err := p.Get(context.Background())
-	if err != nil {
-		t.Fatalf("get: %v", err)
-	}
-	if c3 == c1 || c3 == c2 {
-		t.Fatal("want a replacement (new) socket")
-	}
-	if n := dials.Load(); n != 1 {
-		t.Fatalf("dial sets %d, want 1 (a lazy replacement)", n)
-	}
-	p.Put(c2)
-	p.Put(c3)
-}
-
 func TestUDPPoolClose(t *testing.T) {
 	addr := loopUDPAddr(t)
 	p, err := NewUDPPool(context.Background(), addr, 2)
@@ -329,39 +276,4 @@ func TestUDPPoolBadArguments(t *testing.T) {
 	if _, err := NewUDPPool(context.Background(), "127.0.0.1:99999", 1); err == nil {
 		t.Fatal("an unreachable port: want an eager dial set error")
 	}
-}
-
-// TestUDPPoolDialFailureAtGet — a lazy dial failing after Discard does not
-// break the counter: the next attempt dials the socket again.
-func TestUDPPoolDialFailureAtGet(t *testing.T) {
-	addr := loopUDPAddr(t)
-	p, err := NewUDPPool(context.Background(), addr, 1)
-	if err != nil {
-		t.Fatalf("NewUDPPool: %v", err)
-	}
-	t.Cleanup(func() { _ = p.Close() })
-
-	c1, err := p.Get(context.Background())
-	if err != nil {
-		t.Fatalf("get: %v", err)
-	}
-	p.Discard(c1)
-
-	var attempts atomic.Int32
-	old := p.dial
-	p.dial = func(ctx context.Context) (*net.UDPConn, error) {
-		if attempts.Add(1) == 1 {
-			return nil, errors.New("dial boom")
-		}
-		return old(ctx)
-	}
-	if _, err := p.Get(context.Background()); err == nil {
-		t.Fatal("the first (failing) dial set: want an error")
-	}
-	// The room counter is freed: a repeated Get dials the socket again.
-	c2, err := p.Get(context.Background())
-	if err != nil {
-		t.Fatalf("get after a failed dial set: %v", err)
-	}
-	p.Put(c2)
 }

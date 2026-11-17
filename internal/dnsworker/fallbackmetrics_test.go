@@ -1,8 +1,8 @@
-// Unit tests of the DNS fallback switch collector (T-107): a no-op on
-// nil dependencies, the export of the first snapshot into the counters,
-// accumulation by the deltas between passes, and a source restart (a
-// negative delta). The state source is a closure over a mutable snapshot
-// (FallbackStatsFunc).
+// Unit tests of the DNS fallback switch collector (T-107; the primary
+// RCODE/degradation/latency counters — T-300): a no-op on nil dependencies,
+// the export of the first snapshot into the counters, accumulation by the
+// deltas between passes, and a source restart (a negative delta). The state
+// source is a closure over a mutable snapshot (FallbackStatsFunc).
 
 package dnsworker
 
@@ -82,7 +82,11 @@ func TestCollectFallbackLoopNoop(t *testing.T) {
 
 func TestCollectFallbackLoopExportsAndDeltas(t *testing.T) {
 	reg := metrics.New("dns-worker")
-	src := &mutateStats{val: dnsclient.FallbackStats{Switches: 5, Exhausted: 2}}
+	src := &mutateStats{val: dnsclient.FallbackStats{
+		Switches: 5, Exhausted: 2,
+		PrimaryServFail: 7, PrimaryRefused: 1, Escalated: 3,
+		PrimaryFailNanos: 2500000000, // 2.5 s paid to the failed primary
+	}}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
@@ -90,18 +94,29 @@ func TestCollectFallbackLoopExportsAndDeltas(t *testing.T) {
 		done <- CollectFallbackLoop(ctx, reg, src.get, time.Millisecond, nil)
 	}()
 
-	// The first pass — right at startup: the snapshot {5, 2}.
+	// The first pass — right at startup: the snapshot {5, 2, …}.
 	waitFor(t, func() bool {
 		return fallbackCounterValue(t, reg, "crawler_dns_fallback_switches_total") == 5 &&
-			fallbackCounterValue(t, reg, "crawler_dns_fallback_exhausted_total") == 2
+			fallbackCounterValue(t, reg, "crawler_dns_fallback_exhausted_total") == 2 &&
+			fallbackCounterValue(t, reg, "crawler_dns_fallback_primary_servfail_total") == 7 &&
+			fallbackCounterValue(t, reg, "crawler_dns_fallback_primary_refused_total") == 1 &&
+			fallbackCounterValue(t, reg, "crawler_dns_fallback_escalated_total") == 3 &&
+			fallbackCounterValue(t, reg, "crawler_dns_fallback_primary_fail_seconds_total") == 2.5
 	})
 
 	// The source accumulated more: the counters grow by a delta rather
 	// than being reassigned.
-	src.set(dnsclient.FallbackStats{Switches: 8, Exhausted: 3})
+	src.set(dnsclient.FallbackStats{
+		Switches: 8, Exhausted: 3,
+		PrimaryServFail: 9, PrimaryRefused: 2, Escalated: 4,
+		PrimaryFailNanos: 4000000000,
+	})
 	waitFor(t, func() bool {
 		return fallbackCounterValue(t, reg, "crawler_dns_fallback_switches_total") == 8 &&
-			fallbackCounterValue(t, reg, "crawler_dns_fallback_exhausted_total") == 3
+			fallbackCounterValue(t, reg, "crawler_dns_fallback_exhausted_total") == 3 &&
+			fallbackCounterValue(t, reg, "crawler_dns_fallback_primary_servfail_total") == 9 &&
+			fallbackCounterValue(t, reg, "crawler_dns_fallback_escalated_total") == 4 &&
+			fallbackCounterValue(t, reg, "crawler_dns_fallback_primary_fail_seconds_total") == 4
 	})
 
 	cancel()

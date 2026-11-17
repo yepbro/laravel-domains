@@ -81,6 +81,9 @@ func TestDefault(t *testing.T) {
 		{"dns.retries", c.DNS.Retries, 2},
 		{"dns.retry_delay", c.DNS.RetryDelay.D(), 200 * time.Millisecond},
 		{"dns.udp_pool_size", c.DNS.UDPPoolSize, 2000},
+		{"dns.fallback.escalate_rcodes", c.DNS.Fallback.EscalateRCodes, false},
+		{"dns.fallback.escalate_qps", c.DNS.Fallback.EscalateQPS, float64(100)},
+		{"dns.fallback.fast_switch", c.DNS.Fallback.FastSwitch, false},
 		{"http.concurrency", c.HTTP.Concurrency, 2000},
 		{"http.per_ip_limit", c.HTTP.PerIPLimit, 4},
 		{"http.connect_timeout", c.HTTP.ConnectTimeout.D(), 5 * time.Second},
@@ -244,6 +247,10 @@ dns:
   retries: 4
   retry_delay: "250ms"
   udp_pool_size: 64
+  fallback:
+    escalate_rcodes: true
+    escalate_qps: 25.5
+    fast_switch: true
 http:
   concurrency: 1500
   per_ip_limit: 3
@@ -380,6 +387,9 @@ log:
 		{"dns.retries", cfg.DNS.Retries, 4},
 		{"dns.retry_delay", cfg.DNS.RetryDelay.D(), 250 * time.Millisecond},
 		{"dns.udp_pool_size", cfg.DNS.UDPPoolSize, 64},
+		{"dns.fallback.escalate_rcodes", cfg.DNS.Fallback.EscalateRCodes, true},
+		{"dns.fallback.escalate_qps", cfg.DNS.Fallback.EscalateQPS, 25.5},
+		{"dns.fallback.fast_switch", cfg.DNS.Fallback.FastSwitch, true},
 		{"http.concurrency", cfg.HTTP.Concurrency, 1500},
 		{"http.per_ip_limit", cfg.HTTP.PerIPLimit, 3},
 		{"http.connect_timeout", cfg.HTTP.ConnectTimeout.D(), 3 * time.Second},
@@ -708,6 +718,9 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_DNS_RETRIES":                      "5",
 		"CRAWLER_DNS_RETRY_DELAY":                  "333ms",
 		"CRAWLER_DNS_UDP_POOL_SIZE":                "77",
+		"CRAWLER_DNS_FALLBACK_ESCALATE_RCODES":     "true",
+		"CRAWLER_DNS_FALLBACK_ESCALATE_QPS":        "42.5",
+		"CRAWLER_DNS_FALLBACK_FAST_SWITCH":         "true",
 		"CRAWLER_HTTP_CONCURRENCY":                 "654",
 		"CRAWLER_HTTP_PER_IP_LIMIT":                "3",
 		"CRAWLER_HTTP_CONNECT_TIMEOUT":             "2s",
@@ -829,6 +842,9 @@ func TestEnvOverrides(t *testing.T) {
 		{"dns.retries", cfg.DNS.Retries, 5},
 		{"dns.retry_delay", cfg.DNS.RetryDelay.D(), 333 * time.Millisecond},
 		{"dns.udp_pool_size", cfg.DNS.UDPPoolSize, 77},
+		{"dns.fallback.escalate_rcodes", cfg.DNS.Fallback.EscalateRCodes, true},
+		{"dns.fallback.escalate_qps", cfg.DNS.Fallback.EscalateQPS, 42.5},
+		{"dns.fallback.fast_switch", cfg.DNS.Fallback.FastSwitch, true},
 		{"http.concurrency", cfg.HTTP.Concurrency, 654},
 		{"http.per_ip_limit", cfg.HTTP.PerIPLimit, 3},
 		{"http.connect_timeout", cfg.HTTP.ConnectTimeout.D(), 2 * time.Second},
@@ -1229,6 +1245,17 @@ func TestValidate(t *testing.T) {
 		{"dns retries too large", func(c *Config) { c.DNS.Retries = 11 }, "dns.retries"},
 		{"dns retry_delay 0", func(c *Config) { c.DNS.RetryDelay = 0 }, "dns.retry_delay"},
 		{"dns udp_pool_size 0", func(c *Config) { c.DNS.UDPPoolSize = 0 }, "dns.udp_pool_size"},
+		{"dns.fallback escalate_qps negative", func(c *Config) { c.DNS.Fallback.EscalateQPS = -1 }, "dns.fallback.escalate_qps"},
+		{"dns.fallback escalate_qps NaN", func(c *Config) { c.DNS.Fallback.EscalateQPS = math.NaN() }, "dns.fallback.escalate_qps"},
+		{"dns.fallback escalate_qps too large", func(c *Config) { c.DNS.Fallback.EscalateQPS = 100001 }, "dns.fallback.escalate_qps"},
+		{"dns.fallback escalate without reserves", func(c *Config) {
+			c.DNS.Fallback.EscalateRCodes = true
+			c.DNS.FallbackResolvers = nil
+		}, "dns.fallback.escalate_rcodes"},
+		{"dns.fallback fast_switch without reserves", func(c *Config) {
+			c.DNS.Fallback.FastSwitch = true
+			c.DNS.FallbackResolvers = nil
+		}, "dns.fallback.fast_switch"},
 		{"http concurrency 0", func(c *Config) { c.HTTP.Concurrency = 0 }, "http.concurrency"},
 		{"per_ip_limit 0", func(c *Config) { c.HTTP.PerIPLimit = 0 }, "http.per_ip_limit"},
 		{"per-IP override not a CIDR", func(c *Config) { c.HTTP.PerIPOverrides = map[string]int{"195.208.0.0.1/16": 8} }, "http.per_ip_overrides"},

@@ -992,8 +992,10 @@ The DNS stage's resolvers form a chain: the local unbound
 (`dns.resolvers`) and the fallbacks (`dns.fallback_resolvers`,
 spec 5.4). An exchange that exhausted its attempts on a network
 failure of the local resolver is retried against the fallbacks until
-the first answer (T-107); a server answer with any RCODE (including
-SERVFAIL) is not a switch. Mechanics and configuration —
+the first answer (T-107); by default a server answer with any RCODE
+(including SERVFAIL) is not a switch — with `dns.fallback.escalate_rcodes`
+(T-300) SERVFAIL/REFUSED answers of the primary are re-asked along the
+chain within the `escalate_qps` budget. Mechanics and configuration —
 [`configuration.md`](configuration.md), the `dns` section.
 
 ### 4.1. Signs
@@ -1002,14 +1004,37 @@ SERVFAIL) is not a switch. Mechanics and configuration —
   not answering at the transport level and a fallback is working: the
   pipeline is alive, but the latency of every DNS exchange grew by the
   failed resolver's retry cycle (`dns.timeout` × (`dns.retries`+1),
-  ~6.4 s by default);
+  ~6.4 s by default; with `dns.fallback.fast_switch: true` — one attempt);
+- `rate(crawler_dns_fallback_primary_servfail_total) > 0` (or
+  `_primary_refused_total`) — the local resolver ANSWERS but cannot
+  resolve (the 24.10 incident shape; the counter works regardless of the
+  `dns.fallback.escalate_rcodes` enabling): with the escalation on, a
+  part of these exchanges is drained by the reserves (watch
+  `_escalated_total` against the `escalate_qps` budget); without it —
+  every such exchange is a future `temp_error`, consider enabling the
+  escalation or fixing unbound;
+- `rate(crawler_dns_fallback_primary_fail_seconds_total) > 0` — the
+  DNS seconds per second lost to the primary that did not produce the
+  final answer (switched, exhausted or escalated-over): most of it is
+  the latency a working reserve hides from the limiter (the final
+  exchange succeeds), a part — the fully failed chains;
 - `rate(crawler_dns_fallback_exhausted_total) > 0` — nobody answered
   (the local one and the fallbacks): these domains get `temp_error`
   and a retry after `scheduler.temp_error_retry_after`;
-- the Warn "resolver startup probe: no response" at dns-worker start —
-  part of the chain is dead (the service kept working);
-- the startup error "startup probe: no resolver in the chain responds"
-  — all are dead; systemd restarts the service until it is fixed.
+- the Warn "resolver startup probe: no usable answer" at dns-worker
+  start — a reserve is degraded (its root NS answer is not
+  NOERROR-with-records) or transport-silent: lost redundancy, the
+  service keeps working;
+- the startup error "startup probe: no resolver in the chain answers
+  the root NS with NOERROR records" — nobody is usable (dead or
+  degraded); systemd restarts the service until it is fixed;
+- the startup error "the primary resolver responds but cannot resolve
+  the root NS" — the 24.10 composition: the local unbound answers
+  SERVFAIL, the default switching does not bypass an answering
+  resolver, every episode would become `temp_error`. Fix unbound, or
+  enable `dns.fallback.escalate_rcodes` (the reserves then carry the
+  questions within the `escalate_qps` budget) — the message names this
+  lever.
 
 ### 4.2. Actions
 

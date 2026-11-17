@@ -408,7 +408,7 @@ through `unbound-checkconf` when building the image. The mode is set by the
 
 | Mode | Config | Behavior |
 |---|---|---|
-| `testbed` (default) | `unbound.testbed.conf` | all traffic is forwarded to coredns (172.28.100.11): the test zones answer authoritatively, everything else gets REFUSED, nothing leaves for the outside (integration tests of the DNS stage) |
+| `testbed` (default) | `unbound.testbed.conf` | all traffic is forwarded to coredns (172.28.100.11): the test zones answer authoritatively, everything else gets REFUSED, nothing leaves for the outside (integration tests of the DNS stage). One exception: the root NS answer is served locally from a `local-data` record (T-300) — the dns-worker startup probe requires NOERROR with records, and coredns would REFUSE/SERVFAIL the "." question like any other non-test name; `local-zone "." transparent` keeps the forward for all the other names unchanged |
 | `internet` (`make up-internet`) | `unbound.internet.conf` | full recursion from the root servers, prefetch, the cache within the spec §3.2 budget |
 
 Parameters of the `internet` mode (spec §5.4, §3.2):

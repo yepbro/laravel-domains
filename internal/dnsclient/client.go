@@ -198,11 +198,23 @@ type Options struct {
 	RetryDelay time.Duration
 	// UDPPoolSize is the UDP socket pool size (see DefaultUDPPoolSize).
 	UDPPoolSize int
+	// FastFail — the first transport error fails Exchange at once, without
+	// the retry loop (T-300, dns.fallback.fast_switch): the retry budget
+	// moves to the resolver chain above (FallbackResolver) — each resolver
+	// one attempt, the redundancy is the chain order. Retries/RetryDelay
+	// are ignored in this mode; the option is set by NewOptions only
+	// together with a non-empty dns.fallback_resolvers (a fail-fast
+	// primary without a reserve only loses the budget). The RCODE contract
+	// does not change: a server answer is still a result, not an error.
+	FastFail bool
 }
 
 // NewOptions assembles the parameters from the dns section of the config (T-006):
 // the address is the first resolver (the client works with one server — Unbound);
-// timeouts/retries/pool are the section's own fields.
+// timeouts/retries/pool are the section's own fields. A pure transport
+// mapping: no switching policy — a client built this way keeps its retry
+// loop even with dns.fallback.fast_switch (http-worker has no reserve
+// chain; the chain builders use NewChainOptions, T-300).
 func NewOptions(cfg config.DNS) Options {
 	addr := ""
 	if len(cfg.Resolvers) > 0 {
@@ -216,6 +228,21 @@ func NewOptions(cfg config.DNS) Options {
 		RetryDelay:  cfg.RetryDelay.D(),
 		UDPPoolSize: cfg.UDPPoolSize,
 	}
+}
+
+// NewChainOptions is NewOptions for the clients of a resolver chain
+// (T-300, dns.fallback.fast_switch): with a non-empty
+// dns.fallback_resolvers the chain replaces the internal retry loop of a
+// resolver (each resolver one transport attempt, the redundancy is the
+// chain order); without reserves the primary keeps its retries — there is
+// nobody to switch to, a fail-fast primary would only lose the budget.
+// Used by the chain assemblers (cmd/dns-worker, internal/checker); a
+// standalone client (http-worker: redirect-host resolution, no chain) is
+// built via NewOptions and is never fail-fast.
+func NewChainOptions(cfg config.DNS) Options {
+	o := NewOptions(cfg)
+	o.FastFail = cfg.Fallback.FastSwitch && len(cfg.FallbackResolvers) > 0
+	return o
 }
 
 // withDefaults replaces zero and negative values with the defaults
@@ -311,8 +338,10 @@ func (c *Client) Close() error { return c.pool.Close() }
 // An attempt = a UDP exchange; a TC=1 response is retried over TCP (its
 // own timeout) with the same question — a TCP error fails the whole
 // attempt and the cycle starts over with UDP. Network errors are retried
-// up to Retries times with a RetryDelay pause; ctx cancellation is checked
-// before an attempt, after each failure and during the pause (between attempts Exchange aborts at once).
+// up to Retries times with a RetryDelay pause; with FastFail (T-300) the
+// first transport error fails the Exchange — the retry budget belongs to
+// the resolver chain above. ctx cancellation is checked before an attempt,
+// after each failure and during the pause (between attempts Exchange aborts at once).
 func (c *Client) Exchange(ctx context.Context, q Question) (*Result, error) {
 	if err := q.validate(); err != nil {
 		return nil, err
@@ -356,7 +385,10 @@ func (c *Client) Exchange(ctx context.Context, q Question) (*Result, error) {
 			// no retries are due.
 			return nil, ctxErr
 		}
-		if attempt >= c.opt.Retries {
+		// FastFail (dns.fallback.fast_switch, T-300): no retries here —
+		// the chain above owns the budget; the ctx check above still
+		// separates a cancellation from a transport failure.
+		if attempt >= c.opt.Retries || c.opt.FastFail {
 			break
 		}
 		if c.opt.RetryDelay > 0 {

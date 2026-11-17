@@ -98,12 +98,16 @@ func (t escalateTarget) desc(v any) string {
 // pool of each client (0 — the udp_pool_size of the dns section, the mass
 // pipeline): the long-lived circuit of the form (T-220) passes the small
 // LiveUDPPoolSize — the parallelism of the live check is limited by the
-// web semaphore; a production-sized socket fund is not needed. An empty
+// web semaphore; a production-sized socket fund is not needed. The
+// clients are built with NewChainOptions: dns.fallback.fast_switch (T-300)
+// moves the retry budget of the chain to the chain order (one transport
+// attempt per resolver) — a manual check walks the chain on transport
+// errors anyway, so the redundancy is the same. An empty
 // reserve list degenerates into the single primary client — the behavior
 // before the chain (T-119). The returned close closes all the clients of
 // the chain (one call, the errors joined).
 func newResolverChain(ctx context.Context, cfg config.DNS, udpPoolSize int) (dnsclient.Resolver, func() error, error) {
-	primaryOpts := dnsclient.NewOptions(cfg)
+	primaryOpts := dnsclient.NewChainOptions(cfg)
 	if udpPoolSize > 0 {
 		primaryOpts.UDPPoolSize = udpPoolSize
 	}
@@ -123,7 +127,7 @@ func newResolverChain(ctx context.Context, cfg config.DNS, udpPoolSize int) (dns
 	}
 	targets := []escalateTarget{{addr: primaryOpts.Addr, res: primary}}
 	for _, addr := range cfg.FallbackResolvers {
-		opts := dnsclient.NewOptions(cfg)
+		opts := dnsclient.NewChainOptions(cfg)
 		opts.Addr = addr
 		if udpPoolSize > 0 {
 			opts.UDPPoolSize = udpPoolSize

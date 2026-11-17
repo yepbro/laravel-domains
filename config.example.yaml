@@ -96,6 +96,16 @@ scheduler:
 dns:
   resolvers: ["127.0.0.1:53"]        # the local unbound
   fallback_resolvers: ["1.1.1.1:53", "9.9.9.9:53"]   # the reserve: a per-exchange switch on a transport failure of the local one (T-107)
+  # The switching policy of the chain (T-300). Both switches are off by
+  # default — the deliberate compromise "an RCODE answer is final; the
+  # primary pays its full retry cycle before the switch" protects the
+  # public resolvers from the crawl avalanche. The 24.10 incident (491K
+  # domains through a SERVFAILing local unbound) is the price of the other
+  # extreme — hence opt-in with a budget, not a flip of the default.
+  fallback:
+    escalate_rcodes: false           # true — a SERVFAIL/REFUSED ANSWER of the primary is re-asked along the reserves (the manual-check policy); without a budget a SERVFAIL storm would unload the whole max_qps onto the public DNS
+    escalate_qps: 100                # the escalation budget, exchanges/s (0 — this default): above it the primary's answer stays the result; ≈1% of max_qps
+    fast_switch: false               # true — the first transport error moves the question to the next resolver (one attempt each, the chain order is the retry budget); requires fallback_resolvers
   concurrency: 2000                  # the cap on concurrent exchanges (the T-035 limiter)
   max_qps: 10000                     # the average rate; bursts up to concurrency in a row
   ipv6: true                         # false — AAAA is answered locally (an empty NOERROR, no network)

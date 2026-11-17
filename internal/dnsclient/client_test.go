@@ -300,6 +300,35 @@ func TestExchangeRetriesExhausted(t *testing.T) {
 	}
 }
 
+// TestExchangeFastFailNoRetries — dns.fallback.fast_switch (T-300, 04#P2-2):
+// the first transport error fails the Exchange at once — one attempt, no
+// retry pause; the retry budget belongs to the resolver chain above
+// (FallbackResolver), not to the client.
+func TestExchangeFastFailNoRetries(t *testing.T) {
+	c, calls := newFakeClient(t, func(o *Options) {
+		o.Retries = 2
+		o.RetryDelay = time.Second
+		o.FastFail = true
+	}, func(_ context.Context, _ *dns.Msg, _ bool) (*dns.Msg, error) {
+		return nil, fakeNetErr{timeout: true}
+	})
+
+	start := time.Now()
+	_, err := c.Exchange(context.Background(), Question{Name: "example.com", Type: dns.TypeA})
+	if err == nil {
+		t.Fatal("a transport error — an error even with FastFail")
+	}
+	if !IsTimeout(err) {
+		t.Fatalf("the timeout classification is lost: %v", err)
+	}
+	if n := len(*calls); n != 1 {
+		t.Fatalf("exchanges: %d, want 1 (no retries after the first transport error)", n)
+	}
+	if since := time.Since(start); since > 500*time.Millisecond {
+		t.Fatalf("the failed exchange did not return at once: %s", since)
+	}
+}
+
 func TestExchangeCancelledDuringRetryDelay(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	c, calls := newFakeClient(t, func(o *Options) {
@@ -507,6 +536,36 @@ func TestNewOptionsFromConfig(t *testing.T) {
 	// validation (the config guarantees a non-empty list, spec 5.10).
 	if got := (NewOptions(config.DNS{})).Addr; got != "" {
 		t.Fatalf("without resolvers Addr must be empty, got %q", got)
+	}
+}
+
+// TestNewChainOptionsFastFail — dns.fallback.fast_switch maps onto the
+// transport only for the clients of a resolver chain (T-300): NewOptions
+// is a pure transport mapping (a standalone client — http-worker's
+// redirect-host resolver — keeps its retry loop regardless of the
+// option), NewChainOptions enables FastFail only together with a reserve
+// chain: without dns.fallback_resolvers a fail-fast primary would only
+// lose the retry budget — there is nobody to switch to.
+func TestNewChainOptionsFastFail(t *testing.T) {
+	cfg := config.DNS{
+		Resolvers:         []string{"10.0.0.1:53"},
+		FallbackResolvers: []string{"1.1.1.1:53"},
+		Fallback:          config.DNSFallback{FastSwitch: true},
+	}
+	if got := NewOptions(cfg); got.FastFail {
+		t.Fatal("NewOptions is a pure transport mapping: never fail-fast")
+	}
+	if got := NewChainOptions(cfg); !got.FastFail {
+		t.Fatal("with a reserve chain NewChainOptions enables FastFail")
+	}
+	cfg.FallbackResolvers = nil
+	if got := NewChainOptions(cfg); got.FastFail {
+		t.Fatal("without a reserve chain the primary keeps its retry loop")
+	}
+	cfg.FallbackResolvers = []string{"1.1.1.1:53"}
+	cfg.Fallback.FastSwitch = false
+	if got := NewChainOptions(cfg); got.FastFail {
+		t.Fatal("the option off — no FastFail")
 	}
 }
 

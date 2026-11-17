@@ -91,15 +91,18 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		return errors.New("dns-worker: the DB pool is not provided (postgres.dsn is required)")
 	}
 
-	// The resolver chain (T-107): the primary — the first of dns.resolvers
-	// (a local unbound, spec 5.4), the reserves — dns.fallback_resolvers
-	// in the config order. Each address — its own client with its own pool
-	// of sockets (the T-034 transport "one client — one resolver"); the
-	// pools of the reserves are opened with the same size: in the
-	// switchover mode the reserve holds the planned concurrency of the
-	// pipeline in full, while an idle connected UDP socket consumes
-	// nothing (no packets).
-	opt := dnsclient.NewOptions(cfg.DNS)
+	// The resolver chain (T-107; the switching policy — dns.fallback, T-300):
+	// the primary — the first of dns.resolvers (a local unbound, spec 5.4),
+	// the reserves — dns.fallback_resolvers in the config order. Each
+	// address — its own client with its own pool of sockets (the T-034
+	// transport "one client — one resolver"); the pools of the reserves are
+	// opened with the same size: in the switchover mode the reserve holds
+	// the planned concurrency of the pipeline in full, while an idle
+	// connected UDP socket consumes nothing (no packets). With
+	// dns.fallback.fast_switch the chain clients are built fail-fast (the
+	// first transport error moves the question to the next resolver — the
+	// retry budget belongs to the chain, NewChainOptions maps the option).
+	opt := dnsclient.NewChainOptions(cfg.DNS)
 	client, err := dnsclient.NewClient(ctx, opt)
 	if err != nil {
 		return err
@@ -127,20 +130,24 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		chain = append(chain, dnsclient.FallbackTarget{Addr: addr, Resolver: fc})
 	}
 
-	// The startup synthetic probe of the chain (T-107/DNS-12): a socket
-	// pool is fail-fast only by the address, a dead server without the
-	// probe would sound with the first production temp_error exchange. It
-	// goes to the clients directly, bypassing the limiter (the
-	// slot/token/window of the adaptive — not for a service exchange).
-	// A partial failure — a Warn in the log (the chain keeps working by
-	// switching), nobody answers — a startup error: a pipeline without
-	// resolvers puts the domains into temp_error (T-031), it is cheaper to
-	// fall down noticeably.
-	if err := dnsclient.ProbeChain(ctx, chain, logger); err != nil {
+	// The startup synthetic probe of the chain (T-107/DNS-12; the strict
+	// root NS criterion — T-300): a socket pool is fail-fast only by the
+	// address, a dead or SERVFAILing server without the probe would sound
+	// with the first production temp_error exchange. It goes to the
+	// clients directly, bypassing the limiter (the slot/token/window of
+	// the adaptive — not for a service exchange). A partial failure
+	// (silent or degraded — a bad root NS answer) — a Warn in the log
+	// (the silent one is bypassed by switching; the degraded primary —
+	// only with dns.fallback.escalate_rcodes, without it the startup
+	// falls: an answering-but-useless resolver is not bypassed by the
+	// default policy); nobody usable — a startup error: a pipeline
+	// without a resolving resolver puts the domains into temp_error
+	// (T-031), it is cheaper to fall down noticeably.
+	if err := dnsclient.ProbeChain(ctx, chain, dnsclient.NewFallbackOptions(cfg.DNS), logger); err != nil {
 		return err
 	}
 
-	fallback, err := dnsclient.NewFallbackResolver(chain[0], chain[1:]...)
+	fallback, err := dnsclient.NewFallbackResolver(chain[0], dnsclient.NewFallbackOptions(cfg.DNS), chain[1:]...)
 	if err != nil {
 		return err
 	}
