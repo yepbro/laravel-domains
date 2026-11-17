@@ -27,7 +27,7 @@ import (
 // is the fact of the last episode, check_state is the state of the cycle;
 // the transitions of that table that carry the status transitions of this
 // one as a side effect are the result records and the diagnosis
-// (R2/R3/R4/R13 = O2–O6, O10), the retry (R8 = O11), and the
+// (R2/R3/R4/R13/R16 = O2–O6, O10, O14), the retry (R8 = O11), and the
 // deletion/revival/insertion (R14/R9/R10 = O12/O13/O1).
 //
 //	| #   | Stage     | Condition                                        | Status                | Side effects                                      | Writer |
@@ -45,9 +45,10 @@ import (
 //	| O11 | scheduler | temp_error, the temp_error_retry_after window has passed, temp_attempts ≥ max_retries | delegated_no_address (ASYMMETRY A1) | temp_attempts = 0; check_state stays done | scheduler/retry.go retryFinalizeSQL (T-031) |
 //	| O12 | ingest    | delete file: the domain is removed from the registered | deleted       | result rows are cleaned by T-020; the render_pending flag is cleared by the same transaction | ingest/apply_delete.go (T-019) |
 //	| O13 | ingest    | revival: a deleted domain in a new add-file      | new                   | dns_mask/flags/last_checked_at are kept (the fact of the past check is not zeroed) | ingest/apply_add.go reviveAddSQL (T-018) |
+//	| O14 | scheduler | enqueue filter: the full name is longer than 253 octets (spec 5.2 item 4) — q:dns publication is impossible (queue.DNSBatch.validate); an empty name is unreachable from the dispatcher and stays O10's territory; the sources are manual SQL/corruption/a direct fixtures import (ingest rejects such names — T-309) | invalid (T-309) | temp_attempts = 0; a re-check never returns such rows (R7 does not return invalid) | scheduler/enqueueinvalid.go enqueueDiagnoseInvalid (the R16 transition of the check_state spec) |
 //
 // temp_attempts (T-031): resets to 0 on every non-temp_error episode-record
-// outcome (O2, O4, O6, O7, O9, O10) and on the retry finalization (O11);
+// outcome (O2, O4, O6, O7, O9, O10, O14) and on the retry finalization (O11);
 // the temp_error outcomes (O3, O5, O8) keep the accumulated value — the
 // scheduler increments it when assigning a retry (R8 of the check_state
 // spec); the ingest transitions (O12, O13) do not touch the counter.
@@ -124,10 +125,15 @@ const (
 	StatusDeleted Status = 6
 	// StatusInvalid — the diagnostic terminal status of a poison row
 	// (T-109, the remainder of DNS-03): the check is impossible — the
-	// name is empty or whitespace (a junk/corrupted domains row),
-	// repeating the episode would not change the outcome. Not a fact
+	// name is empty or whitespace (a junk/corrupted domains row), or the
+	// full name is longer than the spec 5.2 limit of 253 octets — such a
+	// row cannot even be published to q:dns and is diagnosed by the
+	// scheduler's enqueue filter (T-309, the R16 transition of the
+	// check_state spec); repeating the episode would not change the
+	// outcome. Not a fact
 	// about the domain: it is set by the DNS stage instead of the
-	// eternal queued→lease→dispatch loop; a recheck never returns such
+	// eternal queued→lease→dispatch loop (or by the enqueue cycle instead
+	// of the eternal batch rejection — T-309); a recheck never returns such
 	// rows — the only way out is manual triage (editing the name or
 	// deleting the row). Code 7 is an extension of the §6.2 table
 	// allowed by the spec: the "seven statuses" precedent (spec 13.1,

@@ -55,6 +55,7 @@
 //	| R13 | queued, pending | diagnosis of a poison row (empty name — the check cannot be performed deterministically) | status <> deleted, check_state <> done | done (status = invalid) | queued_at = NULL; temp_attempts = 0; clearing http_published; zones by the old state; invalid is not returned by recheck R7 — the only way out is manual triage | dnsworker/result.go resultInvalidSQL (T-109) |
 //	| R14 | any | delete file | row is not deleted | check_state NOT changed (status = deleted) | removed from the cycle by the guard predicates of all passes; results are cleaned by T-020; zone counters total −n and the old-state column −n | ingest/apply_delete.go (T-019) |
 //	| R15 | done | the "hung status" compensator (early recheck: O6 without O7–O9 — the q:http task is lost after XADD) | check_state = done, status = new, last_checked_at < now() − 24 h (NULL is filtered out by the comparison; the column's date precision makes the threshold equivalent to last_checked_at < current_date — the FR-2.2 gauge window, the cohort ripens at midnight per the T-031/T-202 precedent: the midnight influx of live q:http deliveries drains with a duplicated episode — the price of date granularity, absorbed by A3) | pending | queued_at = NULL (done already has NULL); the status outcome and temp_attempts are kept (new is not temp_error); the http_published bit is NOT touched — the R1 enqueue of a new episode will clear it (I4); zones checked −n / pending +n; the crawler_scheduler_stale_requeued_total counter; republishing the lost message is impossible (HTTPTask carries subdomain addresses, stored nowhere, internal/queue/message.go) — only a return to pending via the dispatcher | stalerequeue.go StaleRequeueOnce (T-270, FR-2.2) |
+//	| R16 | pending | diagnosis of an unenqueueable row by the enqueue cycle (the full name is longer than 253 octets, spec 5.2 item 4 — q:dns publication is impossible, queue.DNSBatch.validate; an empty name is unreachable from the dispatcher and stays R13's territory; before T-309 such a row rejected the whole R1 batch and forever blocked the cycle from the head of the zone queue: the dispatcher re-selected it into every batch) | status <> deleted, check_state = pending, the length is re-checked at the moment the row is LOCKED (octet_length(label) + 1 + the zone name) — a row fixed in the race window is not diagnosed | done (status = invalid) | queued_at = NULL (pending already has NULL); temp_attempts = 0; clearing http_published; last_checked_at = now(); zones pending −n / checked +n; the crawler_scheduler_enqueue_invalid_total counter (a non-zero steady state is a signal to the operator, runbooks.md §2.11) | enqueue.go EnqueueBatch → enqueueinvalid.go enqueueDiagnoseInvalid (T-309) |
 //
 // Non-transitions (observations, check_state is not changed):
 //
@@ -64,7 +65,7 @@
 //   - the http_published mark (dnsworker/result.go resultMarkPublishedSQL,
 //     T-108): a bit in flags, not a transition — the bit has its own specification (there,
 //     at resultMarkPublishedSQL; TZ-fsm §3 FR-3, T-257); clearing the bit is a
-//     side effect of R1–R4, R13 (in R4 — only the DNS branch: the
+//     side effect of R1–R4, R13, R16 (in R4 — only the DNS branch: the
 //     dnsworker operators write done from pending too; the HTTP branch recordDomainSQL does not
 //     touch the bit — it preserves the other bits except dead_host_cutoff);
 //   - the dispatcher DispatchBatch (dispatch.go, T-027): reads pending,
@@ -79,7 +80,7 @@
 //	I2  pending ⇒ queued_at IS NULL: pending has no lease — every writer
 //	    of a move to pending clears the mark (R5–R12, R15).
 //	I3  done ⇒ queued_at IS NULL: recording the result ends the lease (R2–R4,
-//	    R13); a non-NULL mark remains only on queued rows.
+//	    R13, R16); a non-NULL mark remains only on queued rows.
 //	I4  the only transition into queued is the scheduler enqueue R1: any
 //	    return of a row into work goes through pending (the dispatcher selects
 //	    only pending) — a fresh episode always passes the clearing of the

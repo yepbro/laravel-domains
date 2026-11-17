@@ -41,6 +41,7 @@ const (
 	enqueueKindZones    enqueueCallKind = "zones"    // the SELECT of active zones (T-027)
 	enqueueKindDispatch enqueueCallKind = "dispatch" // the SELECT of zone queues (T-027)
 	enqueueKindUpdate   enqueueCallKind = "update"   // UPDATE … RETURNING (T-028)
+	enqueueKindDiagnose enqueueCallKind = "diagnose" // UPDATE … RETURNING of the poison-row diagnosis (T-309)
 )
 
 // enqueueCall — a recorded Query call.
@@ -120,8 +121,10 @@ type enqueueFakePool struct {
 	zones       [][]any // the active zones reference table response (nil — no zones)
 	dispatches  []*enqueueFakeRows
 	updates     []*enqueueFakeRows
-	dispatchErr error // a sticky selection error (zones/queues)
-	updateErr   error // a sticky move error
+	diagnoses   []*enqueueFakeRows // the RETURNING of the poison-row diagnosis (T-309); exhausted — all rows
+	dispatchErr error              // a sticky selection error (zones/queues)
+	updateErr   error              // a sticky move error
+	diagnoseErr error              // a sticky diagnosis error (T-309)
 	calls       []enqueueCall
 	notify      chan struct{} // if set — a non-blocking signal on every Query
 }
@@ -143,6 +146,10 @@ func (p *enqueueFakePool) Query(ctx context.Context, sql string, args ...any) (p
 
 	kind := enqueueKindDispatch
 	switch {
+	case sql == enqueueInvalidSQL:
+		// The poison-row diagnosis (T-309): the exact text — the move below
+		// also starts with "WITH upd AS (UPDATE", the texts differ in the SET list.
+		kind = enqueueKindDiagnose
 	case strings.HasPrefix(sql, "WITH upd AS (UPDATE"):
 		kind = enqueueKindUpdate
 	case strings.HasPrefix(sql, "SELECT id, name FROM zones"):
@@ -175,6 +182,25 @@ func (p *enqueueFakePool) Query(ctx context.Context, sql string, args ...any) (p
 			return rows, nil
 		}
 		return enqueueFakeRowsOf(), nil // pending is empty
+	}
+
+	if kind == enqueueKindDiagnose {
+		if p.diagnoseErr != nil {
+			return nil, p.diagnoseErr
+		}
+		if len(p.diagnoses) > 0 {
+			rows := p.diagnoses[0]
+			p.diagnoses = p.diagnoses[1:]
+			return rows, nil
+		}
+		// Default: no race — all the batch keys are diagnosed (args: typed
+		// []int16/[]int8 slices — the leasenull style).
+		zones := args[0].([]int16)
+		rows := make([][]any, len(zones))
+		for i := range zones {
+			rows[i] = []any{zones[i]}
+		}
+		return enqueueFakeRowsOf(rows...), nil
 	}
 
 	if p.updateErr != nil {
@@ -450,7 +476,9 @@ func TestEnqueueBatch_EmptyBatch(t *testing.T) {
 }
 
 // TestEnqueueBatch_ValidationNumbers — the domain number in the error message is
-// 1-based: an invalid second batch row is named "domain #2".
+// 1-based: an invalid second batch row is named "domain #2". The data-level
+// cases (an empty/over-long name) are no longer batch errors — T-309 filters
+// them out (enqueueinvalid_test.go); the keys remain errors.
 func TestEnqueueBatch_ValidationNumbers(t *testing.T) {
 	valid := DispatchRow{ZoneID: 1, DomainID: 1, Name: "ok.example.com"}
 	cases := []struct {
@@ -460,8 +488,6 @@ func TestEnqueueBatch_ValidationNumbers(t *testing.T) {
 	}{
 		{"zone 0", DispatchRow{DomainID: 2, Name: "b.example.com"}, "domain #2: zone_id 0 ≤ 0"},
 		{"domain 0", DispatchRow{ZoneID: 2, Name: "b.example.com"}, "domain #2: domain_id 0 ≤ 0"},
-		{"empty name", DispatchRow{ZoneID: 1, DomainID: 2}, "domain #2: empty name"},
-		{"a long name", DispatchRow{ZoneID: 1, DomainID: 2, Name: strings.Repeat("a", 254)}, "domain #2: name longer than 253 octets"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -521,8 +547,6 @@ func TestEnqueueBatch_Validation(t *testing.T) {
 	}{
 		{"zone 0", DispatchRow{DomainID: 1, Name: "a.example.com"}, "zone_id 0"},
 		{"domain 0", DispatchRow{ZoneID: 1, Name: "a.example.com"}, "domain_id 0"},
-		{"empty name", DispatchRow{ZoneID: 1, DomainID: 1}, "empty name"},
-		{"a long name", DispatchRow{ZoneID: 1, DomainID: 1, Name: strings.Repeat("a", 254) + ".com"}, "longer than 253"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

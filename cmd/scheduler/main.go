@@ -207,6 +207,10 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 		BatchSize:   cfg.Scheduler.BatchSize,
 		ZoneWeights: zoneWeights,
 		Log:         logger,
+		// The counter of the terminal diagnosis of unenqueueable rows
+		// (T-309, enqueueinvalid.go): a non-zero steady state is a signal
+		// to the operator (runbooks.md §2.11).
+		Metrics: reg,
 	})
 	<-bg
 	<-bg

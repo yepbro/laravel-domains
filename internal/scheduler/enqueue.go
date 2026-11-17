@@ -37,6 +37,20 @@
 // moved — publication is built from them; unmoved ones (a race)
 // are excluded from publication: the next cycle will pick them up (delivery
 // at-least-once, spec 3.4).
+//
+// The data-level guard of the batch (T-309): a row whose name is empty or
+// longer than 253 octets (spec 5.2 item 4) cannot be published to q:dns
+// (the queue contract) — rejecting the whole batch for it (the pre-T-309
+// behavior) left the cycle forever repeating the same refusal: the
+// dispatcher (T-027) selects the pending prefix of a zone by id, and a
+// poison row at the head got into every batch. Now such a row is filtered
+// out of the move/publication; an over-long one is terminally diagnosed
+// (status = invalid, the R16 transition — enqueueinvalid.go; an empty name
+// is unreachable from the dispatcher — label + '.' + zone always has the
+// dot — and has no DB counterpart of the diagnosis: that territory is
+// R13's, dnsworker): the valid rows of the batch are enqueued regardless
+// of the poison ones; the incident is observable (the
+// crawler_scheduler_enqueue_invalid_total counter and the loop's Warn).
 
 package scheduler
 
@@ -48,6 +62,7 @@ import (
 	"time"
 
 	"crawler/internal/db"
+	"crawler/internal/metrics"
 	"crawler/internal/model"
 	"crawler/internal/queue"
 )
@@ -136,6 +151,20 @@ type EnqueueResult struct {
 	// Skipped — batch rows not moved because of a race (no longer
 	// pending at the moment of the UPDATE), including duplicate keys in the batch.
 	Skipped int
+	// Invalid — batch rows excluded from the move and publication by the
+	// data-level guard (T-309): the name is empty or longer than
+	// enqueueMaxNameLen octets — the q:dns publication would reject such a
+	// value (queue.DNSBatch.validate). Before T-309 one such row rejected
+	// the whole batch.
+	Invalid int
+	// Diagnosed — of the Invalid ones, the rows moved to done/status=invalid
+	// by the terminal diagnosis of THIS call (by RETURNING, after the
+	// guards — enqueueinvalid.go): they leave pending and no longer fall
+	// into selections. Less than Invalid — the statement's guards filtered
+	// out rows (fixed in the race window) or the diagnosis failed (the
+	// returned error): the row remains pending and is filtered again by the
+	// next cycle.
+	Diagnosed int
 }
 
 // EnqueueBatch moves a batch of selected domains to check_state = queued with
@@ -155,15 +184,33 @@ func EnqueueBatch(ctx context.Context, pool db.DB, q queue.Queue, batch []Dispat
 		// forbidden by the queue contract (queue.DNSBatch.validate).
 		return EnqueueResult{}, nil
 	}
-	if err := enqueueValidate(batch); err != nil {
+	if err := enqueueKeysValidate(batch); err != nil {
 		return EnqueueResult{}, err
+	}
+
+	// The data-level guard (T-309): poison rows (an unenqueueable name) are
+	// excluded from the move/publication and terminally diagnosed
+	// (enqueueinvalid.go — the R16 transition); the valid rows are
+	// enqueued regardless of them. A diagnosis failure does not block the
+	// move: the error is returned after the valid part is handled (the
+	// publication-failure style) — the loop Warns and repeats the batch.
+	valid, invalid := enqueueSplit(batch)
+	res := EnqueueResult{Invalid: len(invalid)}
+	var diagErr error
+	if len(invalid) > 0 {
+		res.Diagnosed, diagErr = enqueueDiagnoseInvalid(ctx, pool, invalid)
+	}
+	if len(valid) == 0 {
+		// Nothing to move or publish: an empty DNSBatch is forbidden by the
+		// queue contract; the outcome is the diagnosis alone.
+		return res, diagErr
 	}
 
 	// Batch keys — parallel arrays (the db.Update builder columns —
 	// []any with int2/int8 elements; each array is one parameter).
-	zoneIDs := make([]any, len(batch))
-	domainIDs := make([]any, len(batch))
-	for i, r := range batch {
+	zoneIDs := make([]any, len(valid))
+	domainIDs := make([]any, len(valid))
+	for i, r := range valid {
 		zoneIDs[i] = r.ZoneID
 		domainIDs[i] = r.DomainID
 	}
@@ -173,7 +220,7 @@ func EnqueueBatch(ctx context.Context, pool db.DB, q queue.Queue, batch []Dispat
 	// statement (T-178): the move and the deltas are atomic.
 	rows, err := pool.Query(ctx, enqueueBatchSQL, zoneIDs, domainIDs)
 	if err != nil {
-		return EnqueueResult{}, fmt.Errorf("scheduler: batch enqueue (%d domains): %w", len(batch), err)
+		return res, fmt.Errorf("scheduler: batch enqueue (%d domains): %w", len(valid), err)
 	}
 
 	translated := make(map[enqueueKey]struct{}, len(batch))
@@ -184,7 +231,8 @@ func EnqueueBatch(ctx context.Context, pool db.DB, q queue.Queue, batch []Dispat
 			// the cursor until the function exits, i.e. also during
 			// publication (the VerifyCounters style, T-217).
 			rows.Close()
-			return EnqueueResult{}, fmt.Errorf("scheduler: batch enqueue: reading moved rows: %w", err)
+			// res — with the committed diagnosis counts (T-309).
+			return res, fmt.Errorf("scheduler: batch enqueue: reading moved rows: %w", err)
 		}
 		translated[k] = struct{}{}
 	}
@@ -192,7 +240,8 @@ func EnqueueBatch(ctx context.Context, pool db.DB, q queue.Queue, batch []Dispat
 	// (the readDailyValue precedent, T-217).
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return EnqueueResult{}, fmt.Errorf("scheduler: batch enqueue: %w", err)
+		// res — with the committed diagnosis counts (T-309).
+		return res, fmt.Errorf("scheduler: batch enqueue: %w", err)
 	}
 	// The cursor is closed BEFORE assembling the message and publishing (T-224): Publish is
 	// network I/O to Redis (XADD with retries and pauses up to ~0.75 s on
@@ -200,16 +249,20 @@ func EnqueueBatch(ctx context.Context, pool db.DB, q queue.Queue, batch []Dispat
 	// all that time — with a slow Redis the scheduler hits the connection
 	// budget rather than the queue speed. The keys are fully read —
 	// the cursor is no longer needed (the VerifyCounters style, T-217).
+	// res is returned as is (with the committed Invalid/Diagnosed counts,
+	// T-309): the diagnosis of this batch is already committed, the read
+	// failure must not erase it from the outcome.
 	rows.Close()
 
-	res := EnqueueResult{Queued: len(translated), Skipped: len(batch) - len(translated)}
+	res.Queued = len(translated)
+	res.Skipped = len(valid) - len(translated)
 
 	// Publication: one q:dns message from the moved rows in the
 	// selection order (the zone interleaving of T-027 is preserved for the consumer). The key
 	// is deleted after use — a duplicate key in the batch is published
 	// once.
 	msg := queue.DNSBatch{Domains: make([]queue.DNSDomain, 0, res.Queued)}
-	for _, r := range batch {
+	for _, r := range valid {
 		k := enqueueKey{zone: r.ZoneID, id: r.DomainID}
 		if _, ok := translated[k]; !ok {
 			continue
@@ -224,7 +277,7 @@ func EnqueueBatch(ctx context.Context, pool db.DB, q queue.Queue, batch []Dispat
 	if len(msg.Domains) == 0 {
 		// All rows lost the race — nothing to publish; the next
 		// cycle will pick them up (at-least-once, spec 3.4).
-		return res, nil
+		return res, diagErr
 	}
 	if _, err := q.Publish(ctx, queue.StreamDNS, msg); err != nil {
 		// The move is committed and not rolled back (the file comment):
@@ -232,15 +285,17 @@ func EnqueueBatch(ctx context.Context, pool db.DB, q queue.Queue, batch []Dispat
 		return res, fmt.Errorf("scheduler: batch enqueue: publishing %d domains to q:dns: %w", len(msg.Domains), err)
 	}
 	res.Published = len(msg.Domains)
-	return res, nil
+	// The diagnosis error (if any) is returned after the valid part — the
+	// enqueue itself succeeded (the publication-failure style).
+	return res, diagErr
 }
 
-// enqueueValidate checks the batch rows before touching the DB: the q:dns publication
-// rejects invalid values (queue.DNSBatch.validate), while the move is
-// already committed by then — checking upfront does not put rows
-// into queued without a message. The conditions match the queue contract
-// (zone/domain > 0, the name is non-empty within the spec 5.2 limit).
-func enqueueValidate(batch []DispatchRow) error {
+// enqueueKeysValidate checks the batch keys before touching the DB: zone/domain
+// identifiers are the domains PK (spec 6.1) — a non-positive value is a
+// caller's bug (the dispatch selection reads them from the database), not DB
+// data: such a row cannot be terminally diagnosed (the keys address nothing),
+// the whole batch is rejected without spending a connection.
+func enqueueKeysValidate(batch []DispatchRow) error {
 	for i, r := range batch {
 		if r.ZoneID <= 0 {
 			return fmt.Errorf("scheduler: batch enqueue: domain #%d: zone_id %d ≤ 0", i+1, r.ZoneID)
@@ -248,14 +303,32 @@ func enqueueValidate(batch []DispatchRow) error {
 		if r.DomainID <= 0 {
 			return fmt.Errorf("scheduler: batch enqueue: domain #%d: domain_id %d ≤ 0", i+1, r.DomainID)
 		}
-		if r.Name == "" {
-			return fmt.Errorf("scheduler: batch enqueue: domain #%d: empty name", i+1)
-		}
-		if len(r.Name) > enqueueMaxNameLen {
-			return fmt.Errorf("scheduler: batch enqueue: domain #%d: name longer than %d octets", i+1, enqueueMaxNameLen)
-		}
 	}
 	return nil
+}
+
+// enqueueSplit divides the batch into valid rows (the move and publication
+// targets) and data-level invalid ones — an empty name or longer than
+// enqueueMaxNameLen octets (the queue contract queue.DNSBatch.validate would
+// reject the whole publication message for them, while the move is already
+// committed by then). The invalid ones are not moved and not published:
+// the over-long ones are terminally diagnosed (enqueueDiagnoseInvalid,
+// T-309) — otherwise the row stays pending at the head of the zone queue
+// and re-enters every next selection, forever spending a batch slot. The
+// empty-name branch is defensive for direct callers: the dispatcher cannot
+// produce it (label + '.' + zone always has the dot) and the DB diagnosis
+// has no empty counterpart — the empty-name poison row is diagnosed by the
+// DNS stage (R13, dnsworker); here it is only filtered out. The relative
+// order inside each part is preserved (the zone interleaving of T-027).
+func enqueueSplit(batch []DispatchRow) (valid, invalid []DispatchRow) {
+	for _, r := range batch {
+		if r.Name == "" || len(r.Name) > enqueueMaxNameLen {
+			invalid = append(invalid, r)
+			continue
+		}
+		valid = append(valid, r)
+	}
+	return valid, invalid
 }
 
 // Defaults of the enqueue loop.
@@ -296,6 +369,11 @@ type EnqueueOptions struct {
 	ZoneWeights map[int16]int
 	// Log — loop logger; nil — records suppressed (slog.DiscardHandler).
 	Log *slog.Logger
+	// Metrics — the service's Prometheus registry (T-309): the counter
+	// crawler_scheduler_enqueue_invalid_total of the terminal diagnosis of
+	// unenqueueable rows (enqueueinvalid.go); nil — without metrics
+	// (isolated assemblies/tests).
+	Metrics *metrics.Registry
 }
 
 func (o EnqueueOptions) withDefaults() EnqueueOptions {
@@ -340,6 +418,12 @@ func EnqueueLoop(ctx context.Context, pool db.DB, q queue.Queue, opts EnqueueOpt
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
+	// The counter of the terminal diagnosis of unenqueueable rows (T-309):
+	// grows by the rows diagnosed by the batches (by RETURNING) — including
+	// the error paths of a batch (a publication failure does not erase the
+	// committed diagnosis); encounters without a diagnosis (a statement
+	// failure, Diagnosed < Invalid) are visible in the Warn fields.
+	met := newEnqueueInvalidMetrics(o.Metrics)
 	log.Info("batch enqueue loop into q:dns",
 		"batch", o.BatchSize, "interval", o.Interval.String(), "idle_wait", o.IdleWait.String(),
 		"zone_weights", len(o.ZoneWeights))
@@ -375,6 +459,18 @@ func EnqueueLoop(ctx context.Context, pool db.DB, q queue.Queue, opts EnqueueOpt
 		}
 
 		res, err := EnqueueBatch(ctx, pool, q, batch)
+		if res.Invalid > 0 {
+			// The incident is observable (T-309): the poison rows of the
+			// batch got the terminal diagnosis (status = invalid,
+			// enqueueinvalid.go). Before the err branch — the committed
+			// diagnoses are counted and warned on the batch's error paths
+			// too (a publication failure does not erase them); in steady
+			// state this does not happen (ingest rejects such names), every
+			// event is a signal to the operator (runbooks.md §2.11).
+			met.add(res.Diagnosed)
+			log.Warn("enqueue loop: unenqueueable rows skipped and terminally diagnosed",
+				"invalid", res.Invalid, "diagnosed", res.Diagnosed)
+		}
 		if err != nil {
 			// Equivalent mutant (T-M05): without this return the loop
 			// ends on the next revolution — wait is interrupted by ctx.Done,

@@ -918,6 +918,55 @@ WHERE status = 0 AND check_state = 2
   AND last_checked_at < current_date;   -- the 24 h window at date precision
 ```
 
+### 2.11. Growth of `crawler_scheduler_enqueue_invalid_total` (unenqueueable rows: the name is over-long)
+
+**Sign.** The `crawler_scheduler_enqueue_invalid_total` counter
+(scheduler) is non-zero and growing; the scheduler journal shows the
+Warn "enqueue loop: unenqueueable rows skipped and terminally
+diagnosed".
+
+**What it is.** The enqueue cycle met a pending row whose full name
+(`label || '.' || zone`) is longer than 253 octets (spec 5.2 item 4) —
+q:dns publication is impossible for it (the queue contract).
+Before T-309 `enqueueValidate` rejected the WHOLE batch, and since the
+dispatcher selects the pending prefix of a zone by id, one such row at
+the head of a zone queue got into every batch and blocked the enqueue
+of the zone (and through the shared batch — of the others) forever,
+repeating the same refusal every `scheduler.idle_wait`. Now the row is
+filtered out of the move/publication and terminally diagnosed: status =
+invalid, check_state = done (the R16 transition of the check_state
+spec, `internal/scheduler/enqueueinvalid.go` — the R13 poison-row
+diagnosis of the DNS stage applied by the scheduler). The row leaves
+pending; the valid domains of the batch are enqueued regardless of it.
+
+**Cause.** The regular ingest rejects such names, so the sources are
+the same trust boundary as §2.9: manual SQL (e.g. an "import" of rows
+bypassing ingest), a corrupted row, a direct fixtures import
+(`crawlerctl fixtures import` writes the label as is).
+
+**Actions.** The pipeline heals itself; triage the SOURCE, otherwise
+new rows will keep arriving:
+
+```sql
+-- the diagnosed rows (status = invalid; the way out is manual triage —
+-- fix the name and recheck, or delete the row):
+SELECT zone_id, id, label, status FROM domains
+WHERE status = 7 AND check_state = 2;
+
+-- not yet diagnosed candidates (pending with an over-long full name):
+SELECT d.zone_id, d.id, d.label FROM domains AS d
+JOIN zones AS z ON z.id = d.zone_id
+WHERE d.check_state = 0 AND d.status <> 6
+  AND octet_length(d.label) + 1 + octet_length(z.name) > 253;
+```
+
+A one-off batch of such rows (a bad import) is normal: the counter
+spikes once and returns to a zero rate — the criterion is `rate(...) ≈
+0`, not the zero value. A row diagnosed by mistake is returned by
+`crawlerctl recheck <domain>` after fixing its label. A sustained
+growth rate — find the writer (the DB operations log around the first
+rise: who inserts/updates `domains.label` bypassing ingest).
+
 ## 3. Re-analysis of results under new rules
 
 Changing the Laravel rule set does not require re-downloading sites:
