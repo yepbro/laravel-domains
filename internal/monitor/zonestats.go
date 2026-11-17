@@ -43,6 +43,14 @@
 //     result-record increment touched a counters row after the pass
 //     snapshot — a regression against a non-existent defect.
 //
+// The pass is inter-process exclusive (T-314): a transaction advisory
+// lock is its FIRST statement — the background ZoneStatsLoop,
+// `crawlerctl counters recount` and the collapse reconciliation never
+// run two full domains scans at once (each is tens of seconds of the
+// postgres CPU, the slow-query window of T-199). A busy lock skips the
+// loop's tick (no queue) and makes an external caller wait out the
+// holder (DefaultZoneStatsLockWait) or fail with ErrZoneStatsBusy.
+//
 // The pass composition:
 //
 //   - zones: domains_total/domains_pending/domains_queued/
@@ -875,6 +883,126 @@ func hourlyStreamingPositions() []string {
 		hourlyRenderedPrevCounter, hourlyRenderedCurCounter, hourlyResultsPrevCounter, hourlyResultsCurCounter}
 }
 
+// ---------------------------------------------------------------- pass lock
+
+// The inter-process lock of the reconciliation pass (T-314, the hy4 bulk
+// review): the pass is one full scan of domains (tens of seconds on the
+// production corpus, the slow-query window of T-199: median 39 s, max
+// 501 s), and besides the background ZoneStatsLoop it is run by two
+// external callers — `crawlerctl counters recount` and the collapse
+// move (collapse.go) — with no mutual exclusion between the PROCESSES:
+// a coinciding external call doubled the load on the production DB and
+// built a queue of row locks. The exclusion is a PostgreSQL transaction
+// advisory lock — the first statement of the pass transaction, released
+// by its Commit/Rollback (the analyzer aggregate precedent, T-072; a
+// session lock would need a dedicated connection, the migrate pattern —
+// overkill for a per-pass guard). The two-argument key form
+// (hashtext('zonestats_pass'), 1) — the migration 000003 style: the
+// 64-bit keys of the two-int form do not intersect the one-int keys of
+// the analyzer (domain_id) and the migration runner ("craw"). Everyone
+// takes ONE key: the zone-filtered recount runs the same full domains
+// aggregate (there is no zone filter in domainsAggSQL — the global
+// counters are always recomputed), so the filter does not narrow the
+// scan and must not weaken the lock. The wait runs INSIDE the pass
+// transaction (xact locks cannot outlive it): PostgreSQL pins now() to
+// the transaction START, so an external caller that waited out a holder
+// evaluates the pass windows with a now() older by the wait — the names
+// and the FILTER windows stay consistent with each other (one pinned
+// clock for the whole pass, the T-315 property holds), only the covered
+// moment shifts back by the wait (≤ DefaultZoneStatsLockWait).
+const zoneStatsTryLockSQL = "SELECT pg_try_advisory_xact_lock(hashtext('zonestats_pass'), 1)"
+
+// DefaultZoneStatsLockWait — the lock wait budget of an external
+// (human-initiated) pass: 10 minutes covers the worst observed pass
+// (501 s, T-199) with a margin; on expiry the caller gets
+// ErrZoneStatsBusy — an honest failure with a diagnostics instead of an
+// endless hang; the monitor loop reconciles the counters anyway within
+// monitor.zone_stats_interval, so the timeout does not leave a gap.
+const DefaultZoneStatsLockWait = 10 * time.Minute
+
+// ZoneStatsLockTryOnly — the LockWait value of the background loop: one
+// lock attempt without waiting (a busy lock skips the tick, no queue is
+// built — the loop repeats by its interval).
+const ZoneStatsLockTryOnly = -1 * time.Second
+
+// ErrZoneStatsBusy — the pass lock is held by another process (for the
+// whole LockWait budget, or at once with ZoneStatsLockTryOnly). The
+// pass was NOT run: nothing is written, the transaction is rolled back.
+// The background loop skips the tick; an external caller fails with
+// this error and may retry — the counters converge at the next
+// background pass regardless.
+var ErrZoneStatsBusy = errors.New("monitor: counter reconciliation: the pass lock is held by another reconciliation (crawlerctl counters recount, the collapse move or the monitor loop)")
+
+// zoneStatsLockPollInterval — the pause between the lock attempts while
+// waiting out a concurrent pass (LockWait): a try-lock poll instead of a
+// blocking pg_advisory_xact_lock — the wait stays interruptible by the
+// ctx between the attempts and tells "busy" (false) apart from a
+// failure; a variable for the tests (the migrate lockTimeout style).
+var zoneStatsLockPollInterval = 500 * time.Millisecond
+
+// acquireZoneStatsLock — taking the inter-process pass lock in the pass
+// transaction (the first statement — before any row lock of the pass;
+// released by the Commit/Rollback). wait > 0 — poll until the budget
+// expires, then ErrZoneStatsBusy; wait ≤ 0 — a single attempt (the
+// loop's tick). A ctx cancellation during the wait — the ctx error (the
+// shutdown path, not the busy skip).
+func acquireZoneStatsLock(ctx context.Context, tx pgx.Tx, wait time.Duration) error {
+	var deadline time.Time
+	if wait > 0 {
+		deadline = time.Now().Add(wait)
+	}
+	for {
+		ok, err := tryZoneStatsLock(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if ok {
+			return nil
+		}
+		if wait <= 0 {
+			return ErrZoneStatsBusy
+		}
+		pause := zoneStatsLockPollInterval
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return ErrZoneStatsBusy
+		}
+		if pause > remaining {
+			pause = remaining
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("monitor: counter reconciliation: the pass lock wait: %w", ctx.Err())
+		case <-time.After(pause):
+		}
+	}
+}
+
+// tryZoneStatsLock — one lock attempt: the bool of
+// pg_try_advisory_xact_lock (false — held by another process; the query
+// protocol of the pass, not Exec — the fake pool style of the tests).
+func tryZoneStatsLock(ctx context.Context, tx pgx.Tx) (bool, error) {
+	rows, err := tx.Query(ctx, zoneStatsTryLockSQL)
+	if err != nil {
+		return false, fmt.Errorf("monitor: counter reconciliation: the pass lock: %w", err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return false, fmt.Errorf("monitor: counter reconciliation: the pass lock: %w", err)
+		}
+		return false, errors.New("monitor: counter reconciliation: the pass lock: an empty response")
+	}
+	var ok bool
+	if err := rows.Scan(&ok); err != nil {
+		return false, fmt.Errorf("monitor: counter reconciliation: the pass lock: scan: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("monitor: counter reconciliation: the pass lock: %w", err)
+	}
+	return ok, nil
+}
+
 // ---------------------------------------------------------------- pass
 
 // ZoneStatsDB — the pool for the pass: a db.DB with transactions (the
@@ -906,6 +1034,17 @@ type ZoneStatsOptions struct {
 	// counters are always recomputed. nil — all zones; it does not affect
 	// the ZoneStatsLoop loop (the periodic pass is always full).
 	Zone *int16
+	// LockWait is the budget for waiting out a concurrent holder of the
+	// inter-process pass lock (T-314): the background ZoneStatsLoop pass,
+	// `crawlerctl counters recount` and the collapse reconciliation are
+	// one full domains pass each — the lock serializes them across the
+	// processes. 0 — DefaultZoneStatsLockWait (the external callers'
+	// default: a human waits out the monitor's pass); < 0 — a single
+	// attempt, a busy lock fails at once with ErrZoneStatsBusy; > 0 —
+	// the explicit budget, on expiry — ErrZoneStatsBusy. ZoneStatsLoop
+	// ignores the value: its tick is single-attempt by construction
+	// (a busy lock skips the pass, the next tick reconciles — no queue).
+	LockWait time.Duration
 	// Log is the logger of the ZoneStatsLoop loop; nil — records
 	// suppressed (slog.DiscardHandler). ZoneStatsOnce does not log — the
 	// result is returned as ZoneStatsResult.
@@ -917,6 +1056,9 @@ type ZoneStatsOptions struct {
 func (o ZoneStatsOptions) withDefaults() ZoneStatsOptions {
 	if o.Interval <= 0 {
 		o.Interval = DefaultZoneStatsInterval
+	}
+	if o.LockWait == 0 {
+		o.LockWait = DefaultZoneStatsLockWait
 	}
 	return o
 }
@@ -1009,6 +1151,15 @@ func ZoneStatsOnce(ctx context.Context, pool ZoneStatsDB, opts ZoneStatsOptions)
 	}
 	// An unconditional rollback: after Commit it is a no-op (the T-044 style).
 	defer func() { _ = tx.Rollback(ctx) }()
+
+	// The inter-process lock (T-314) — the first statement of the
+	// transaction, before any row lock of the pass: while it is held,
+	// neither the background loop nor an external recount/collapse runs
+	// a second full domains pass concurrently; released by the
+	// Commit/Rollback of this transaction.
+	if err := acquireZoneStatsLock(ctx, tx, o.LockWait); err != nil {
+		return ZoneStatsResult{}, err
+	}
 
 	oldZones, err := readZonePositions(ctx, tx, o.Zone)
 	if err != nil {
@@ -1703,7 +1854,11 @@ func readCounterValues(ctx context.Context, tx pgx.Tx, names []string) (map[stri
 // finished; a pass longer than the interval (table growth, measurement
 // §12) resets the accumulated ticker tick (otherwise a new pass would
 // start right behind the slow one — a continuous aggregate), a Warn and
-// the crawler_zonestats_skipped_ticks_total counter raise the noise. reg
+// the crawler_zonestats_skipped_ticks_total counter raise the noise.
+// The inter-process single-flight (T-314): the pass lock is taken with
+// a single attempt — a lock held by an external recount/collapse skips
+// the tick (a Warn + the crawler_zonestats_busy_skipped_total counter,
+// no queue), the next tick reconciles. reg
 // is the service metric registry (the pass and drift metrics; nil — the
 // loop without metrics,
 // the recount lives: the loop's purpose is reconciliation, not
@@ -1717,6 +1872,11 @@ func ZoneStatsLoop(ctx context.Context, pool db.DB, reg *metrics.Registry, opts 
 		return errors.New("monitor: counter reconciliation: the pool has no transactions (ZoneStatsDB)")
 	}
 	o := opts.withDefaults()
+	// The tick is single-attempt (T-314): a busy pass lock (an external
+	// recount or the collapse move) skips the tick — the loop does not
+	// queue behind the human commands, the next tick reconciles by
+	// itself.
+	o.LockWait = ZoneStatsLockTryOnly
 	log := o.Log
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
@@ -1743,6 +1903,12 @@ func ZoneStatsLoop(ctx context.Context, pool db.DB, reg *metrics.Registry, opts 
 		// mutator-disable-next-line branch/case
 		case err != nil && ctx.Err() != nil:
 			// A cancellation during the pass — part of the shutdown, not an alarm.
+		case err != nil && errors.Is(err, ErrZoneStatsBusy):
+			// The lock is held by an external pass (T-314): it performs
+			// the same reconciliation right now, so the skipped tick is
+			// not a gap; no queue behind the holder.
+			log.Warn("counter reconciliation pass skipped: the lock is held by another pass (crawlerctl counters recount / the collapse move) — the next tick will reconcile")
+			m.skipBusy()
 		case err != nil:
 			log.Warn("counter reconciliation pass", "err", err)
 		default:
@@ -1850,7 +2016,11 @@ func reportDrift(log *slog.Logger, m *zoneStatsLoopMetrics, res ZoneStatsResult,
 type zoneStatsLoopMetrics struct {
 	seconds prometheus.ObserverVec
 	skipped *prometheus.CounterVec
-	drift   *prometheus.GaugeVec
+	// busySkipped — ticks skipped on a busy inter-process pass lock
+	// (T-314): an external pass holds it and performs the same
+	// reconciliation.
+	busySkipped *prometheus.CounterVec
+	drift       *prometheus.GaugeVec
 	// newDoneStale — the value of the pass's new_done_stale row (a level,
 	// not drift): it is set by every successful pass, including the first
 	// filling one (unlike the drift — the zero norm and there is nothing
@@ -1879,6 +2049,10 @@ func newZoneStatsLoopMetrics(reg *metrics.Registry) *zoneStatsLoopMetrics {
 			Name: "crawler_zonestats_skipped_ticks_total",
 			Help: "Skipped ticks of the reconciliation loop: the pass ran longer than the interval, the accumulated tick does not start a new pass (single-flight, T-161).",
 		}),
+		busySkipped: reg.MustCounter(prometheus.CounterOpts{
+			Name: "crawler_zonestats_busy_skipped_total",
+			Help: "Reconciliation ticks skipped because the inter-process pass lock was held by another process (crawlerctl counters recount or the collapse move, T-314): that pass performs the same reconciliation, the next tick (monitor.zone_stats_interval) runs as usual — no queue is built.",
+		}),
 		drift: reg.MustGauge(prometheus.GaugeOpts{
 			Name: "crawler_counters_drift",
 			Help: "Incremental counter drift on the reconciliation pass: |old − new| per position (zone:<id>:column, global:<name>; daily:checks and daily:temp_error — the daily checks tempo and its temp_error numerator, T-179/T-182). Steady state — 0, a sustained non-zero drift — a missed transition or manual SQL bypassing the code (triage — docs/runbooks.md, T-178); exceptions — the streaming positions (they count events against the live domains/rows, non-zero under live load — an observable quantity, not in the Warn): the daily daily:* (T-179/T-182), the retry maturity baskets retry_mature:past/retry_mature:today (T-202), the hourly tempo baskets rendered:prev/rendered:cur/results:prev/results:cur (T-203 — prev/cur: the previous and the current calendar hour) and the re-analysis tails reanalyze:prev/reanalyze:cur (T-204).",
@@ -1904,6 +2078,15 @@ func (m *zoneStatsLoopMetrics) skip() {
 		return
 	}
 	m.skipped.WithLabelValues().Inc()
+}
+
+// skipBusy — a tick skipped on a busy inter-process pass lock (T-314);
+// nil — a no-op.
+func (m *zoneStatsLoopMetrics) skipBusy() {
+	if m == nil {
+		return
+	}
+	m.busySkipped.WithLabelValues().Inc()
 }
 
 // setNewDoneStale — sets the "status hung" domains gauge to the value of

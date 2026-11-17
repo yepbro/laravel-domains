@@ -207,17 +207,17 @@ func TestZoneStatsSumsMultipleZones(t *testing.T) {
 	}
 	calls := pool.calls()
 	// The daily rows: checks 3+30, temp 1+10.
-	if got := calls[18].args[0].(int64); got != 33 {
+	if got := calls[19].args[0].(int64); got != 33 {
 		t.Errorf("checks:SUM = %d, want 33 (3+30)", got)
 	}
-	if got := calls[19].args[0].(int64); got != 11 {
+	if got := calls[20].args[0].(int64); got != 11 {
 		t.Errorf("temp_error:SUM = %d, want 11 (1+10)", got)
 	}
 	// The retry baskets: the mature one 4+40, today's 2+20.
-	if got := calls[21].args[0].(int64); got != 44 {
+	if got := calls[22].args[0].(int64); got != 44 {
 		t.Errorf("the mature basket = %d, want 44", got)
 	}
-	if got := calls[22].args[0].(int64); got != 22 {
+	if got := calls[23].args[0].(int64); got != 22 {
 		t.Errorf("today's basket = %d, want 22", got)
 	}
 	// The "status hung" — also a sum over zones.
@@ -344,7 +344,7 @@ func TestZoneStatsLoopNoDriftNoWarn(t *testing.T) {
 	go func() {
 		done <- ZoneStatsLoop(ctx, pool, reg, ZoneStatsOptions{Interval: 2 * time.Millisecond, Log: logger})
 	}()
-	waitCond(t, 2*time.Second, func() bool { return pool.stats() >= 64 }, "two passes")
+	waitCond(t, 2*time.Second, func() bool { return pool.stats() >= 66 }, "two passes")
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatalf("ZoneStatsLoop: %v", err)

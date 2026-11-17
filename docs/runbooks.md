@@ -1780,7 +1780,12 @@ the `daily:checks` position, not included in the Warn).
    monitor's: it overwrites the counters with aggregates; prints
    "before → after" for the drifting positions). `--zone NAME` limits
    the column overwrite to one zone — the global counters are always
-   recomputed.
+   recomputed. The recount is serialized with the monitor's pass by the
+   inter-process advisory lock (T-314): if the monitor's pass is
+   running, the command waits it out (up to 10 minutes); on expiry it
+   fails with "the pass lock is held by another reconciliation" —
+   retry, or leave the convergence to the monitor loop (it reconciles
+   every `zone_stats_interval` regardless).
 3. **Re-verify** — `crawlerctl counters verify` must return code 0; a
    repeated non-zero drift of the same positions is a systematic cause
    (see below), not a one-off failure.
@@ -1895,7 +1900,10 @@ messages carry a stale `zone_id`.
 
    The command prints the move per zone and the counter reconciliation
    result; `--skip-reconcile` leaves the recomputation to the monitor's
-   first pass. An interrupted run (Ctrl-C, a failure) is resumed by
+   first pass. The reconciliation step takes the inter-process pass lock
+   (T-314) and waits out a concurrent pass (up to 10 minutes) — with the
+   stack fully down (step 6) the lock is free. An interrupted run
+   (Ctrl-C, a failure) is resumed by
    repeating the command — completed batches stay in place.
 8. **Post-checks** — the command runs them itself (no 2LD zones left
    outside the allowlist; no orphan `zone_id`s in the domain tables;

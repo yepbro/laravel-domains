@@ -355,6 +355,7 @@ monitor section (the reconciliation is combined, §7).
 | `crawler_counters_drift{counter}` | gauge | \|old − new\| on the reconciliation pass; the counter label — the counter name (`zone:<id>:pending`, `global:status_alive`, …); steady state — 0 |
 | `crawler_counters_recount_seconds` | histogram | the duration of the combined pass (a renaming of `crawler_zonestats_pass_seconds`, the buckets unchanged) |
 | `crawler_zonestats_skipped_ticks_total` | counter | unchanged (T-161) |
+| `crawler_zonestats_busy_skipped_total` | counter | ticks skipped on the inter-process pass lock (T-314): an external `crawlerctl counters recount`/collapse pass holds the advisory key and performs the same reconciliation; no queue, the next tick runs as usual |
 | `crawler_backlog_domains`, `crawler_laravel_appeared_total`, `crawler_laravel_lost_total`, `crawler_laravel_near_findings` | gauge | names/semantics unchanged — the source is now the counters (§8) |
 
 The drift alert: a Warn to the monitor log on a non-zero drift (after the startup

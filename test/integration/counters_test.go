@@ -1423,3 +1423,69 @@ func TestCounters_ReanalyzeTailBaskets(t *testing.T) {
 	}
 	countersVerifyEmpty(t, pool, "after the tails buckets scenario (the buckets outside verify)")
 }
+
+// TestCounters_RecountPassLock — the inter-process pass lock (T-314):
+// while a foreign transaction holds the advisory key, a try-only pass
+// (the monitor loop's mode) refuses to start — ErrZoneStatsBusy without
+// a single write; after the holder's commit the same pass runs
+// normally. The key here is the one zoneStatsTryLockSQL is built on
+// (internal/monitor pins the text — TestZoneStatsOnceLockContract): a
+// change of the key must be mirrored in both places.
+func TestCounters_RecountPassLock(t *testing.T) {
+	skipUnlessIntegration(t)
+	pool := countersSchema(t)
+	ctx := context.Background()
+
+	countersSeedZone(t, pool, "lock.test")
+
+	// A foreign holder of the pass key (the collapse/recount shape: the
+	// xact lock lives until its commit). The advisory key is DATABASE-wide:
+	// the isolated schemas of the integration tests (search_path) do not
+	// separate it, so a parallel package's pass (cmd/crawlerctl
+	// recheck_integration_test.go) would see this holder too — the holder
+	// must stay short-lived (milliseconds here).
+	hold, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("the holder transaction: %v", err)
+	}
+	defer func() { _ = hold.Rollback(ctx) }()
+	if _, err := hold.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext('zonestats_pass'), 1)"); err != nil {
+		t.Fatalf("holding the pass lock: %v", err)
+	}
+
+	// The loop's mode (a single attempt): the pass did not run, nothing
+	// was written. The baseline is taken AFTER the migrations: 000015
+	// backfills the render_pending row (an aggregate without GROUP BY
+	// inserts it even on an empty schema), so the table is not empty
+	// before the pass — the refused pass must not change it.
+	var before int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM crawler_counters").Scan(&before); err != nil {
+		t.Fatalf("counting the counters before the pass: %v", err)
+	}
+	if _, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{LockWait: monitor.ZoneStatsLockTryOnly}); !errors.Is(err, monitor.ErrZoneStatsBusy) {
+		t.Fatalf("a try-only pass under the holder: err = %v, want ErrZoneStatsBusy", err)
+	}
+	var rows int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM crawler_counters").Scan(&rows); err != nil {
+		t.Fatalf("counting the counters: %v", err)
+	}
+	if rows != before {
+		t.Fatalf("the refused pass changed the counter rows: %d → %d, want unchanged", before, rows)
+	}
+
+	// The holder released — the same pass runs and fills the counters
+	// (the legend, the daily rows and the live baskets are its writes).
+	if err := hold.Commit(ctx); err != nil {
+		t.Fatalf("the holder commit: %v", err)
+	}
+	res, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{})
+	if err != nil {
+		t.Fatalf("the pass after the release: %v", err)
+	}
+	if res.Zones != 1 {
+		t.Fatalf("the pass after the release: %d zones, want 1", res.Zones)
+	}
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM crawler_counters").Scan(&rows); err != nil || rows <= before {
+		t.Fatalf("the pass after the release did not fill the counters (rows=%d before=%d err=%v)", rows, before, err)
+	}
+}

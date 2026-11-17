@@ -5,6 +5,8 @@
 // of the pass statements (reading old values → aggregates → overwriting
 // zones with an unnest batch → the counter upsert), the drift (old/new by
 // positions), the step errors and the ctx cancellation, the
+// inter-process pass lock (T-314: a busy lock — ErrZoneStatsBusy for an
+// external caller, a skipped tick for the loop), the
 // ZoneStatsLoop loop (an immediate
 // first pass without drift noise, a Warn+gauge on drift, single-flight
 // T-161, a clean exit), the VerifyCounters cross-check. The behavior
@@ -120,11 +122,18 @@ type zonestatsFakePool struct {
 	commitErr error
 	beginErr  error
 	delay     time.Duration
+	// lockAnswers — the answers of the pass-lock attempts (T-314), one
+	// per query of zoneStatsTryLockSQL in order; nil/exhausted — the
+	// lock is acquired (the default world of the ordinary pass tests).
+	lockAnswers []bool
+	// lockErr — the error of every lock attempt (the failure path).
+	lockErr error
 
 	queries   []zonestatsCall
 	begins    int
 	commits   int
 	rollbacks int
+	locks     int
 }
 
 func (p *zonestatsFakePool) CopyFrom(context.Context, pgx.Identifier, []string, pgx.CopyFromSource) (int64, error) {
@@ -142,6 +151,22 @@ func (p *zonestatsFakePool) Query(_ context.Context, sql string, args ...any) (p
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.queries = append(p.queries, zonestatsCall{sql: sql, args: args})
+	// The pass lock (T-314) is answered outside the steps queue: it is
+	// not a pass statement — the step indexes of the tests keep
+	// numbering the pass itself; the call is still recorded (the lock is
+	// the first statement of the transaction, TestZoneStatsOnceSQL).
+	if sql == zoneStatsTryLockSQL {
+		p.locks++
+		if p.lockErr != nil {
+			return nil, p.lockErr
+		}
+		ok := true
+		if len(p.lockAnswers) > 0 {
+			ok = p.lockAnswers[0]
+			p.lockAnswers = p.lockAnswers[1:]
+		}
+		return zonestatsRows([]any{ok}), nil
+	}
 	if len(p.steps) == 0 {
 		return zonestatsRows(), nil
 	}
@@ -185,6 +210,13 @@ func (p *zonestatsFakePool) txCounts() (begins, commits, rollbacks int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.begins, p.commits, p.rollbacks
+}
+
+// lockTries — the number of the pass-lock attempts (T-314).
+func (p *zonestatsFakePool) lockTries() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.locks
 }
 
 func (p *zonestatsFakePool) delaySnapshot() time.Duration {
@@ -357,7 +389,8 @@ func zonestatsFixedClock() (time.Time, func() time.Time) {
 // --- ZoneStatsOnce ---------------------------------------------------------
 
 // TestZoneStatsOnceSQL — the sequence of the pass statements in one
-// transaction with the exact texts: reading the old zones, the counters,
+// transaction with the exact texts: the inter-process lock (T-314,
+// first), reading the old zones, the counters,
 // both daily rows, both maturity baskets, the four hourly tempo baskets
 // and
 // the two reanalysis tail baskets → the aggregate (the only domains
@@ -428,10 +461,11 @@ func TestZoneStatsOnceSQL(t *testing.T) {
 	}
 
 	calls := pool.calls()
-	if len(calls) != 32 {
-		t.Fatalf("queries = %d, want 32 (reads ×12, aggregates ×4, the zone overwrite, the counters upsert, daily ×2, retry baskets ×3, tails ×3, hourly ×6)", len(calls))
+	if len(calls) != 33 {
+		t.Fatalf("queries = %d, want 33 (the pass lock, reads ×12, aggregates ×4, the zone overwrite, the counters upsert, daily ×2, retry baskets ×3, tails ×3, hourly ×6)", len(calls))
 	}
 	wantSQL := []string{
+		zoneStatsTryLockSQL,
 		readZonesSQL, readCountersSQL, readDailyChecksSQL, readDailyTempSQL, readRetryPastSQL, readRetryTodaySQL,
 		readHourlyRenderedPrevSQL, readHourlyRenderedCurSQL, readHourlyResultsPrevSQL, readHourlyResultsCurSQL,
 		readHourlyReanalyzePrevSQL, readHourlyReanalyzeCurSQL,
@@ -448,28 +482,28 @@ func TestZoneStatsOnceSQL(t *testing.T) {
 		}
 	}
 	// The counter legend is complete, in a deterministic order.
-	if !reflect.DeepEqual(calls[1].args, []any{CounterNames()}) {
-		t.Errorf("the counter read args = %v, want %v", calls[1].args, CounterNames())
+	if !reflect.DeepEqual(calls[2].args, []any{CounterNames()}) {
+		t.Errorf("the counter read args = %v, want %v", calls[2].args, CounterNames())
 	}
 	// The zone overwrite: the unnest batch — all the parameters in the SQL
 	// order:
 	// $1 ids, $2 total, $3 pending, $4 queued, $5 checked, $6 the moment,
-	// $7 laravel — from the laravel aggregate (step 13), not from the zone
+	// $7 laravel — from the laravel aggregate (step 14), not from the zone
 	// RETURNING
 	// (a mixed-up columns test must catch it, review R2).
 	wantZone := []any{[]int16{7}, []int64{10}, []int64{4}, []int64{2}, []int64{3}, now, []int64{1}}
-	if !reflect.DeepEqual(calls[16].args, wantZone) {
-		t.Errorf("the zone unnest batch = %#v\nwant %#v", calls[16].args, wantZone)
+	if !reflect.DeepEqual(calls[17].args, wantZone) {
+		t.Errorf("the zone unnest batch = %#v\nwant %#v", calls[17].args, wantZone)
 	}
 	// The upsert: the full legend names + the values + the moment.
-	if got := calls[17].args[0]; !reflect.DeepEqual(got, CounterNames()) {
+	if got := calls[18].args[0]; !reflect.DeepEqual(got, CounterNames()) {
 		t.Errorf("upsert names = %v, want the CounterNames legend", got)
 	}
-	if calls[17].args[2] != any(now) {
-		t.Errorf("updated_at upsert = %#v, want %v", calls[17].args[2], now)
+	if calls[18].args[2] != any(now) {
+		t.Errorf("updated_at upsert = %#v, want %v", calls[18].args[2], now)
 	}
 	// The upsert values match the aggregate: the legend in order.
-	wantVals := calls[17].args[1].([]int64)
+	wantVals := calls[18].args[1].([]int64)
 	if wantVals[len(statusAggCols)] != 2 { // render_pending after the statuses
 		t.Errorf("render_pending in the upsert = %d, want 2", wantVals[len(statusAggCols)])
 	}
@@ -484,11 +518,11 @@ func TestZoneStatsOnceSQL(t *testing.T) {
 	// names are computed by the DB — current_date in the statement
 	// texts, no name parameter; the write order
 	// "checks: → temp_error:" is shared with the record.go increments.
-	if !reflect.DeepEqual(calls[18].args, []any{int64(8), any(now)}) {
-		t.Errorf("the checks row upsert args = %#v, want the value 8 + the moment", calls[18].args)
+	if !reflect.DeepEqual(calls[19].args, []any{int64(8), any(now)}) {
+		t.Errorf("the checks row upsert args = %#v, want the value 8 + the moment", calls[19].args)
 	}
-	if !reflect.DeepEqual(calls[19].args, []any{int64(1), any(now)}) {
-		t.Errorf("the temp row upsert args = %#v, want the value 1 + the moment", calls[19].args)
+	if !reflect.DeepEqual(calls[20].args, []any{int64(1), any(now)}) {
+		t.Errorf("the temp row upsert args = %#v, want the value 1 + the moment", calls[20].args)
 	}
 	if !strings.Contains(recountDailyChecksSQL, "'checks:' || to_char(current_date, 'YYYY-MM-DD')") {
 		t.Errorf("recountDailyChecksSQL without the day name from the DB:\n%s", recountDailyChecksSQL)
@@ -501,14 +535,14 @@ func TestZoneStatsOnceSQL(t *testing.T) {
 	// moment; the basket names are
 	// current_date − 1 / current_date in the statement texts; the order
 	// "cleanup → mature → today's" is shared with the delta writers.
-	if len(calls[20].args) != 0 {
-		t.Errorf("the basket cleanup args = %#v, want no parameters", calls[20].args)
+	if len(calls[21].args) != 0 {
+		t.Errorf("the basket cleanup args = %#v, want no parameters", calls[21].args)
 	}
-	if !reflect.DeepEqual(calls[21].args, []any{int64(2), any(now)}) {
-		t.Errorf("the mature basket upsert args = %#v, want the value 2 + the moment", calls[21].args)
+	if !reflect.DeepEqual(calls[22].args, []any{int64(2), any(now)}) {
+		t.Errorf("the mature basket upsert args = %#v, want the value 2 + the moment", calls[22].args)
 	}
-	if !reflect.DeepEqual(calls[22].args, []any{int64(3), any(now)}) {
-		t.Errorf("today's basket upsert args = %#v, want the value 3 + the moment", calls[22].args)
+	if !reflect.DeepEqual(calls[23].args, []any{int64(3), any(now)}) {
+		t.Errorf("today's basket upsert args = %#v, want the value 3 + the moment", calls[23].args)
 	}
 	if !strings.Contains(recountRetryPastSQL, "'retry_mature:' || to_char(current_date - 1, 'YYYY-MM-DD')") {
 		t.Errorf("recountRetryPastSQL without the basket name from the DB:\n%s", recountRetryPastSQL)
@@ -525,14 +559,14 @@ func TestZoneStatsOnceSQL(t *testing.T) {
 	// "cleanup → prev → cur" between the retry baskets and the rendered
 	// tempo ones —
 	// shared with the writers (record.go/renderworker/analyzer).
-	if len(calls[23].args) != 0 {
-		t.Errorf("the tail basket cleanup args = %#v, want no parameters", calls[23].args)
+	if len(calls[24].args) != 0 {
+		t.Errorf("the tail basket cleanup args = %#v, want no parameters", calls[24].args)
 	}
-	if !reflect.DeepEqual(calls[24].args, []any{int64(2), any(now)}) {
-		t.Errorf("the tail prev upsert args = %#v, want the value 2 + the moment", calls[24].args)
+	if !reflect.DeepEqual(calls[25].args, []any{int64(2), any(now)}) {
+		t.Errorf("the tail prev upsert args = %#v, want the value 2 + the moment", calls[25].args)
 	}
-	if !reflect.DeepEqual(calls[25].args, []any{int64(1), any(now)}) {
-		t.Errorf("the tail cur upsert args = %#v, want the value 1 + the moment", calls[25].args)
+	if !reflect.DeepEqual(calls[26].args, []any{int64(1), any(now)}) {
+		t.Errorf("the tail cur upsert args = %#v, want the value 1 + the moment", calls[26].args)
 	}
 	for _, s := range []struct {
 		sql  string
@@ -557,22 +591,22 @@ func TestZoneStatsOnceSQL(t *testing.T) {
 	// "rendered: (cleanup → prev → cur) → results: (the same)" — shared
 	// with
 	// the writers (record.go: results: last; renderworker: rendered:).
-	for _, i := range []int{26, 29} {
+	for _, i := range []int{27, 30} {
 		if len(calls[i].args) != 0 {
 			t.Errorf("the hourly basket cleanup args (step %d) = %#v, want no parameters", i, calls[i].args)
 		}
 	}
-	if !reflect.DeepEqual(calls[27].args, []any{int64(4), any(now)}) {
-		t.Errorf("the rendered prev upsert args = %#v, want the value 4 + the moment", calls[27].args)
+	if !reflect.DeepEqual(calls[28].args, []any{int64(4), any(now)}) {
+		t.Errorf("the rendered prev upsert args = %#v, want the value 4 + the moment", calls[28].args)
 	}
-	if !reflect.DeepEqual(calls[28].args, []any{int64(2), any(now)}) {
-		t.Errorf("the rendered cur upsert args = %#v, want the value 2 + the moment", calls[28].args)
+	if !reflect.DeepEqual(calls[29].args, []any{int64(2), any(now)}) {
+		t.Errorf("the rendered cur upsert args = %#v, want the value 2 + the moment", calls[29].args)
 	}
-	if !reflect.DeepEqual(calls[30].args, []any{int64(9), any(now)}) {
-		t.Errorf("the results prev upsert args = %#v, want the value 9 + the moment", calls[30].args)
+	if !reflect.DeepEqual(calls[31].args, []any{int64(9), any(now)}) {
+		t.Errorf("the results prev upsert args = %#v, want the value 9 + the moment", calls[31].args)
 	}
-	if !reflect.DeepEqual(calls[31].args, []any{int64(5), any(now)}) {
-		t.Errorf("the results cur upsert args = %#v, want the value 5 + the moment", calls[31].args)
+	if !reflect.DeepEqual(calls[32].args, []any{int64(5), any(now)}) {
+		t.Errorf("the results cur upsert args = %#v, want the value 5 + the moment", calls[32].args)
 	}
 	for _, s := range []struct {
 		sql  string
@@ -780,7 +814,7 @@ func TestZoneStatsOnceNewDoneStale(t *testing.T) {
 	// render_pending,
 	// the cumulatives).
 	calls := pool.calls()
-	vals := calls[17].args[1].([]int64)
+	vals := calls[18].args[1].([]int64)
 	if got := vals[len(statusAggCols)+3]; got != 7 {
 		t.Errorf("new_done_stale in the upsert = %d, want 7", got)
 	}
@@ -893,11 +927,11 @@ func TestZoneStatsOnceZoneFilter(t *testing.T) {
 		t.Fatalf("ZoneStatsOnce: %v", err)
 	}
 	calls := pool.calls()
-	if got, ok := calls[0].args[0].(*int16); !ok || got == nil || *got != zone {
-		t.Errorf("the old-zone read zone filter = %#v, want *int16(7)", calls[0].args[0])
+	if got, ok := calls[1].args[0].(*int16); !ok || got == nil || *got != zone {
+		t.Errorf("the old-zone read zone filter = %#v, want *int16(7)", calls[1].args[0])
 	}
-	if got := calls[16].args[0]; !reflect.DeepEqual(got, []int16{7}) {
-		t.Errorf("the overwrite zone unnest = %#v, want [7] (the zone overwrite — step 16)", got)
+	if got := calls[17].args[0]; !reflect.DeepEqual(got, []int16{7}) {
+		t.Errorf("the overwrite zone unnest = %#v, want [7] (the zone overwrite — step 17)", got)
 	}
 }
 
@@ -910,7 +944,7 @@ func TestZoneStatsOnceEmpty(t *testing.T) {
 	// aggregates ×4,
 	// the counter upsert, the dailies ×2, the retry baskets ×3, the tails
 	// ×3,
-	// the hourly ×6.
+	// the hourly ×6; plus the pass lock (T-314).
 	pool := &zonestatsFakePool{steps: []zonestatsStep{
 		{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
 		{rows: zonestatsRows()}, {rows: zonestatsRows()},
@@ -940,8 +974,8 @@ func TestZoneStatsOnceEmpty(t *testing.T) {
 	if res.Zones != 0 {
 		t.Errorf("Zones = %d, want 0", res.Zones)
 	}
-	if n := pool.stats(); n != 31 {
-		t.Errorf("queries = %d, want 31 (the zone overwrite skipped)", n)
+	if n := pool.stats(); n != 32 {
+		t.Errorf("queries = %d, want 32 (the pass lock + the zone overwrite skipped)", n)
 	}
 	wantPositions := len(driftCounterNames()) + len(dailyStreamingPositions()) + len(retryMatureStreamingPositions()) + len(hourlyStreamingPositions())
 	if len(res.Positions) != wantPositions {
@@ -1009,6 +1043,167 @@ func TestZoneStatsOnceNilPool(t *testing.T) {
 	}
 }
 
+// --- the inter-process pass lock (T-314) -------------------------------------
+
+// zonestatsSetLockPoll — replacing the lock poll pause for the test
+// (restored by the returned function).
+func zonestatsSetLockPoll(t *testing.T, d time.Duration) func() {
+	t.Helper()
+	old := zoneStatsLockPollInterval
+	zoneStatsLockPollInterval = d
+	return func() { zoneStatsLockPollInterval = old }
+}
+
+// TestZoneStatsOnceLockContract — the lock statement is the TRANSACTION
+// try-form on a fixed two-int key: the xact form is released by the
+// pass Commit/Rollback (no dedicated connection, unlike the migrate
+// session lock), the try form polls without blocking between the
+// attempts, the two-int key (the migration 000003 style) is outside the
+// one-int key space of the analyzer (domain_id) and the migration
+// runner ("craw"). The integration test
+// (test/integration/counters_test.go) holds the same key via
+// pg_advisory_xact_lock — a change of the key here must be mirrored
+// there.
+func TestZoneStatsOnceLockContract(t *testing.T) {
+	if zoneStatsTryLockSQL != "SELECT pg_try_advisory_xact_lock(hashtext('zonestats_pass'), 1)" {
+		t.Errorf("zoneStatsTryLockSQL:\n%s\nwant the xact try-lock on the fixed key hashtext('zonestats_pass'), 1", zoneStatsTryLockSQL)
+	}
+}
+
+// TestZoneStatsOnceLockBusyTryOnly — the loop's tick (LockWait < 0): a
+// busy lock — ErrZoneStatsBusy at once, a single lock query, not one
+// pass statement, the transaction is rolled back.
+func TestZoneStatsOnceLockBusyTryOnly(t *testing.T) {
+	statuses := make([]int64, len(statusAggCols))
+	pool := &zonestatsFakePool{
+		lockAnswers: []bool{false},
+		steps: stepsOfPass(
+			zoneValsOf(7, 10, 4, 2, 3, 1),
+			zoneValsOf(7, 10, 4, 2, 3, 1),
+			aggRowOf(7, 10, 4, 2, 3, statuses, 0),
+			zonestatsRows(),
+			fullCounterRows(nil),
+			fullCounterRows(nil)),
+	}
+
+	_, err := ZoneStatsOnce(context.Background(), pool, ZoneStatsOptions{LockWait: ZoneStatsLockTryOnly})
+	if !errors.Is(err, ErrZoneStatsBusy) {
+		t.Fatalf("error = %v, want ErrZoneStatsBusy", err)
+	}
+	if n := pool.stats(); n != 1 {
+		t.Errorf("queries = %d, want 1 (the lock attempt only — the pass did not start)", n)
+	}
+	if _, _, rollbacks := pool.txCounts(); rollbacks != 1 {
+		t.Errorf("rollbacks = %d, want 1 (the busy transaction is rolled back)", rollbacks)
+	}
+}
+
+// TestZoneStatsOnceLockWaitsOut — the external default (LockWait > 0):
+// the busy attempts repeat until the holder releases; the pass then
+// runs in the SAME transaction (the lock is its first statement, not a
+// separate connection — one Begin for the waiting and the pass).
+func TestZoneStatsOnceLockWaitsOut(t *testing.T) {
+	defer zonestatsSetLockPoll(t, time.Millisecond)()
+	statuses := make([]int64, len(statusAggCols))
+	pool := &zonestatsFakePool{
+		lockAnswers: []bool{false, false, true},
+		steps: stepsOfPass(
+			zoneValsOf(7, 10, 4, 2, 3, 1),
+			zoneValsOf(7, 10, 4, 2, 3, 1),
+			aggRowOf(7, 10, 4, 2, 3, statuses, 0),
+			zonestatsRows(),
+			fullCounterRows(nil),
+			fullCounterRows(nil)),
+	}
+
+	res, err := ZoneStatsOnce(context.Background(), pool, ZoneStatsOptions{LockWait: time.Second})
+	if err != nil {
+		t.Fatalf("ZoneStatsOnce: %v", err)
+	}
+	if res.Zones != 1 {
+		t.Errorf("Zones = %d, want 1 (the pass ran after the wait)", res.Zones)
+	}
+	if got := pool.lockTries(); got != 3 {
+		t.Errorf("lock attempts = %d, want 3 (two busy, the third acquired)", got)
+	}
+	begins, commits, _ := pool.txCounts()
+	if begins != 1 || commits != 1 {
+		t.Errorf("transactions: begin=%d commit=%d, want 1/1 (the wait is in the pass transaction)", begins, commits)
+	}
+}
+
+// TestZoneStatsOnceLockWaitTimeout — the budget expires: ErrZoneStatsBusy
+// after several attempts, not one pass statement, rollback.
+func TestZoneStatsOnceLockWaitTimeout(t *testing.T) {
+	defer zonestatsSetLockPoll(t, time.Millisecond)()
+	statuses := make([]int64, len(statusAggCols))
+	pool := &zonestatsFakePool{
+		lockAnswers: make([]bool, 1024), // busy longer than the budget
+		steps: stepsOfPass(
+			zoneValsOf(7, 10, 4, 2, 3, 1),
+			zoneValsOf(7, 10, 4, 2, 3, 1),
+			aggRowOf(7, 10, 4, 2, 3, statuses, 0),
+			zonestatsRows(),
+			fullCounterRows(nil),
+			fullCounterRows(nil)),
+	}
+
+	// The budget is generous against the 1 ms poll: a scheduler hiccup of
+	// a few tens of milliseconds (a container under -race, parallel
+	// packages) must not cut the attempts to one.
+	_, err := ZoneStatsOnce(context.Background(), pool, ZoneStatsOptions{LockWait: 150 * time.Millisecond})
+	if !errors.Is(err, ErrZoneStatsBusy) {
+		t.Fatalf("error = %v, want ErrZoneStatsBusy after the budget", err)
+	}
+	if got := pool.lockTries(); got < 2 {
+		t.Errorf("lock attempts = %d, want ≥ 2 (the budget outlives one poll)", got)
+	}
+	if n := pool.stats(); n != pool.lockTries() {
+		t.Errorf("queries = %d with %d lock attempts, want the lock only (the pass did not start)", n, pool.lockTries())
+	}
+	if _, _, rollbacks := pool.txCounts(); rollbacks != 1 {
+		t.Errorf("rollbacks = %d, want 1", rollbacks)
+	}
+}
+
+// TestZoneStatsOnceLockError — the lock query failure is wrapped with the
+// task context, the original error is preserved; rollback.
+func TestZoneStatsOnceLockError(t *testing.T) {
+	pool := &zonestatsFakePool{lockErr: errors.New("db unavailable")}
+	_, err := ZoneStatsOnce(context.Background(), pool, ZoneStatsOptions{})
+	if err == nil || !strings.Contains(err.Error(), "monitor: counter reconciliation") ||
+		!strings.Contains(err.Error(), "db unavailable") {
+		t.Errorf("error = %v, want the task context and the original", err)
+	}
+	if _, _, rollbacks := pool.txCounts(); rollbacks != 1 {
+		t.Errorf("rollbacks = %d, want 1", rollbacks)
+	}
+}
+
+// TestZoneStatsOnceLockCancelDuringWait — a ctx cancellation while
+// waiting out the holder: the ctx error (the shutdown path), NOT the
+// busy skip; rollback.
+func TestZoneStatsOnceLockCancelDuringWait(t *testing.T) {
+	defer zonestatsSetLockPoll(t, 2*time.Millisecond)()
+	pool := &zonestatsFakePool{
+		lockAnswers: make([]bool, 128), // busy longer than the test waits
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	timer := time.AfterFunc(5*time.Millisecond, cancel)
+	defer timer.Stop()
+	_, err := ZoneStatsOnce(ctx, pool, ZoneStatsOptions{LockWait: 10 * time.Second})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled (the cancellation during the wait)", err)
+	}
+	if errors.Is(err, ErrZoneStatsBusy) {
+		t.Errorf("error = %v, the cancellation must not surface as the busy skip", err)
+	}
+	if _, _, rollbacks := pool.txCounts(); rollbacks != 1 {
+		t.Errorf("rollbacks = %d, want 1", rollbacks)
+	}
+}
+
 // --- ZoneStatsOptions ------------------------------------------------------
 
 // TestZoneStatsOptionsDefaults — zero and negative values are the
@@ -1025,9 +1220,28 @@ func TestZoneStatsOptionsDefaults(t *testing.T) {
 	if got.Interval != DefaultZoneStatsInterval {
 		t.Errorf("Interval = %v, want the default %v", got.Interval, DefaultZoneStatsInterval)
 	}
+	if got.LockWait != DefaultZoneStatsLockWait {
+		t.Errorf("LockWait = %v, want the default %v", got.LockWait, DefaultZoneStatsLockWait)
+	}
 	got = (ZoneStatsOptions{Interval: -time.Second}).withDefaults()
 	if got.Interval != DefaultZoneStatsInterval {
 		t.Errorf("Interval = %v after a negative one, want the default %v", got.Interval, DefaultZoneStatsInterval)
+	}
+	// The lock budget (T-314): zero — the external default; the negative
+	// (the loop's single attempt) and the positive values are kept as
+	// set — only the zero is replaced.
+	got = (ZoneStatsOptions{LockWait: ZoneStatsLockTryOnly}).withDefaults()
+	if got.LockWait != ZoneStatsLockTryOnly {
+		t.Errorf("LockWait = %v after the try-only one, want it kept", got.LockWait)
+	}
+	got = (ZoneStatsOptions{LockWait: 42 * time.Second}).withDefaults()
+	if got.LockWait != 42*time.Second {
+		t.Errorf("LockWait = %v after 42s, want 42s (only 0 is replaced)", got.LockWait)
+	}
+	// The default covers the worst observed pass (501 s, T-199) with a
+	// margin.
+	if DefaultZoneStatsLockWait != 10*time.Minute {
+		t.Errorf("DefaultZoneStatsLockWait = %v, want 10m", DefaultZoneStatsLockWait)
 	}
 	got = (ZoneStatsOptions{Interval: time.Nanosecond}).withDefaults()
 	if got.Interval != time.Nanosecond {
@@ -1095,7 +1309,7 @@ func TestZoneStatsLoopImmediatePass(t *testing.T) {
 	}()
 
 	deadline := time.Now().Add(2 * time.Second)
-	for pool.stats() < 32 {
+	for pool.stats() < 33 {
 		if time.Now().After(deadline) {
 			cancel()
 			t.Fatal("the starting pass was not performed")
@@ -1103,8 +1317,8 @@ func TestZoneStatsLoopImmediatePass(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	time.Sleep(20 * time.Millisecond)
-	if n := pool.stats(); n != 32 {
-		t.Errorf("queries = %d, want 32: without a tick there are no repeated passes", n)
+	if n := pool.stats(); n != 33 {
+		t.Errorf("queries = %d, want 33: without a tick there are no repeated passes", n)
 	}
 
 	cancel()
@@ -1206,7 +1420,7 @@ func TestZoneStatsLoopFailedFirstPass(t *testing.T) {
 		})
 	}()
 
-	waitCond(t, 2*time.Second, func() bool { return pool.stats() >= 38 }, "a pass after a failed start")
+	waitCond(t, 2*time.Second, func() bool { return pool.stats() >= 40 }, "a pass after a failed start")
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatalf("ZoneStatsLoop: %v", err)
@@ -1452,6 +1666,25 @@ func zonestatsHistogramSamples(t *testing.T, reg *metrics.Registry) uint64 {
 	return 0
 }
 
+// zonestatsBusySkippedValue — the current value of the
+// crawler_zonestats_busy_skipped_total counter (T-314).
+func zonestatsBusySkippedValue(t *testing.T, reg *metrics.Registry) float64 {
+	t.Helper()
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	for _, mf := range families {
+		if mf.GetName() != "crawler_zonestats_busy_skipped_total" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			return m.GetCounter().GetValue()
+		}
+	}
+	return 0
+}
+
 // passSteps — presets of N "quiet" passes (a zero drift).
 func passSteps(n int) []zonestatsStep {
 	statuses := make([]int64, len(statusAggCols))
@@ -1479,7 +1712,7 @@ func TestZoneStatsLoopSingleFlight(t *testing.T) {
 
 	reg := metrics.New("monitor")
 	pool := &zonestatsFakePool{steps: passSteps(12)}
-	pool.setDelay(70 * time.Millisecond) // 27 queries ≈ 1.9 s per pass > the 50 ms interval
+	pool.setDelay(70 * time.Millisecond) // 28 queries ≈ 2.0 s per pass > the 50 ms interval
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -1500,8 +1733,8 @@ func TestZoneStatsLoopSingleFlight(t *testing.T) {
 	// checked: under
 	// the load of the run between the Warn and the check the next tick
 	// (150 ms) could arrive and start pass 2 — that is the normal mode.
-	if n := pool.stats(); n < 27 {
-		t.Errorf("queries = %d after the drain, want ≥ 27 (the first pass completed)", n)
+	if n := pool.stats(); n < 28 {
+		t.Errorf("queries = %d after the drain, want ≥ 28 (the first pass completed)", n)
 	}
 
 	// Pass 2 is fast: the normal mode is restored, the loop lives.
@@ -1512,7 +1745,7 @@ func TestZoneStatsLoopSingleFlight(t *testing.T) {
 	// the single-flight invariant ("no more often than the interval") is
 	// checked above.
 	pool.setDelay(0)
-	waitCond(t, 2*time.Second, func() bool { return pool.stats() >= 33 }, "a pass after a skip")
+	waitCond(t, 2*time.Second, func() bool { return pool.stats() >= 34 }, "a pass after a skip")
 	if got := zonestatsSkippedValue(t, reg); got < 1 {
 		t.Errorf("skipped_ticks = %v after a fast pass, want ≥ 1", got)
 	}
@@ -1546,10 +1779,84 @@ func TestZoneStatsLoopNilRegistry(t *testing.T) {
 		})
 	}()
 
-	waitCond(t, 2*time.Second, func() bool { return pool.stats() >= 27 }, "the starting pass without a registry")
+	waitCond(t, 2*time.Second, func() bool { return pool.stats() >= 28 }, "the starting pass without a registry")
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatalf("ZoneStatsLoop: %v, want nil without a registry", err)
+	}
+}
+
+// TestZoneStatsLoopSkipsBusyTick — the inter-process single-flight
+// (T-314): a busy pass lock (an external recount or the collapse move)
+// skips the tick — a Warn and the busy counter, no queue behind the
+// holder, the loop lives; the next tick runs the pass in full. The
+// skipped starting pass does not clear "first": the next successful one
+// fills in quietly — the pass after the skip carries a REAL drift (the
+// old zeros against the new values), and neither the drift Warn nor the
+// gauge may raise on it (the TestZoneStatsLoopFailedFirstPass shape).
+func TestZoneStatsLoopSkipsBusyTick(t *testing.T) {
+	slogBuf := &zonestatsSyncBuf{}
+	logger := slog.New(slog.NewTextHandler(slogBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	reg := metrics.New("monitor")
+
+	// The filling pass: the old zone values are zeros, the new ones are
+	// the aggregate — a non-zero drift everywhere; it must stay
+	// unobserved (the skip did not clear "first").
+	statuses := make([]int64, len(statusAggCols))
+	fill := stepsOfPass(
+		zoneValsOf(7, 0, 0, 0, 0, 0),
+		zoneValsOf(7, 10, 4, 2, 3, 1),
+		aggRowOf(7, 10, 4, 2, 3, statuses, 5),
+		zonestatsRows(),
+		fullCounterRows(nil),
+		fullCounterRows(map[string]int64{"render_pending": 5}))
+	pool := &zonestatsFakePool{
+		lockAnswers: []bool{false}, // the starting pass is busy, then free
+		steps:       fill,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- ZoneStatsLoop(ctx, pool, reg, ZoneStatsOptions{
+			Interval: 5 * time.Millisecond,
+			Log:      logger,
+		})
+	}()
+
+	waitCond(t, 2*time.Second, func() bool {
+		return slogBuf.contains("skipped: the lock is held by another pass")
+	}, "the busy-skip Warn")
+	if got := zonestatsBusySkippedValue(t, reg); got != 1 {
+		t.Errorf("busy_skipped = %v, want 1", got)
+	}
+	// No queue: the skip is one lock query, the pass statements start
+	// only after the holder released.
+	waitCond(t, 2*time.Second, func() bool { return pool.stats() >= 34 }, "the next tick's full pass")
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("ZoneStatsLoop: %v, want nil", err)
+	}
+	log := slogBuf.String()
+	if !strings.Contains(log, "counter reconciliation pass skipped: the lock is held by another pass") {
+		t.Errorf("the log without the busy-skip Warn:\n%s", log)
+	}
+	// The pass after the skip is the filling first one — no drift Warn,
+	// no pass error Warn (the error branch message is exactly
+	// "counter reconciliation pass" — the skip one carries the
+	// " skipped:" tail; the success Debug line differs by the level).
+	if strings.Contains(log, `level=WARN msg="counter reconciliation pass"`) {
+		t.Errorf("a pass error Warn besides the skip:\n%s", log)
+	}
+	if strings.Contains(log, "reconciliation: counter drift") {
+		t.Errorf("the filling pass after the skip is reported as drift:\n%s", log)
+	}
+	// The drift gauge is the observable sign of a non-first pass
+	// (reportDrift raises it from the second successful pass on): the
+	// skip must not have cleared "first".
+	if v := driftGaugeValue(t, reg, "zone:7:total"); v != 0 {
+		t.Errorf("the drift gauge after the filling pass = %v, want 0 (the skip did not clear \"first\")", v)
 	}
 }
 

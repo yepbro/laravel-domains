@@ -903,6 +903,16 @@ func Run(ctx context.Context, pool *pgxpool.Pool, opts Options, stdout io.Writer
 	} else {
 		rec, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{})
 		if err != nil {
+			if errors.Is(err, monitor.ErrZoneStatsBusy) {
+				// The pass lock (T-314): the move itself is complete, the
+				// external pass held the lock for the whole wait — the
+				// reconciliation is not lost, the monitor loop performs
+				// it within its interval. The post-checks of §7.5 did not
+				// run either: a repeat of the command is safe (the move is
+				// idempotent — nothing left to move) and runs them.
+				return fmt.Errorf("collapse: counter reconciliation: another pass (the monitor loop or crawlerctl counters recount) held the lock for the whole wait of %s; the move is complete, but the post-checks (§7.5) did not run — repeat the command (idempotent: nothing left to move) or wait for the next monitor pass (≤ %s) / a repeated crawlerctl counters recount",
+					monitor.DefaultZoneStatsLockWait, monitor.DefaultZoneStatsInterval)
+			}
 			return fmt.Errorf("collapse: counter reconciliation: %w", err)
 		}
 		drifted := 0

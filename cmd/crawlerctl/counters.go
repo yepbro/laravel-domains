@@ -13,6 +13,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -295,6 +296,14 @@ func countersRecount(args []string, stdout, stderr io.Writer) error {
 
 	res, err := monitor.ZoneStatsOnce(ctx, pool, monitor.ZoneStatsOptions{Zone: zoneID})
 	if err != nil {
+		if errors.Is(err, monitor.ErrZoneStatsBusy) {
+			// The pass lock (T-314): a concurrent pass (the monitor loop
+			// or the collapse move) held it for the whole wait — the
+			// command fails honestly instead of hanging; the counters
+			// converge at the next background pass regardless.
+			return fmt.Errorf("counters recount: another reconciliation pass (the monitor loop or the collapse move) held the lock for the whole wait of %s — retry when it finishes; the monitor loop reconciles the counters anyway every zone_stats_interval",
+				monitor.DefaultZoneStatsLockWait)
+		}
 		return fmt.Errorf("counters recount: %w", err)
 	}
 
