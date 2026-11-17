@@ -450,6 +450,99 @@ func TestFetchHTTPS_HostAndSNIOverResolvedIP(t *testing.T) {
 	}
 }
 
+// --- HTTP/2 (T-305) ----------------------------------------------------------
+
+// TestNewFetcherHTTP2Attempt: with the custom DialContext (the DNS stage
+// addresses) net/http does not enable the automatic h2 — the transport
+// sets ForceAttemptHTTP2 itself; the rollback switch is Options.ForceHTTP1
+// (http.force_http1), carried by the NewOptions assembly from the http
+// config section.
+func TestNewFetcherHTTP2Attempt(t *testing.T) {
+	if got := NewFetcher(Options{}).rt.ForceAttemptHTTP2; !got {
+		t.Errorf("ForceAttemptHTTP2 of the default transport: want true, got %v", got)
+	}
+	if got := NewFetcher(Options{ForceHTTP1: true}).rt.ForceAttemptHTTP2; got {
+		t.Errorf("ForceAttemptHTTP2 with Options.ForceHTTP1: want false, got %v", got)
+	}
+	if got := NewOptions(config.HTTP{}).ForceHTTP1; got {
+		t.Errorf("NewOptions force_http1 default: want false, got %v", got)
+	}
+	if got := NewOptions(config.HTTP{ForceHTTP1: true}).ForceHTTP1; !got {
+		t.Errorf("NewOptions force_http1: want true, got %v", got)
+	}
+}
+
+// TestFetchHTTP2Negotiated: the default transport negotiates h2 via ALPN
+// (an httptest server with h2 enabled), Options.ForceHTTP1 keeps
+// HTTP/1.1 — both over the same custom DialContext (the pre-resolved
+// loopback addresses of the DNS stage form). The handler echoes the
+// server-side protocol; the client-side truth is the TLS handshake's
+// NegotiatedProtocol (the detection data — headers, cookies, HTML — is
+// the same over both; the switch changes only the wire protocol).
+func TestFetchHTTP2Negotiated(t *testing.T) {
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, "proto ", r.Proto)
+	}))
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	defer srv.Close()
+
+	fetch := func(t *testing.T, forceHTTP1 bool) (body string, negotiated string) {
+		t.Helper()
+		u, err := url.Parse(srv.URL)
+		if err != nil {
+			t.Fatalf("test URL %q: %v", srv.URL, err)
+		}
+		f := NewFetcher(Options{
+			ForceHTTP1: forceHTTP1,
+			// The certificate check is not the test's subject (the
+			// httptest certificate is not trusted); ALPN is negotiated
+			// regardless of the verification mode.
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		})
+		defer f.CloseIdleConnections()
+		res, err := f.Fetch(context.Background(), FetchRequest{URL: u, Addrs: loopbackAddr()})
+		if err != nil {
+			t.Fatalf("Fetch https (force_http1=%v): %v", forceHTTP1, err)
+		}
+		defer func() { _ = res.Body.Close() }()
+		b, err := io.ReadAll(res.Body)
+		if err != nil {
+			t.Fatalf("body (force_http1=%v): %v", forceHTTP1, err)
+		}
+		if res.TLS == nil {
+			t.Fatal("the TLS connection is not established")
+		}
+		return string(b), res.TLS.NegotiatedProtocol
+	}
+
+	t.Run("default h2", func(t *testing.T) {
+		body, alpn := fetch(t, false)
+		if proto := "HTTP/2.0"; body != "proto "+proto {
+			t.Errorf("server-side protocol: want %q, got %q", proto, body)
+		}
+		if alpn != "h2" {
+			t.Errorf("the TLS handshake's NegotiatedProtocol: want h2, got %q", alpn)
+		}
+	})
+	t.Run("force http/1.1", func(t *testing.T) {
+		body, alpn := fetch(t, true)
+		if proto := "HTTP/1.1"; body != "proto "+proto {
+			t.Errorf("server-side protocol: want %q, got %q", proto, body)
+		}
+		// The pre-T-305 shape: with the h2 attempt off, the transport
+		// offers no ALPN at all (NextProtos is appended by net/http's
+		// h2 configurator, which does not run) — NegotiatedProtocol is
+		// empty and the connection speaks HTTP/1.1 by construction.
+		// The exact pin, not just "not h2": a non-empty value would mean
+		// the rollback's ClientHello changed its wire form (the review
+		// of T-305, tmp/review/32-t305.md#P3-2).
+		if alpn != "" {
+			t.Errorf("the TLS handshake's NegotiatedProtocol: want none (empty — no ALPN offered), got %q", alpn)
+		}
+	})
+}
+
 // --- the redirect-host resolve hook ------------------------------------------
 
 // TestRoundTripResolvesHostsWithoutStageAddrs: a request without DNS

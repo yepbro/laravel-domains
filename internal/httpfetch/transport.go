@@ -17,7 +17,14 @@
 //   - the limits and protections of T-049 (the spec 5.5 limits table):
 //     the body cap with the truncation flag, the anti-tarpit (a min speed
 //     after the first byte), connections per IP, global connections and
-//     RPS — limits.go, enabled by Options.Limits.
+//     RPS — limits.go, enabled by Options.Limits;
+//   - HTTP/2 for https (T-305, the bulk review 02#P3-3): the transport
+//     dials through a custom DialContext, with which net/http does not
+//     enable the automatic h2 by itself — ForceAttemptHTTP2 is set, so
+//     https negotiates h2 in the same TLS handshake (ALPN; a server
+//     without h2 falls back to HTTP/1.1 by itself). http (cleartext) URLs
+//     stay HTTP/1.1: h2c is not attempted. The exact pre-T-305 wire
+//     behavior (HTTP/1.1 always) is the http.force_http1 switch.
 //
 // Ethics and the minimum of requests (spec 5.5, §9): the crawler requests
 // only the main page "/" — a site check's FetchRequest is built from the
@@ -146,6 +153,19 @@ type Options struct {
 	// the usual check; InsecureSkipVerify and storing the certificate
 	// check result (issuer, validity, SAN) — T-050.
 	TLSClientConfig *tls.Config
+	// ForceHTTP1 keeps https on HTTP/1.1 (T-305, the bulk review
+	// 02#P3-3): the transport dials through a custom DialContext (the
+	// DNS stage addresses), with which net/http conservatively disables
+	// the automatic h2 — before T-305 every https request went over
+	// HTTP/1.1 for exactly that reason. false (the default) sets
+	// Transport.ForceAttemptHTTP2: h2 is proposed in the TLS handshake
+	// (ALPN), a server without h2 falls back to HTTP/1.1 by itself; the
+	// custom dial (with the T-049 connection limits) serves h2
+	// connections too. Headers, cookies and HTML are the same over both
+	// protocols — the Laravel detection does not change; the difference
+	// is the wire protocol's speed/resources. The flag is the rollback
+	// switch to the exact pre-T-305 transport behavior (http.force_http1).
+	ForceHTTP1 bool
 }
 
 // NewOptions assembles the parameters from the http config section
@@ -172,6 +192,7 @@ func NewOptions(cfg config.HTTP) Options {
 		UserAgent:           ua,
 		Limits:              &limits,
 		BlockInternalAddrs:  cfg.BlockInternalAddrs,
+		ForceHTTP1:          cfg.ForceHTTP1,
 	}
 }
 
@@ -334,6 +355,13 @@ func NewFetcher(opts Options) *Fetcher {
 		TLSHandshakeTimeout:   opts.TLSHandshakeTimeout,
 		ResponseHeaderTimeout: opts.HeaderTimeout,
 		TLSClientConfig:       opts.TLSClientConfig,
+		// HTTP/2 for https (T-305): with a custom DialContext net/http
+		// does not enable the automatic h2 on its own — ForceAttemptHTTP2
+		// re-enables it (the custom dial, including the T-049 connection
+		// limits, serves h2 connections too). http (cleartext) URLs stay
+		// HTTP/1.1: h2c is not attempted. The rollback to the exact
+		// pre-T-305 wire behavior is Options.ForceHTTP1 (http.force_http1).
+		ForceAttemptHTTP2: !opts.ForceHTTP1,
 	}
 	return f
 }

@@ -93,6 +93,9 @@ func TestDefault(t *testing.T) {
 		{"http.max_redirects", c.HTTP.MaxRedirects, 8},
 		{"http.max_body_bytes", c.HTTP.MaxBodyBytes.B(), int64(2 << 20)},
 		{"http.user_agent", c.HTTP.UserAgent != "", true},
+		// false — HTTP/2 is the default since T-305 (the owner's
+		// decision; force_http1 is the rollback switch).
+		{"http.force_http1", c.HTTP.ForceHTTP1, false},
 		{"http.task_concurrency", c.HTTP.TaskConcurrency, 192},
 		{"http.task_consume", c.HTTP.TaskConsume, 16},
 		{"http.task_per_domain", c.HTTP.TaskPerDomain, 8},
@@ -263,6 +266,7 @@ http:
   total_timeout: "15s"
   max_redirects: 5
   max_body_bytes: 1048576
+  force_http1: true
   user_agent: "TestCrawler/2.0 (contact: test@example.invalid)"
   task_concurrency: 128
   task_consume: 8
@@ -398,6 +402,7 @@ log:
 		{"http.total_timeout", cfg.HTTP.TotalTimeout.D(), 15 * time.Second},
 		{"http.max_redirects", cfg.HTTP.MaxRedirects, 5},
 		{"http.max_body_bytes", cfg.HTTP.MaxBodyBytes.B(), int64(1048576)},
+		{"http.force_http1", cfg.HTTP.ForceHTTP1, true},
 		{"http.user_agent", cfg.HTTP.UserAgent, "TestCrawler/2.0 (contact: test@example.invalid)"},
 		{"http.task_concurrency", cfg.HTTP.TaskConcurrency, 128},
 		{"http.task_consume", cfg.HTTP.TaskConsume, 8},
@@ -730,6 +735,7 @@ func TestEnvOverrides(t *testing.T) {
 		"CRAWLER_HTTP_MAX_REDIRECTS":               "3",
 		"CRAWLER_HTTP_MAX_BODY_BYTES":              "4MiB",
 		"CRAWLER_HTTP_USER_AGENT":                  "EnvCrawler/1.0 (contact: env@example.invalid)",
+		"CRAWLER_HTTP_FORCE_HTTP1":                 "true",
 		"CRAWLER_HTTP_TASK_CONCURRENCY":            "96",
 		"CRAWLER_HTTP_TASK_CONSUME":                "32",
 		"CRAWLER_HTTP_TASK_PER_DOMAIN":             "4",
@@ -854,6 +860,7 @@ func TestEnvOverrides(t *testing.T) {
 		{"http.max_redirects", cfg.HTTP.MaxRedirects, 3},
 		{"http.max_body_bytes", cfg.HTTP.MaxBodyBytes.B(), int64(4 << 20)},
 		{"http.user_agent", cfg.HTTP.UserAgent, "EnvCrawler/1.0 (contact: env@example.invalid)"},
+		{"http.force_http1", cfg.HTTP.ForceHTTP1, true},
 		{"http.task_concurrency", cfg.HTTP.TaskConcurrency, 96},
 		{"http.task_consume", cfg.HTTP.TaskConsume, 32},
 		{"http.task_per_domain", cfg.HTTP.TaskPerDomain, 4},

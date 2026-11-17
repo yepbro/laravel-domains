@@ -545,6 +545,7 @@ the probe from a `local-data` record, deploy/docker/unbound.
 | `max_rps` | `CRAWLER_HTTP_MAX_RPS` | integer | `1000` |
 | `user_agent` | `CRAWLER_HTTP_USER_AGENT` | string | `DomainCrawler/1.0 (+https://example.example/contact; admin@example.example)` |
 | `block_internal_addrs` | `CRAWLER_HTTP_BLOCK_INTERNAL_ADDRS` | boolean | `false` (the deploy example — `true`; mandatory for Internet operation) |
+| `force_http1` | `CRAWLER_HTTP_FORCE_HTTP1` | boolean | `false` (T-305: HTTP/2 via ALPN; `true` — the pre-T-305 HTTP/1.1 behavior) |
 | `task_concurrency` | `CRAWLER_HTTP_TASK_CONCURRENCY` | integer | `192` (T-157; the return to 256 — by measurement after T-163) |
 | `task_consume` | `CRAWLER_HTTP_TASK_CONSUME` | integer | `16` (T-139) |
 | `task_per_domain` | `CRAWLER_HTTP_TASK_PER_DOMAIN` | integer | `8` (T-139) |
@@ -600,6 +601,22 @@ the request rate — `max_rps` (a token bucket with bursts up to
 (a spec 5.5 variant "off or a very short idle"): one main page per
 site; a per-host pool would outlive address re-resolution and keep
 thousands of inactive connections at concurrency 2000.
+
+`force_http1` (T-305, the bulk review 02#P3-3) — the HTTP protocol of
+https requests. The transport connects to pre-resolved IPs (a custom
+DialContext), with which net/http does not enable the automatic
+HTTP/2 — before T-305 all https went over HTTP/1.1 for exactly that
+reason. The default (`false`) sets `ForceAttemptHTTP2`: h2 is
+negotiated by ALPN in the same TLS handshake (a server without h2
+falls back to HTTP/1.1 by itself), and the connection is still dialed
+through the same custom dialer — the per-IP/global connection limits
+and the connect timeouts keep applying; `http` (cleartext) URLs stay
+HTTP/1.1 (h2c is not attempted). Keep-alive stays off, so every
+request is still a new connection — the change is the wire protocol
+of that one request, not the connection churn. Headers, cookies and
+HTML are the same over both protocols — the Laravel detection does
+not change; the difference is speed/resources on the mass crawl.
+`true` — the exact pre-T-305 wire behavior (the rollback switch).
 
 `per_ip_overrides` (T-165) — raised per-IP limits for the prefixes of
 domain parkers: a "CIDR → limit" map in YAML

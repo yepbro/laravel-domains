@@ -150,6 +150,7 @@ func envSpecs() []envSpec {
 		{"CRAWLER_HTTP_MAX_RPS", setInt(func(c *Config) *int { return &c.HTTP.MaxRPS })},
 		{"CRAWLER_HTTP_USER_AGENT", setString(func(c *Config) *string { return &c.HTTP.UserAgent })},
 		{"CRAWLER_HTTP_BLOCK_INTERNAL_ADDRS", setBool(func(c *Config) *bool { return &c.HTTP.BlockInternalAddrs })},
+		{"CRAWLER_HTTP_FORCE_HTTP1", setBool(func(c *Config) *bool { return &c.HTTP.ForceHTTP1 })},
 		{"CRAWLER_HTTP_TASK_CONCURRENCY", setInt(func(c *Config) *int { return &c.HTTP.TaskConcurrency })},
 		{"CRAWLER_HTTP_TASK_CONSUME", setInt(func(c *Config) *int { return &c.HTTP.TaskConsume })},
 		{"CRAWLER_HTTP_TASK_PER_DOMAIN", setInt(func(c *Config) *int { return &c.HTTP.TaskPerDomain })},

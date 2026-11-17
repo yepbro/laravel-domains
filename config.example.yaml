@@ -155,6 +155,18 @@ http:
   # dev/testbed with internal networks (172.28.100.0/24). The code default
   # is false.
   block_internal_addrs: true
+  # HTTP/2 for https requests (T-305, the bulk review 02#P3-3): the
+  # transport connects to pre-resolved IPs (a custom DialContext), with
+  # which net/http does not enable h2 on its own — before T-305 all https
+  # went over HTTP/1.1 for exactly that reason. false (the default) — the
+  # transport sets ForceAttemptHTTP2: the protocol is negotiated by ALPN in
+  # the same TLS handshake, a server without h2 falls back to HTTP/1.1 by
+  # itself; http (cleartext) URLs stay HTTP/1.1 (no h2c). Headers, cookies
+  # and HTML are the same over both protocols — the Laravel detection does
+  # not change; the difference is the wire protocol's speed/resources on
+  # the mass crawl. true — the exact pre-T-305 wire behavior (the rollback
+  # switch).
+  force_http1: false
   user_agent: "DomainCrawler/1.0 (+https://example.example/contact; admin@example.example)"  # an honest UA with contacts — a must; substitute the operator's real contacts (spec §9)
   # The task parallelism of the http-worker loop (T-139; not transport!):
   # the q:http consumption is sliding — the next read happens when a task

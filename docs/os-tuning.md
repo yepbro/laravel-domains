@@ -28,6 +28,10 @@ closes per second from a single IP. The DNS stage runs in parallel: up to 2000
 concurrent UDP exchanges with the local unbound (one pool socket — one
 request in flight, the `UDPPool` contract), and on TC=1 the TCP fallback —
 up to 2000 concurrent short TCP connections to unbound as well.
+HTTP/2 for https (T-305, `http.force_http1: false`) does not change this
+sizing: without keep-alive each request is still a new TCP+TLS connection —
+h2 changes the wire protocol of that one request (ALPN), not the connection
+churn; the rollback to HTTP/1.1 is `http.force_http1`.
 
 DNS datagrams are small: the `internal/dnsclient` client does not set EDNS0 —
 requests ≤ ~300 B, responses ≤ 512 B (a truncated response goes to the TCP

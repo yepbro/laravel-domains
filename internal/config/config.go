@@ -366,6 +366,19 @@ type HTTP struct {
 	// enabling it is mandatory. An extension to the minimal set of
 	// spec 5.10.
 	BlockInternalAddrs bool `yaml:"block_internal_addrs"`
+	// ForceHTTP1 — https requests stay on HTTP/1.1 (T-305, the bulk
+	// review 02#P3-3): the transport dials through a custom DialContext
+	// (the DNS stage addresses), with which net/http does not enable the
+	// automatic HTTP/2 — before T-305 all https was HTTP/1.1 for exactly
+	// that reason. false (the default) — the transport sets
+	// ForceAttemptHTTP2 and proposes h2 in the TLS handshake (ALPN); a
+	// server without h2 falls back to HTTP/1.1 by itself, http
+	// (cleartext) URLs stay HTTP/1.1 (no h2c). Headers, cookies and HTML
+	// are the same over both protocols — the Laravel detection does not
+	// change; the difference is the wire protocol's speed/resources. The
+	// flag is the rollback switch to the exact pre-T-305 transport
+	// behavior. An extension to the minimal set of spec 5.10.
+	ForceHTTP1 bool `yaml:"force_http1"`
 	// TaskConcurrency — the concurrent q:http tasks (domains) in the
 	// http-worker loop (T-139): the task parallelism of the stage, as
 	// opposed to the transport Concurrency (connections/RPS — the

@@ -1547,3 +1547,33 @@ find-sections/get-overview секцию показывали; move в други
 диагностике (move в DRAFT работал, обратно не требовалось — сразу ушла
 в новую PROCESSING).
 Ссылки: AGENTS.md (id секций доски); T-305.
+
+### D-050 — T-305: HTTP/2 для https-запросов httpfetch (ForceAttemptHTTP2 при кастомном DialContext), откат — http.force_http1
+
+Контекст: NewFetcher задаёт кастомный DialContext (адреса DNS-стадии) и
+TLSClientConfig — с таким набором net/http сам не включает
+автоматический h2 (находка bulk-ревью hy4 02#P3-3), весь prod-HTTPS шёл
+по HTTP/1.1. Решение владельца из ТЗ: HTTP/2 по умолчанию, оба варианта
+доступны через конфиг.
+Реализация: транспорт ставит ForceAttemptHTTP2: !Options.ForceHTTP1 —
+h2 предлагается в том же TLS-handshake (ALPN), сервер без h2 сам падает
+в HTTP/1.1; h2-соединения диалятся тем же кастомным путём — лимиты T-049
+(per-IP/global/RPS) и послоевые таймауты сохраняются. http (cleartext)
+остаётся HTTP/1.1: h2c не пытается. Имя опции — http.force_http1 (env
+CRAWLER_HTTP_FORCE_HTTP1), дефолт false: глагольный стиль соседних
+булевых опций секции (block_internal_addrs, dead_host_cutoff), дефолту
+строка в конфиге не нужна, а переключатель читается как осознанный
+откат к старому поведению. Обратная совместимость поведения транспорта
+меняется намеренно (решение владельца); на детекцию Laravel не влияет —
+заголовки/cookie/HTML одинаковы над обоими протоколами. Нюанс,
+выплывший в тестах: при force_http1 клиент вообще не предлагает ALPN
+(NextProtos в TLSClientConfig дописывает только h2-конфигуратор net/http,
+который не запускается) — NegotiatedProtocol пуст, а HTTP/1.1 — по
+построению; серверная сторона (r.Proto) — надёжная проверка.
+Затронуто: internal/httpfetch/transport.go (+тесты), internal/config
+(поле + env + тесты), config.example.yaml, docs/configuration.md,
+docs/os-tuning.md (заметка: churn соединений не меняется — keep-alive
+выключен, h2 меняет протокол одного запроса, не переиспользование
+соединений).
+Ссылки: T-305; tmp/review/hy4bulk/02-httpfetch.md#P3-3 (основное дерево).
+
