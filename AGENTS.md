@@ -118,7 +118,7 @@ creates the directory when writing the prompt.
    from the worktree under review:
 
    ```bash
-   timeout 1200 opencode run --auto \
+   timeout 3600 opencode run --auto \
      -m "opencode-go/deepseek-v4.1-flash" \
      --title "review-<slug>" "$(cat tmp/review/prompt-<slug>.md)" \
      > tmp/review/<slug>-deepseek.md 2>&1; echo "exit=$?"
@@ -134,10 +134,19 @@ creates the directory when writing the prompt.
    shell (there is no nested-subagent spawn tool — do not look for one).
    The prompt carries the read-only rules and the report path; the final
    message remains in the stdout file as a backup.
-2. First fallback — `cursor-agent` (Cursor CLI, model `grok-4.7-high`):
+2. First fallback — `opencode run` with `zai-coding-plan/glm-5.3#max`
+   (the same command shape as the primary, a different model):
 
    ```bash
-   timeout 1200 cursor-agent -p --output-format text --mode ask \
+   timeout 3600 opencode run --auto \
+     -m "zai-coding-plan/glm-5.3#max" \
+     --title "review-<slug>" "$(cat tmp/review/prompt-<slug>.md)" \
+     > tmp/review/<slug>-glm.md 2>&1; echo "exit=$?"
+   ```
+3. Second fallback — `cursor-agent` (Cursor CLI, model `grok-4.7-high`):
+
+   ```bash
+   timeout 3600 cursor-agent -p --output-format text --mode ask \
      --model grok-4.7-high --trust \
      "$(cat tmp/review/prompt-<slug>.md)" </dev/null \
      > tmp/review/<slug>-cursor.md 2>&1; echo "exit=$?"
@@ -150,19 +159,10 @@ creates the directory when writing the prompt.
    without it a headless run hangs; `--model` — the model for a single
    run; `</dev/null` keeps it headless. Do not use `-f`/`--yolo` —
    they force-allow commands and contradict read-only.
-3. Second fallback — `opencode run` with `zai-coding-plan/glm-5.3#max`
-   (the same command shape as the primary, a different model):
-
-   ```bash
-   timeout 1200 opencode run --auto \
-     -m "zai-coding-plan/glm-5.3#max" \
-     --title "review-<slug>" "$(cat tmp/review/prompt-<slug>.md)" \
-     > tmp/review/<slug>-glm.md 2>&1; echo "exit=$?"
-   ```
 4. Third fallback — `kimi` (Kimi Code CLI, model `kimi-code/k3.1-pro`):
 
    ```bash
-   timeout 1200 kimi -m kimi-code/k3.1-pro \
+   timeout 3600 kimi -m kimi-code/k3.1-pro \
      -p "$(cat tmp/review/prompt-<slug>.md)" --output-format text </dev/null \
      > tmp/review/<slug>-kimi.md 2>&1; echo "exit=$?"
    ```
