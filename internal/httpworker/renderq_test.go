@@ -2582,7 +2582,13 @@ func TestRequeueRenderPendingZoneCycle(t *testing.T) {
 			RequeueOptions{Interval: time.Hour, BatchSize: 1, DeprioritizedZones: []string{"xn--p1ai"}})
 	}()
 
-	// We wait for the full drainage: all three flags cleared.
+	// We wait for the full drainage: all three flags cleared AND the debt
+	// counter at 0. The counter is part of the completion, not a later
+	// assertion only: in the fake the flag clear and the counter's decrement
+	// are two separate steps of one clear transaction (two Exec calls, the
+	// D-030 flake — the "clear" journal event wakes the reader right between
+	// them, and winning the pool.mu race lands it inside that gap), so a
+	// flags-only observation races the transaction's second half.
 	deadline := time.After(3 * time.Second)
 	for {
 		pool.mu.Lock()
@@ -2592,13 +2598,15 @@ func TestRequeueRenderPendingZoneCycle(t *testing.T) {
 				left++
 			}
 		}
+		debt := pool.counters["render_pending"]
 		pool.mu.Unlock()
-		if left == 0 {
+		if left == 0 && debt == 0 {
 			break
 		}
 		select {
 		case <-deadline:
-			t.Fatalf("the drain is not complete: %d flags left", left)
+			t.Fatalf("the drain is not complete: %d flags left, the debt counter %d (zero flags with a non-zero counter — a counter desync, runbooks §6)",
+				left, debt)
 		case <-pool.j.done:
 		case <-time.After(time.Millisecond):
 		}
@@ -2617,6 +2625,10 @@ func TestRequeueRenderPendingZoneCycle(t *testing.T) {
 				i, pub[i].msg.ZoneID, pub[i].msg.DomainID, w.zone, w.id)
 		}
 	}
+	// The counter is pinned here again deliberately (the T-175 invariant):
+	// the drain loop's exit already saw 0 — this check keeps the "the flags
+	// and the counter reach 0 together" contract visible at the assertion
+	// level.
 	pool.mu.Lock()
 	debt := pool.counters["render_pending"]
 	pool.mu.Unlock()
