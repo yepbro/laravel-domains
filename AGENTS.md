@@ -22,7 +22,7 @@ todoist-project: 6hx3xR5WF9GpPG7P
 todoist-inbox-section: 6j2h8f4HJJJ59mww
 todoist-drafts-section: 6j2hGJwGW9fgJpMP
 todoist-todo-section: 6j2hGJxpF336Gqvw
-todoist-processing-section: 6j2hGM2X7rpjFr8P
+todoist-processing-section: 6j38CxP3rr4VpVgw
 todoist-done-section: 6j2hGJwXCRgQXGFw
 todoist-archive-section: 6j2hGM2JW7J42HpP
 task-id-project: yepbro/laravel-domains

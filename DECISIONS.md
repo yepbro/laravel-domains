@@ -1531,3 +1531,19 @@ tmp/review/31-t304.md; test/integration/{acceptance_test.go,
 content_test.go, env_test.go, ingest_stage_cleanup_test.go};
 docs/dev-environment.md (acceptance map item 6);
 internal/ingest/{cleanup.go (batchIDBefore), stage.go}.
+
+### D-049 — инфраструктура цикла: пересоздана битая секция PROCESSING доски LaravelDomains
+
+Симптом: update-tasks с sectionId PROCESSING (6j2hGM2X7rpjFr8P) стабильно
+падал «Section not found (HTTP 404, code 478, NOT_FOUND)», при этом
+find-sections/get-overview секцию показывали; move в другие секции того же
+проекта работал. delete-object по этому id — тот же 404: id мёртв на стороне
+записи Todoist (кэш чтения отдавал старое состояние).
+Решение: секция пересоздана (add-sections), новый id 6j38CxP3rr4VpVgw,
+порядок восстановлен reorder-objects (позиция 4); старая запись удалена
+быть не может (404) и в списках больше не проявляется. Машинно-читаемый
+блок AGENTS.md обновлён на новый id (сервисный коммит в master).
+Затронуто: T-305 стартовал с задержкой, карточка прошла через DRAFT при
+диагностике (move в DRAFT работал, обратно не требовалось — сразу ушла
+в новую PROCESSING).
+Ссылки: AGENTS.md (id секций доски); T-305.
