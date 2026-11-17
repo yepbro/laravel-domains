@@ -36,17 +36,29 @@ jobs:
           printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > id_ed25519
           printf '%s\n' "${{ secrets.DEPLOY_SSH_KNOWN_HOSTS }}" > known_hosts.txt
 
-      # Secrets are passed as arguments to the bash script over SSH: GitHub
-      # masks them in the run logs, the script never prints the values
-      # (deploy/telegram-env.sh; the "bash -s" style from deploy.yml).
-      # Script exit codes: 4 — no env file or arguments, 3 — the delivery
-      # enablement line was not found in the journal.
+      # The secrets travel in the ssh stdin stream — two lines ahead of the
+      # script text — and not in any process command line (T-303, 19#P2-3):
+      # /proc/<pid>/cmdline is world-readable on the server (hidepid=0) and
+      # the former `bash -s -- <token> <chat>` exposed the values there for
+      # the script's lifetime. The remote command reads the two lines with
+      # shell builtins (read — no extra process) and exports them for the
+      # script; the environment of the root process
+      # (/proc/<pid>/environ) is root-only. GitHub still masks the values
+      # in the run logs; the values must be single-line (they are).
+      # Green means delivered: the script text is checked BEFORE the pipe
+      # (a failed checkout must not send an empty stream) and the remote
+      # wrapper rejects missing/empty lines (a bare `bash -s` on an empty
+      # stdin would exit 0 — review P3-2).
+      # Exit codes: 4 — no values (the wrapper or the script itself),
+      # 3 — the delivery enablement line was not found in the journal,
+      # 1 — the checkout lacks the script / the upsert failed.
       - name: Deliver secrets and restart monitor
         run: |
           set +e
-          ssh $SSH_OPTS -i id_ed25519 "$SSH_HOST" 'bash -s -- ' \
-            "${{ secrets.TELEGRAM_BOT_TOKEN }}" "${{ secrets.TELEGRAM_CHAT_ID }}" \
-            < deploy/telegram-env.sh
+          script="$(cat deploy/telegram-env.sh)" || exit 1
+          { printf '%s\n' "${{ secrets.TELEGRAM_BOT_TOKEN }}" "${{ secrets.TELEGRAM_CHAT_ID }}"; printf '%s\n' "$script"; } | \
+            ssh $SSH_OPTS -i id_ed25519 "$SSH_HOST" \
+              'read -r _tok && read -r _chat || exit 4; [ -n "$_tok" ] && [ -n "$_chat" ] || exit 4; export TELEGRAM_BOT_TOKEN="$_tok" TELEGRAM_CHAT_ID="$_chat"; unset _tok _chat; exec bash -s'
           rc=$?
           set -e
           echo "rc=$rc" >> "$GITHUB_STEP_SUMMARY"

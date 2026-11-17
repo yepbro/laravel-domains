@@ -147,7 +147,7 @@ schema is not supported. Recovery from an interrupted migration (dirty) —
 | Where | Command |
 |---|---|
 | dev | `make logs SERVICE=<name>`; `dc logs -f --tail=100 <service>` ([`docker.md`](docker.md) §2) |
-| production, services | `journalctl -t crawler-<service> -f` (SyslogIdentifier; the names — `crawler-ingest`, `crawler-scheduler`, `crawler-dns-worker`, `crawler-http-worker`, `crawler-render-worker`, `crawler-analyzer`, `crawler-monitor`, `crawler-web`, `crawler-dashboard`) |
+| production, services | `journalctl -t crawler-<service> -f` (SyslogIdentifier; the names — `crawler-ingest`, `crawler-scheduler`, `crawler-dns-worker`, `crawler-http-worker`, `crawler-render-worker` (template instances — `crawler-render-worker@<port>`, T-303), `crawler-analyzer`, `crawler-monitor`, `crawler-web`, `crawler-dashboard`, `crawler-chromium`/`crawler-chromium2`) |
 | production, OS packages | `journalctl -u postgresql -u redis-server -u unbound` |
 | SMART | `journalctl -t smartd -p warning` ([`disks.md`](disks.md) §6) |
 

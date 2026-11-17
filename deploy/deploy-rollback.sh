@@ -63,8 +63,9 @@ if ! systemctl start crawler.target; then
     echo "the set start after the rollback returned an error — see the unit states below" >&2
 fi
 
-# A light check after the rollback: the units active (the list — like in
-# deploy-healthcheck.sh; the full healthz cycle is not repeated — the next
+# A light check after the rollback: the units active (the list — in sync
+# with deploy-healthcheck.sh (units + healthz ports) and deploy-install.sh,
+# T-303 19#P2-2; the full healthz cycle is not repeated — the next
 # pipeline step does the deep diagnostics). 3 s — the window for the first
 # crash: Type=simple reports active right away, and a broken binary manages
 # to die within it and is visible as activating/failed.

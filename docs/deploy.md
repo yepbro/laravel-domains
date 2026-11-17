@@ -314,7 +314,8 @@ is the second headless-shell instance (CDP `127.0.0.1:9223`, a separate profile
 the second worker of step 3 (the bullet above). It was carried over from the 29.10 experiment
 (the drainage window of T-198), where it was produced as a sed-copy of `crawler-chromium.service`
 (port 9222→9223, user-data-dir, Description; the other directives are as in
-the first one, except `ReadWritePaths` — the fix below); the directives were verified against the server
+the first one, except `ReadWritePaths` — the fix below — and `SyslogIdentifier`
+— its own journal tag `crawler-chromium2`, T-303); the directives were verified against the server
 byte by byte. This is a concrete unit, not an `@.service` template: systemd has long expanded
 specifiers in isolation paths (`ReadWritePaths=`) (since v233;
 Ubuntu 24.04 on the server has systemd 255 — it works), but the pair "port 9223 +
@@ -336,7 +337,7 @@ cp deploy/systemd/crawler-chromium2.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now crawler-chromium2.service
 curl -fsS 127.0.0.1:9223/json/version # the second browser's CDP responds
-journalctl -u crawler-chromium2 -f    # logs: the SyslogIdentifier is shared with the first one; tell them apart by unit
+journalctl -u crawler-chromium2 -f    # logs: its own SyslogIdentifier crawler-chromium2 (until T-303 it shared the first one's tag)
 # worker → second browser: per-instance env (the bullet above). Create the file
 # with this single line; if other overrides appear, append
 # (`>>`) instead of truncating:
@@ -711,9 +712,18 @@ cp -r rules /etc/crawler/rules                    # Laravel rules for analyzer
 Required edits to `config.yaml` relative to the example
 (the full reference — [`configuration.md`](configuration.md)):
 
-- `postgres.dsn`, `redis.addr` — replace the examples with local values
-  (or leave them as is and set the exact ones in `crawler.env` — environment
-  variables win over YAML, docs/configuration.md);
+- `postgres.dsn` — the canonical place for the production secret is
+  `crawler.env` (`CRAWLER_POSTGRES_DSN`): leave the placeholder in
+  `config.yaml` and set the real DSN in the env file (0640 root:crawler,
+  never in git — the same recommendation as
+  `deploy/systemd/crawler.env.example`); environment variables win over
+  YAML (docs/configuration.md). Keeping the DSN in `config.yaml` works too
+  (the file sits inside the 0750 root:crawler `/etc/crawler`) — pick one
+  place, not both. Both configurations are fully supported end to end: the
+  post-deploy healthcheck passes the EnvironmentFile keys to `crawlerctl`
+  (T-303), so "DSN only in env" does not false-rollback a deploy;
+- `redis.addr` — likewise: either in `config.yaml` or as
+  `CRAWLER_REDIS_ADDR` in `crawler.env` (one place);
 - `postgres.pool_size` — per service, while the spec §6.3 budget (20–50) is
   the total across all: the example value (5) gives 8 × 5 + dashboard (2,
   set by its unit — the ninth service did not fit 5 under the cap;
@@ -900,6 +910,16 @@ curl -fsS 127.0.0.1:9102/healthz       # readiness (DB pool); /metrics — same 
 systemctl kill -s HUP crawler-analyzer  # reload Laravel rules without a restart
 /opt/crawler/bin/crawlerctl status      # CLI: status, search, control (spec 4.1)
 ```
+
+- **`crawlerctl` outside the units** does not see the EnvironmentFile: when
+  the DSN lives only in `crawler.env` (the recommendation of §4.5), export
+  it in the shell first —
+  `export CRAWLER_POSTGRES_DSN="$(sed -n 's/^CRAWLER_POSTGRES_DSN=//p' /etc/crawler/crawler.env | tail -n 1)"`
+  (likewise `CRAWLER_REDIS_ADDR`; if the value is quoted in the file — the
+  systemd EnvironmentFile grammar allows it — strip the quotes); the deploy
+  healthcheck does the same for its `crawlerctl status` call (T-303). The
+  file is not sourced with `.`: a systemd EnvironmentFile may contain
+  values with shell metacharacters (the example's User-Agent).
 
 - **Restarts**: `Restart=on-failure`, `RestartSec=5s`, the limits
   `StartLimitIntervalSec=300` / `StartLimitBurst=10` — after 10 failed

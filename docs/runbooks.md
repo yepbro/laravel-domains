@@ -368,7 +368,8 @@ Accumulated entries are triaged manually, in this order:
 2. **Requeue criterion**: a `q:render` entry with the reason "attempt
    limit exhausted" and page timeouts in the render-worker logs around
    the time of death (`journalctl -t crawler-render-worker --since … |
-   grep "page timeout"`) — the page gets another chance: after T-148
+   grep "page timeout"`; the template instances log under their own tags —
+   `-t 'crawler-render-worker@*'`, T-303) — the page gets another chance: after T-148
    the cost of a repeated tarpit is bounded (`render.timeout_attempts` ×
    25 s of slot time per task); afterwards the entry finalizes itself
    without render. The same after T-159 for cert hosts (in the logs —

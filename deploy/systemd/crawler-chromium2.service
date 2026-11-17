@@ -70,7 +70,10 @@ StartLimitBurst=10
 Type=simple
 User=crawler-chromium
 Group=crawler
-SyslogIdentifier=crawler-chromium
+# Distinct from the first instance's tag (T-303, 19#P3-4): the sed copy
+# kept crawler-chromium, making the two browsers' logs indistinguishable
+# in journald.
+SyslogIdentifier=crawler-chromium2
 ExecStart=/opt/crawler/chromium/headless-shell --remote-debugging-address=127.0.0.1 --remote-debugging-port=9223 --no-sandbox --disable-gpu --user-data-dir=/var/lib/crawler/chromium2/profile
 Restart=on-failure
 RestartSec=5s

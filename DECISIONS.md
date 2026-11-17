@@ -1397,3 +1397,83 @@ T-310.
 render_test.go}; internal/status/status_test.go; internal/idn/{idn.go,
 corpus_test.go}; internal/web/{api.go,api_test.go};
 cmd/crawlerctl/check.go; docs/services.md.
+
+### D-047 — T-303: deploy-фиксы стадии 19 — окружение crawlerctl в healthcheck (без source'инга crawler.env), monitor в списке проверок, секреты Telegram вне argv, trap'ы до stop
+Дата: 2026-11-17.
+Проблема: четыре находки P2 (+P3) стадии 19-deploy-infra bulk-ревью.
+(1) 19#P2-1: healthcheck вызывает `crawlerctl status` из ssh-сессии без
+EnvironmentFile — при конфигурации «DSN только в crawler.env» (что
+предписывает crawler.env.example) CLI не подключается к БД → rc=1 →
+ложный rollback каждого деплоя. (2) 19#P2-2: crawler-monitor:9100
+отсутствовал в списке юнитов/портов healthcheck (заявлен в заголовке,
+есть в install/rollback) — краш-луп monitor'а проходит post-deploy
+проверку. (3) 19#P2-3: токен/chat-id приезжали в telegram-env.sh
+аргументами процесса, токен лежал в URL curl — /proc/<pid>/cmdline
+читаем всеми при hidepid=0. (4) 19#P2-4: trap EXIT/INT/TERM/HUP в
+deploy-install.sh установлен ПОСЛЕ systemctl stop — обрыв ssh в окне
+остановки (~30 с) оставлял сет остановленным без автостарта.
+Решение: (1) healthcheck НЕ source'ит crawler.env: это systemd
+EnvironmentFile, значения могут содержать shell-метасимволы
+(CRAWLER_HTTP_USER_AGENT в примере — пробелы, скобки, «;») — `.` умер бы
+на синтаксической ошибке под set -e (усугубил бы баг). Вместо этого два
+нужных CLI ключа (CRAWLER_POSTGRES_DSN, CRAWLER_REDIS_ADDR) извлекаются
+sed'ом целыми строками и export'ятся в окружение (не в argv — cmdline
+world-readable, environ root-only); отсутствие файла/ключа = прежнее
+поведение (значение из YAML). Конфликт рекомендаций docs/deploy.md vs
+crawler.env.example о размещении DSN разрешён в пользу crawler.env
+(0640 root:crawler, вне git) и зафиксирован в docs/deploy.md §4.5 +
+примечание о ручном crawlerctl в §5. (2) crawler-monitor:9100 добавлен
+в список healthcheck (monitor поднимает /healthz сервисным фреймворком —
+cmd/monitor/main.go); общий файл списка юнитов НЕ заведён: скрипты
+едут на сервер через ssh-stdin (`bash -s < script`), репозитория на
+сервере нет — source невозможен; вместо этого перекрёстные
+комментарии-синхронизации в трёх скриптах. (3) telegram-env.sh берёт
+значения из переменных окружения TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID;
+ops-telegram-env.yml передаёт их двумя строками в stdin-потоке ssh
+перед текстом скрипта, удалённая обёртка `read -r …; export …; exec
+bash -s` вычитывает их builtins'ами; по итогам ревью upsert переписан с
+sed на awk с ENVIRON (значение шло в argv sed), payload в
+telegram-notify.sh собирается jq с env-builtin (chat-id шёл в argv jq),
+запрос уходит в curl через `--config -` (stdin, printf-builtin; в
+синтаксисе конфига экранируются " и \) — итог: значения не проходят ни
+через один argv ни на одном шаге; обёртка отвергает пустые строки, а
+скрипт проверяется до пайпа — пустой поток не может завершиться
+зелёным (ревью P3-2); заодно починен P3-1 (`echo … >&2` было отдельной
+командой `>&2`). env_line в healthcheck срезает одну пару кавычек
+значения — грамматика systemd EnvironmentFile их допускает и
+отбрасывает (ревью P3-1).
+(4) trap'ы переставлены до stop: обрыв ssh в окне остановки и failure
+stop'а теперь идут через on_exit (fresh=0 → рестарт тех же бинарников),
+код stop-failure меняется с 3 на 7/8 (3 более не возвращается, легенда
+в шапке install и docs/ci-cd.md обновлены; маппинг 3 в deploy.yml
+оставлен — мёртвый, но безвредный путь). P3-2/P3-4:
+SyslogIdentifier=crawler-render-worker@%i и crawler-chromium2. P3-3
+(асимметрия общего бюджета healthz) — задокументирована в комментарии
+healthcheck: персональные бюджеты 9×300 с превысили бы таймаут job'а
+деплоя (20 мин) и превратили бы зависший сервис в «unknown» вместо
+rc=1→rollback; принято осознанно.
+Проверки: bash -n всех правленых скриптов; shellcheck в системе нет;
+функциональные прогоны с PATH-стабами: healthcheck-извлечение ключей на
+реальном crawler.env.example (+закавыченные значения), доставка секретов
+через stdin-обёртку (эквивалент ssh-команды), telegram-notify curl
+--config - против локального HTTP-сервера (пэйлоад с
+кавычками/бэкслэшами/эмодзи), deploy-install сценарии
+stop-fail/HUP-в-окне-остановки → rc 7/8 и рестарт сета; контрольный
+прогон старой версии под HUP — rc=129, сет остаётся остановленным
+(«красное» состояние до фикса). Go не трогался — make test не
+запускался (deploy-only задача).
+Ревью: один раунд, deepseek (opencode-go/deepseek-v4.1-flash, отчёт
+tmp/review/30-t303.md): approve-with-findings — P2-1 (остаточные argv в
+sed/jq — исправлено: awk ENVIRON + jq env), P3-1 (кавычки грамматики
+EnvironmentFile — исправлено), P3-2 (ложный зелёный ops-прогона на
+пустом потоке — исправлено), P3-3 (устаревшие строки о SyslogIdentifier
+в docs/deploy.md — исправлено, плюс operations.md/runbooks.md), P3-4
+(комментарий про код 3 в deploy.yml — исправлен), P3-5 (комментарий о
+тестируемости telegram-env.sh — исправлен). Отклонённых находок нет.
+Ссылки: T-303; bulk-ревью 19#P2-1..P2-4, 19#P3-1..P3-4
+(tmp/review/stage-report.md); ревью раунда 1 — tmp/review/30-t303.md;
+deploy/{deploy-healthcheck.sh, deploy-install.sh, deploy-rollback.sh,
+telegram-env.sh, telegram-notify.sh}; deploy/systemd/{crawler-render-
+worker@.service, crawler-chromium2.service};
+.github/workflows/{ops-telegram-env.yml, deploy.yml};
+docs/{deploy.md, ci-cd.md, operations.md, runbooks.md}.

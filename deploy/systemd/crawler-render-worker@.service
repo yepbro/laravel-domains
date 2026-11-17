@@ -63,6 +63,11 @@ EnvironmentFile=-/etc/crawler/render-worker@%i.env
 # unit header covers the conflict with crawler.env).
 Environment=METRICS_ADDR=127.0.0.1:%i
 WorkingDirectory=/var/lib/crawler
+# The journal tag promised by the header (`journalctl -t
+# crawler-render-worker@<port>`, T-303 19#P3-2): without it journald tags
+# the process by the binary name (render-worker) — the instances and the
+# first unit would be indistinguishable in the journal.
+SyslogIdentifier=crawler-render-worker@%i
 ExecStart=/opt/crawler/bin/render-worker
 Restart=on-failure
 RestartSec=5s

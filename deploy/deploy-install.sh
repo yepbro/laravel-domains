@@ -16,15 +16,19 @@
 #       trap rollback to bin.prev has run, the set is restarted and active
 #       (2 is returned both by bash on a parse error and by tar on a broken
 #       archive — in both real cases the rollback has already run via the trap);
-#   3 — the set did not stop (before the trap: bin untouched, but the unit
-#       states need checking);
+#   3 — not returned since T-303 (formerly: "the set did not stop" — the
+#       traps were installed after the stop, so the failure bypassed them);
+#       a stop failure now goes through the trap: on_exit (fresh=0) brings
+#       the partially stopped set back up on the same binaries and the code
+#       becomes 7 or 8;
 #   4 — no archive (before the trap: the server untouched, no rollback needed);
 #   5 — a failure inside the installation, the rollback to bin.prev has run,
 #       but the set did not come up / came up only partly — an operator is needed;
 #   6 — a failure inside the installation, the rollback itself failed — the
 #       state needs an operator;
-#   7 — a failure while preparing the backup: bin untouched (the pre-deploy
-#       version is running), no rollback needed, the set restarted;
+#   7 — a failure before the fresh backup was built (a stop failure, a
+#       backup copy failure): bin untouched (the pre-deploy version is
+#       running), no rollback needed, the set restarted;
 #   8 — the same, but starting the set failed — the state needs an operator.
 # 255 — the ssh transport: the server state is unknown.
 set -euo pipefail
@@ -71,6 +75,8 @@ rollback() {
     fi
     # A light check (like deploy-rollback.sh): Type=simple reports active
     # right away; a broken binary shows within 3 s as activating/failed.
+    # The unit list — keep in sync with deploy-healthcheck.sh (units +
+    # healthz ports) and deploy-rollback.sh (T-303, 19#P2-2).
     sleep 3
     degraded=0
     for u in crawler-chromium crawler-ingest crawler-scheduler crawler-dns-worker \
@@ -125,13 +131,20 @@ on_exit() {
 
 [ -f "$ARCHIVE" ] || { echo "ERROR: no archive $ARCHIVE" >&2; exit 4; }
 
-# Before the trap (the code shows no rollback ran and none was needed):
-# a stop failure = bin untouched, but the set may have stopped only partly.
-systemctl stop crawler.target || { echo "ERROR: failed to stop crawler.target" >&2; exit 3; }
+# The traps are installed BEFORE the stop (T-303, 19#P2-4): the stop takes
+# up to ~30 s (the units' TimeoutStopSec) and an ssh drop inside that
+# window used to kill the script with SIGHUP while the EXIT trap was not
+# there yet — the set stayed stopped with no auto-start. With the trap
+# already installed, on_exit runs (fresh=0: bin is untouched) and restarts
+# the set on the same binaries. A stop failure goes through the trap the
+# same way: the partially stopped set is brought back up and the exit code
+# becomes 7/8 instead of the former 3 (see the header).
 trap on_exit EXIT
 # Exit on a signal (ssh dropped on a run cancel/timeout, a manual interrupt):
 # without this $? is 0 in the EXIT handler and the rollback never starts.
 trap 'exit 130' INT TERM HUP
+
+systemctl stop crawler.target || { echo "ERROR: failed to stop crawler.target" >&2; exit 3; }
 
 # A fresh backup via a temporary directory and mv: the old bin.prev lives
 # until the new one is copied in full (a cp failure never leaves the server

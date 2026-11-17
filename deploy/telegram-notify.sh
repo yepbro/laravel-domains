@@ -18,7 +18,10 @@
 # EnvironmentFile) — a regular skip with the reason in the log. The
 # TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID values are not printed: the token
 # never reaches the output (curl without -v, the API response with chat.id
-# is discarded), xtrace is not enabled.
+# is discarded), xtrace is not enabled; since T-303 it does not appear in
+# any process command line either — the URL and the payload travel to curl
+# through a config on stdin (--config -), because /proc/<pid>/cmdline is
+# world-readable at hidepid=0 for the up to 30 s of the request.
 #
 # Usage (CI/CD):
 #   deploy/telegram-notify.sh --status ok|fail --event "<event type>" \
@@ -184,21 +187,28 @@ if [ "$dry_run" -eq 1 ]; then
 fi
 
 # The production payload: the real chat id from the secret (it never reaches
-# the output).
-payload="$(jq -cn --arg chat_id "$TELEGRAM_CHAT_ID" --arg text "$text" \
-    '{chat_id: $chat_id, text: $text}')"
+# the output — nor any argv: jq reads it from its environment via the env
+# builtin, like the value stays out of sed/awk elsewhere — T-303, review
+# P2-1). The text travels as --arg: it is the message body, not a secret.
+payload="$(jq -cn --arg text "$text" '{chat_id: env.TELEGRAM_CHAT_ID, text: $text}')"
 
 # The API response with chat.id (a secret) is not printed; on an error only
 # the error_code and description from the body are shown (chat.id is not part
-# of error responses). curl without -v, so the token from the URL never
-# appears in its diagnostics.
+# of error responses). The request itself carries no secret in argv (T-303,
+# 19#P2-3): the URL (with the token) and the payload go to curl through a
+# config on stdin (--config -; printf is a shell builtin, so the values pass
+# through no process arguments on the way). In the curl config syntax a
+# quoted string escapes " and \ — the payload needs both escaped (jq -c
+# keeps newlines escaped, the value stays a single line); the token alphabet
+# (digits, colon, letters, _ -) has no escapable characters.
 resp="$(mktemp)"
 trap 'rm -f "$resp"' EXIT
-if ! http_code="$(curl -sS -o "$resp" -w '%{http_code}' \
-        --connect-timeout 10 --max-time 30 \
-        -H 'Content-Type: application/json' \
-        -d "$payload" \
-        "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage")"; then
+cfg_payload="${payload//\\/\\\\}"
+cfg_payload="${cfg_payload//\"/\\\"}"
+if ! http_code="$(printf 'url = "https://api.telegram.org/bot%s/sendMessage"\nheader = "Content-Type: application/json"\ndata = "%s"\n' \
+        "$TELEGRAM_BOT_TOKEN" "$cfg_payload" | \
+        curl -sS -o "$resp" -w '%{http_code}' \
+        --connect-timeout 10 --max-time 30 --config -)"; then
     # A transport error: curl itself prints 000 via -w, and its error
     # message has already gone to stderr.
     [ -n "$http_code" ] || http_code=000

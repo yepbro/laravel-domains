@@ -224,14 +224,16 @@ jobs:
           elif pick "${{ steps.upload.outcome }}" "Upload binaries (scp)"; then :
           elif pick "${{ steps.install.outcome }}" "Install on the server"; then
             # deploy-install.sh codes (T-137): 4 — no archive and 7 — a
-            # backup preparation failure (bin untouched, the set restarted)
-            # → no rollback line; 3 — the set did not stop, 255 — the ssh
-            # transport, 8 — the stopped set was not brought up → the
+            # stop failure or a backup preparation failure (bin untouched,
+            # the set restarted via the trap) → no rollback line; 255 — the
+            # ssh transport, 8 — the stopped set was not brought up → the
             # state needs checking; 5 — the trap rollback performed but
             # the set is partial; 6 — the trap rollback failed; others
             # (including 2: produced both by bash on a parse failure and
             # by tar on a broken archive) — a failure inside the install:
-            # the trap rolled back to bin.prev.
+            # the trap rolled back to bin.prev. 3 — not returned since
+            # T-303 (the traps now cover the stop too); the branch below
+            # stays as a defensive dead path.
             if [ "${{ steps.install.outcome }}" = cancelled ]; then
               rollback=unknown
             else

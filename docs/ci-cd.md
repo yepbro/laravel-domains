@@ -44,12 +44,12 @@ Principles:
 - **rollback is automatic at any step after the set is stopped** (spec
   §10.4, T-137): the previous binaries remain in `/opt/crawler/bin.prev`; an
   install error after a successful stop restores them and restarts the set
-  (trap in `deploy-install.sh`; if stopping the set itself fails — the
-  binaries are untouched, but the unit state needs checking — the
-  notification is "unknown"; a missing archive — the server is untouched; a
-  backup preparation failure — the binaries are untouched, the set was
-  stopped and restarted, and on a start failure the notification is
-  "unknown"); a healthcheck failure — a separate pipeline rollback step
+  (trap in `deploy-install.sh`; since T-303 the traps are installed before
+  the stop — a stop failure and an ssh drop inside the stop window also go
+  through the trap: the binaries are untouched, the partially stopped set is
+  brought back up on the same version, and only a start failure of that
+  restart makes the notification "unknown"; a missing archive — the server
+  is untouched); a healthcheck failure — a separate pipeline rollback step
   (`deploy/deploy-rollback.sh`: copy the backup → stop → atomic replacement
   → start with a start-limit reset → a light unit check); before
   diagnostics — restoring a working version matters more than collecting
@@ -108,9 +108,10 @@ build step) and the rollback fact for deploys, the offending commit (short
 SHA + the first subject line; in PR runs — the head commit of the PR
 branch), and a link to the run. The rollback fact reflects the actual step
 outcomes: an install failure before the set is stopped — no rollback line
-(the archive is missing — the server is untouched; a backup preparation
-failure — the binaries are untouched, the set was restarted) or "unknown,
-check the server" (the set did not stop; the stopped set did not come up);
+(the archive is missing — the server is untouched; a stop failure or a
+backup preparation failure — the binaries are untouched, the set was
+restarted) or "unknown, check the server" (the stopped set did not come
+back up);
 a failure inside the install — by the trap rollback result: "completed to
 the previous version (bin.prev)", "completed, but not all units are active
 — operator required" or "failed — the server state requires operator
