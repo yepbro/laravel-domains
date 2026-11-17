@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"errors"
 	"log/slog"
+	"math"
 	"strings"
 	"testing"
 )
@@ -337,13 +338,6 @@ func TestNewValidator(t *testing.T) {
 			t.Errorf("errZoneNotAllowed is expected, got %v", err)
 		}
 	})
-	t.Run("a threshold outside the range", func(t *testing.T) {
-		for _, ratio := range []float64{-0.1, 1.0001} {
-			if _, err := NewValidator(ValidatorOptions{Zone: "com", MaxErrorRatio: ratio}); err == nil {
-				t.Errorf("the threshold %v must be rejected", ratio)
-			}
-		}
-	})
 	t.Run("without a logger", func(t *testing.T) {
 		v, err := NewValidator(ValidatorOptions{Zone: "com"})
 		if err != nil {
@@ -353,6 +347,75 @@ func TestNewValidator(t *testing.T) {
 			t.Fatal("a line not from the zone must be rejected without a logger too")
 		}
 	})
+}
+
+// TestNewValidatorMaxErrorRatio — the threshold corridor table: the
+// guard must be NaN/±Inf-proof (the config.floatInRange form, T-298 /
+// D-042; the second line of defense behind config.Validate — the
+// production path is closed there, a direct NewValidator call is not).
+// The old `ratio < 0 || ratio > 1` form was all-false for NaN and let
+// it through; a NaN threshold silently disables the file verdict (see
+// TestOverErrorRatioNaN).
+func TestNewValidatorMaxErrorRatio(t *testing.T) {
+	tests := []struct {
+		name    string
+		ratio   float64
+		want    float64 // the expected stored threshold (0 — an error is expected)
+		wantErr bool
+	}{
+		// 0 — the DefaultMaxErrorRatio default (the "disabled" meaning of
+		// the field); -0.0 compares equal to 0 and takes the default too.
+		{"zero — the default", 0, DefaultMaxErrorRatio, false},
+		{"negative zero — the default", math.Copysign(0, -1), DefaultMaxErrorRatio, false},
+		// The corridor is (0, 1]: a tiny positive threshold is legal (an
+		// strict one-line junk tolerance), one is the upper boundary.
+		{"a tiny positive", 1e-9, 1e-9, false},
+		{"one — the upper boundary", 1, 1, false},
+		// Outside the corridor.
+		{"negative", -0.1, 0, true},
+		{"above one", 1.0001, 0, true},
+		// Non-finite: NaN is insensitive to comparisons — the plain range
+		// form lets it through; ±Inf are caught by the bounds, but the
+		// explicit math.IsInf cutoff documents them (the config.floatInRange
+		// form).
+		{"NaN", math.NaN(), 0, true},
+		{"+Inf", math.Inf(1), 0, true},
+		{"-Inf", math.Inf(-1), 0, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			v, err := NewValidator(ValidatorOptions{Zone: "com", MaxErrorRatio: tc.ratio})
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("the threshold %v must be rejected", tc.ratio)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("NewValidator: %v", err)
+			}
+			if v.ratio != tc.want {
+				t.Errorf("the stored threshold = %v, want %v", v.ratio, tc.want)
+			}
+		})
+	}
+}
+
+// TestOverErrorRatioNaN — why the constructor guard rejects NaN: a NaN
+// threshold is never exceeded (every comparison with NaN is false), the
+// Failed verdict is silently disabled — a file with a 100% rejected
+// share passes as valid. overErrorRatio itself stays comparison-based
+// (the T-287 single decision function); keeping NaN out is the guard's
+// job (TestNewValidatorMaxErrorRatio), this test pins the hazard.
+func TestOverErrorRatioNaN(t *testing.T) {
+	if overErrorRatio(math.NaN(), 100, 100, 0) {
+		t.Fatal("a NaN threshold disables the verdict: a 100% rejected share must not be above it")
+	}
+	// The working corridor for contrast: the same share with a finite
+	// threshold fails the file (strictly above, spec 5.1).
+	if !overErrorRatio(0.99, 100, 100, 0) {
+		t.Fatal("a 100% rejected share must be above the 0.99 threshold")
+	}
 }
 
 // TestValidatorZoneless — a zone-less file (Zone == ""): line zones are

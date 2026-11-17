@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -1714,5 +1715,25 @@ func TestNewPipelineValidation(t *testing.T) {
 	if p.opts.BatchSize != DefaultBatchSize || p.opts.MaxErrorRatio != DefaultMaxErrorRatio {
 		t.Errorf("the defaults = %d/%v, want %d/%v",
 			p.opts.BatchSize, p.opts.MaxErrorRatio, DefaultBatchSize, DefaultMaxErrorRatio)
+	}
+
+	// The error ratio corridor (T-321): the same (0, 1] guard as
+	// NewValidator — without it a bad threshold surfaced only per file in
+	// streamStage → NewValidator and was classified as an infrastructure
+	// failure (OutcomeLeft, an eternal reprocess loop) instead of a
+	// constructor error. NaN is caught here too: a plain range check is
+	// NaN-blind — hence the config.floatInRange form (T-298, D-042).
+	for _, ratio := range []float64{-0.1, 1.0001, math.NaN(), math.Inf(1), math.Inf(-1)} {
+		if _, err := NewPipeline(newFakeZoneStore(), newFakeFileStore(), &pipePool{},
+			PipelineOptions{Dir: "/tmp", MaxErrorRatio: ratio}); err == nil {
+			t.Errorf("the threshold %v must be rejected", ratio)
+		}
+	}
+	// A NaN threshold was the worst case before the guard: files with any
+	// rejected share passed as valid (overErrorRatio comparisons with NaN
+	// are false) — the verdict was silently off.
+	if _, err := NewPipeline(newFakeZoneStore(), newFakeFileStore(), &pipePool{},
+		PipelineOptions{Dir: "/tmp", MaxErrorRatio: 1}); err != nil {
+		t.Errorf("the threshold 1 (the corridor boundary) must be accepted: %v", err)
 	}
 }

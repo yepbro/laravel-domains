@@ -45,6 +45,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"strings"
 
 	"crawler/internal/idn"
@@ -151,7 +152,10 @@ type ValidatorOptions struct {
 	// MaxErrorRatio — the threshold for the share of rejected lines:
 	// above it the file as a whole is considered invalid
 	// (ingest.max_error_ratio). 0 — the DefaultMaxErrorRatio default;
-	// (0, 1] is allowed, as in config.Validate.
+	// (0, 1] is allowed, as in config.Validate — including the explicit
+	// NaN/±Inf cutoff (floatInRange below): a NaN threshold would
+	// silently disable the file verdict (every comparison with NaN in
+	// overErrorRatio is false).
 	MaxErrorRatio float64
 	// RejectLog — the rejected logger (NewRejectedLogger); nil — do not
 	// write records (counters are kept anyway).
@@ -203,6 +207,20 @@ func checkZonePath(zone string, allowed []string) error {
 	return fmt.Errorf("the zone %s: %w", zone, errZoneNotAllowed)
 }
 
+// floatInRange — the (lo, hi] corridor for the float64 options, with
+// an explicit NaN/±Inf cutoff: a local mirror of config.floatInRange
+// (T-298, D-042). A copy, not an import: ingest deliberately does not
+// depend on config (DefaultMaxErrorRatio duplicates config.Default the
+// same way — the package works without configuration). NaN is
+// insensitive to comparisons: the equivalent-looking `x < lo || x > hi`
+// guard form is all-false for NaN and lets it through, and a NaN
+// threshold silently disables the protection behind it (overErrorRatio
+// is false for any share) — the second line of defense behind
+// config.Validate must not diverge from it (T-321).
+func floatInRange(x, lo, hi float64) bool {
+	return !math.IsNaN(x) && !math.IsInf(x, 0) && x > lo && x <= hi
+}
+
 // NewValidator prepares file validation: the zone is normalized by the
 // same pipeline as the lines (spec 5.2 item 6: "the zone is normalized
 // the same way too"), so a zone directory in unicode and punycode
@@ -226,7 +244,11 @@ func NewValidator(opts ValidatorOptions) (*Validator, error) {
 	if ratio == 0 {
 		ratio = DefaultMaxErrorRatio
 	}
-	if ratio < 0 || ratio > 1 {
+	// The corridor is checked in the positive form (hitting the range,
+	// the floatInRange model): for NaN the old `ratio < 0 || ratio > 1`
+	// was all-false — a NaN threshold passed and silently disabled the
+	// Failed verdict (the config.Validate second line, T-321).
+	if !floatInRange(ratio, 0, 1) {
 		return nil, fmt.Errorf("ingest: the error ratio threshold %v is outside (0, 1]", ratio)
 	}
 	log := opts.RejectLog

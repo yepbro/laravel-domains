@@ -70,9 +70,12 @@ type PipelineOptions struct {
 	// BatchSize — rows per COPY chunk into staging (ingest.batch_size).
 	BatchSize int
 	// MaxErrorRatio — the threshold for the share of rejected file lines
-	// (ingest.max_error_ratio); 0 — DefaultMaxErrorRatio. For archives
-	// it acts on a member (T-133): a member above the threshold fails
-	// the archive as a whole.
+	// (ingest.max_error_ratio); 0 — DefaultMaxErrorRatio. (0, 1] is
+	// allowed, as in config.Validate — the same NaN/±Inf-proof guard as
+	// NewValidator (floatInRange): a bad value is a constructor error,
+	// not a per-file OutcomeLeft loop (T-321). For archives it acts on a
+	// member (T-133): a member above the threshold fails the archive as
+	// a whole.
 	MaxErrorRatio float64
 	// ArchiveMaxUncompressed — the cap on the total uncompressed size of
 	// archive members (ingest.archive_max_uncompressed, T-133); 0 — the default.
@@ -124,6 +127,15 @@ func NewPipeline(zones ZoneStore, files FileStore, pool ApplyDB, opts PipelineOp
 	}
 	if opts.MaxErrorRatio == 0 {
 		opts.MaxErrorRatio = DefaultMaxErrorRatio
+	}
+	// The NewValidator corridor, checked up front (the second line of
+	// defense, T-321): without it a bad threshold surfaced only per file
+	// in streamStage → NewValidator and was classified as an
+	// infrastructure failure (OutcomeLeft — the file stays and is
+	// reprocessed forever); a NaN one did not surface at all — the
+	// Failed verdict was silently off (NaN-blind comparisons).
+	if !floatInRange(opts.MaxErrorRatio, 0, 1) {
+		return nil, fmt.Errorf("ingest: pipeline: the error ratio threshold %v is outside (0, 1]", opts.MaxErrorRatio)
 	}
 	if opts.ArchiveMaxUncompressed <= 0 {
 		opts.ArchiveMaxUncompressed = DefaultArchiveMaxUncompressed

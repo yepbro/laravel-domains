@@ -1895,3 +1895,84 @@ cmd/crawlerctl/zonessync.go (zonesDeactivateCandidatesSQL,
 zonesDeactivateGuardShare, zonesSyncOpts, zonesSyncRun),
 cmd/crawlerctl/zonessync_test.go, cmd/crawlerctl/zones.go (справка),
 docs/dev-environment.md, docs/runbooks.md.
+
+### D-061 — T-321: NaN-слепой guard MaxErrorRatio в ingest — инвертирован в позитивную форму floatInRange (локальное зеркало config), тот же коридор добавлен в NewPipeline
+Дата: 2026-11-17.
+Проблема: находка ревью T-298 P3-2 (D-042, отклонённая тогда как вне
+зоны T-298 и вынесенная в INBOX). internal/ingest/validate.go:229 —
+guard `ratio < 0 || ratio > 1` NaN-слеп: обе операции сравнения с NaN
+дают false, NaN проходил в валидатор; overErrorRatio с NaN-порогом
+всегда false → вердикт Failed молча выключался (файл со 100% брака
+проходил как валидный). Комментарий поля обещал «(0, 1] is allowed,
+as in config.Validate» — расхождение второй линии обороны с
+config.Validate (главный фикс T-298). Прод-путь закрыт config.Validate
+(config.floatInRange, D-042); достижимость — прямой вызов
+NewValidator/NewPipeline (тесты, будущие вызывающие). NewPipeline
+(pipeline.go) диапазон вообще не проверял, только 0 → default: плохое
+конечное значение всплывало только per-file в streamStage →
+NewValidator и классифицировалось как инфраструктурная ошибка
+(OutcomeLeft — вечный ретрай файла), NaN не всплывало вовсе.
+Решение: (1) локальный хелпер floatInRange(x, lo, hi) в
+internal/ingest/validate.go — зеркало config.floatInRange (T-298,
+D-042): позитивная форма коридора (lo, hi] с явным отсечением
+`!math.IsNaN && !math.IsInf && x > lo && x <= hi`, а не буквальный
+инвертированный диапазон (обоснование формы — D-042: для NaN/±Inf
+эквивалентно, но читается как коридор). Локальная копия, а не экспорт
+из config: ingest сознательно не зависит от config
+(DefaultMaxErrorRatio дублирует config.Default по той же причине —
+пакет работает без конфигурации); тянуть тяжёлый пакет конфига ради
+однострочного предиката — несоразмерная связность; прецеденты
+локальных NaN-проверок — dnsclient/fallback.go, rules/rules.go.
+(2) guard NewValidator инвертирован: `!floatInRange(ratio, 0, 1)` —
+NaN/±Inf/вне коридора отклоняются конструктором (замыкает T-298 P3-2).
+(3) тот же коридор добавлен в NewPipeline после 0 → default: плохое
+значение — ошибка конструктора, а не вечный OutcomeLeft-ретрай;
+NaN-сценарий (тихо выключенный вердикт) исключён по обеим точкам входа.
+(4) согласованные стражи `<= 0` в content/disk.go:128, rules/score.go:74,
+monitor/alerts.go:971 НЕ тронуты — вне объёма карточки (те же «вторые
+линии», конфиг их прикрывает; у rules своя NaN-проверка уже есть —
+rules.go:187). Тесты (BDD, красные до фикса — NaN в validate_test,
+все пять значений в pipeline_test): TestNewValidatorMaxErrorRatio —
+таблица guard'а (0 и -0.0 → дефолт; 1e-9 и 1 — границы коридора (0, 1];
+-0.1, 1.0001, NaN, +Inf, -Inf — отказ, точное сохранённое значение);
+TestOverErrorRatioNaN — документирует, почему guard обязателен:
+overErrorRatio(NaN, …) false при 100% брака (первый прямой тест
+overErrorRatio — функции T-287); TestNewPipelineValidation дополнен
+пятью отказными значениями + принятием границы 1. Документация:
+инвариант в docs/configuration.md (строки 233, 1911, 1922-1929 —
+коридор и NaN-отсечение описаны для config) не менялся — поведение
+второй линии выровнено с уже задокументированным; комментарий поля
+ValidatorOptions.MaxErrorRatio дополнен упоминанием NaN-отсечки.
+Проверки: make test, make lint, make fmt — зелёные (ingest не в
+RACE_PKGS).
+Ревью фикса (tmp/review/39-t321.md): один раунд, первичный ревьюер
+deepseek-v4.1-flash (fallback-цепочка не понадобилась). 0×P0/P1/P2,
+3×P3, вердикт «приемлем»; ревьюер воспроизвёл проверки (make test,
+make lint, gofmt — зелёные) и подтвердил по коду эквивалентность
+инверсии для конечных значений, классификацию OutcomeLeft старого
+поведения и отсутствие новых ошибок у вызывающих (cmd/ingest/main.go —
+config провалидирован; в репозитории значений вне (0, 1] нет).
+Диспозиции: P3-1 (двусмысленная скобка в комментарии pipeline_test —
+читалось, будто NaN-слепа сама форма config.floatInRange) — принят:
+формулировка переформулирована по предложению ревьюера («a plain range
+check is NaN-blind — hence the config.floatInRange form»), правка
+коммитована amend'ом; P3-2 (риск дрейфа двух копий floatInRange) —
+принят к сведению без правки: дублирование сознательное (зафиксировано
+в этой записи D-061 и в комментарии хелпера «a local mirror of
+config.floatInRange»), ревьюер сам заключил «ничего делать не нужно»;
+условие — синхронизировать копию при следующей правке
+config.floatInRange; P3-3 (TestOverErrorRatioNaN пинует
+недостижимое после guard'а состояние и заблокирует будущее ужесточение
+overErrorRatio до NaN→true) — принят к сведению без правки: пин
+сознательный (документация hazard'а — причина существования guard'а),
+ревьюер классифицировал как «наблюдение, не находка».
+Ссылки: T-321; источник — ревью T-298 P3-2 (tmp/review/29-t298.md,
+D-042); образец формы — config.floatInRange (internal/config/config.go,
+T-298/T-233); internal/ingest/validate.go (floatInRange, NewValidator,
+ValidatorOptions.MaxErrorRatio), internal/ingest/pipeline.go
+(NewPipeline, PipelineOptions.MaxErrorRatio);
+internal/ingest/validate_test.go (TestNewValidatorMaxErrorRatio,
+TestOverErrorRatioNaN), internal/ingest/pipeline_test.go
+(TestNewPipelineValidation); docs/configuration.md (без изменений —
+уже описывало коридор).
+
