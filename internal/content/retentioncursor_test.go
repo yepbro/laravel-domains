@@ -4,10 +4,12 @@
 // "batch ⟺ cursor"), the main scenario "a restart continues from the
 // cursor, not from zero" (RetentionLoop reads the state at start), the DB
 // position is not moved past rows deferred by the guards (the loss of the
-// retry list is compensated by re-reading the window), the circle plan
-// clears the state at the moment of the plan and suppresses saves until
-// the apply, invalid state → start from zero, missing table (42P01) —
-// operation without persistence.
+// retry list is compensated by re-reading the window — including the
+// multi-batch case of 09#P2-1), the circle plan clears the state at the
+// moment of the plan and suppresses saves until the apply, the debt-era
+// marker of T-295 (09#P2-2: the restart restores the era; NULL — an
+// unknown state — circles from zero), invalid state → start from zero,
+// missing table (42P01) — operation without persistence.
 // The fake pool lives in retention_test.go (the cursor row is cursorRow,
 // applied in Commit).
 package content
@@ -24,6 +26,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"crawler/internal/model"
+	"crawler/internal/queue"
 )
 
 // runLoopPass — running RetentionLoop until the first completed pass (the
@@ -186,6 +189,93 @@ func TestRetentionPass_DeferredBatchKeepsCursor(t *testing.T) {
 	}
 }
 
+// TestRetentionPass_DeferredThenCleanBatchesKeepCursor — the multi-batch
+// regression of 09#P2-1: the len(batch) == selected check guarded only the
+// batch with the deferrals themselves; a CLEAN batch of the same pass after
+// a deferred one saved the DB position past the deferred key — a restart
+// (the retry list is memory-only) lost the key forever. The save condition
+// must hold while ANY deferred key is unresolved (the retry list is the
+// floor of the position): clean batches keep the old row until the probe
+// resolves the list; the first save-eligible batch after that commits.
+func TestRetentionPass_DeferredThenCleanBatchesKeepCursor(t *testing.T) {
+	now := retentionTestNow()
+	pool := drainPool(now)
+	// sub=0 — deferred by the snapshot of pass 1; sub=1, sub=2 — clean
+	// batches after it (BatchSize = 1).
+	pool.results = append(pool.results, retentionRow{
+		key:       retentionKey{zone: 1, domain: 10, sub: 2, variant: 0},
+		checkedAt: pool.results[1].checkedAt.Add(time.Hour), hash: retentionHash16(0x33), jsonb: true,
+	})
+	pool.contents[retentionHash(0x33)] = retentionFakeContent{refc: 1, clen: 3000}
+	opts := retentionDefaultOpts()
+	opts.BatchSize = 1
+	opts.Pending = &fakePending{
+		render:  []map[RetentionPendingKey]struct{}{pendingKey(1, 10, 0, 0), {}, {}},
+		analyze: []map[RetentionPendingKey]struct{}{{}, {}, {}},
+	}
+
+	st := &retentionState{persist: true}
+	stats, err := retentionPass(context.Background(), pool, opts, st)
+	if err != nil {
+		t.Fatalf("pass 1: %v", err)
+	}
+	if stats.Rows != 2 || stats.Deferred[queue.StreamRender] != 1 {
+		t.Fatalf("pass 1 = %+v, want sub=1/sub=2 purged, sub=0 deferred", stats)
+	}
+	if len(st.retries) != 1 {
+		t.Fatalf("the retry list = %d keys, want 1 (sub=0)", len(st.retries))
+	}
+	// The position must stay behind the deferred key despite the two clean
+	// batches after it (the T-274 guarantee across batches).
+	if pool.cursorRow != nil || pool.cursorSaves != 0 {
+		t.Fatalf("cursor row = %+v (saves=%d), want none: a clean batch moved the position past the deferred key",
+			pool.cursorRow, pool.cursorSaves)
+	}
+	want := retentionCursor{checkedAt: pool.results[2].checkedAt, key: retentionKey{zone: 1, domain: 10, sub: 2, variant: 0}}
+	if st.cursor != want {
+		t.Fatalf("in-memory cursor = %+v, want %+v (it advances; the probe owns the deferred key)", st.cursor, want)
+	}
+
+	// Pass 2: the protection is gone — the probe purges sub=0 in place and
+	// the list resolves; the selection is empty (everything is behind the
+	// in-memory cursor), so no save happens either: the DB position never
+	// passed the deferred key while it was unresolved.
+	pool.queries = nil
+	stats, err = retentionPass(context.Background(), pool, opts, st)
+	if err != nil {
+		t.Fatalf("pass 2: %v", err)
+	}
+	if stats.Rows != 1 {
+		t.Fatalf("pass 2: Rows = %d, want 1 (the probe cleared sub=0)", stats.Rows)
+	}
+	if len(st.retries) != 0 {
+		t.Fatalf("the retry list = %d, want 0 (resolved)", len(st.retries))
+	}
+	if r := pool.row(retentionKey{zone: 1, domain: 10, sub: 0, variant: 0}); r.hash != nil {
+		t.Fatal("the deferred record not purged by the probe")
+	}
+	if pool.cursorRow != nil || pool.cursorSaves != 0 {
+		t.Fatalf("cursor row = %+v (saves=%d), want none: the position jumped over the deferred key's window",
+			pool.cursorRow, pool.cursorSaves)
+	}
+
+	// A new aged row ahead — the first save-eligible batch commits the
+	// position: the floor lifts with the resolved list.
+	pool.results = append(pool.results, retentionRow{
+		key:       retentionKey{zone: 1, domain: 10, sub: 3, variant: 0},
+		checkedAt: pool.results[2].checkedAt.Add(time.Hour), hash: retentionHash16(0x44), jsonb: true,
+	})
+	pool.contents[retentionHash(0x44)] = retentionFakeContent{refc: 1, clen: 4000}
+	if _, err := retentionPass(context.Background(), pool, opts, st); err != nil {
+		t.Fatalf("pass 3: %v", err)
+	}
+	after := retentionCursor{checkedAt: pool.results[3].checkedAt, key: retentionKey{zone: 1, domain: 10, sub: 3, variant: 0}}
+	if pool.cursorRow == nil || *pool.cursorRow != after || pool.cursorSaves != 1 {
+		t.Fatalf("cursor row = %+v (saves=%d), want %+v committed by the clean batch",
+			pool.cursorRow, pool.cursorSaves, after)
+	}
+}
+
 // TestRetentionPass_CircleResetsPersistedCursor — a forced catch-up circle
 // (the render-debt counter reset to zero) clears the persistent state
 // BEFORE traversing from zero: a restart in the middle of the circle will
@@ -250,9 +340,14 @@ func TestRetentionPass_CircleResetsPersistedCursor(t *testing.T) {
 func TestRetentionLoop_ResumesFromPersistedCursor(t *testing.T) {
 	now := retentionTestNow()
 	pool := drainPool(now)
-	// The "previous process" stopped at the first row.
+	// The "previous process" stopped at the first row. Its row carries a
+	// definite debt state (a T-295 binary always writes one): false — no
+	// era was observed; NULL would mean a pre-T-295 row — an unknown
+	// state, a circle (TestRetentionLoop_UnknownDebtStatePlansCircle).
 	saved := retentionCursor{checkedAt: pool.results[0].checkedAt, key: retentionKey{zone: 1, domain: 10, sub: 0, variant: 0}}
 	pool.cursorRow = &saved
+	noDebt := false
+	pool.cursorDebt = &noDebt
 
 	stats := runLoopPass(t, pool, RetentionOptions{BatchSize: 100})
 	if stats.Rows != 1 {
@@ -346,8 +441,9 @@ func TestRetentionLoop_NoCursorTableMidRun(t *testing.T) {
 	if _, err := retentionPass(context.Background(), pool, retentionDefaultOpts(), &retentionState{}); err != nil {
 		t.Fatalf("a repeated pass: %v", err)
 	}
-	if !strings.Contains(buf.String(), "the persistent cursor table is missing") {
-		t.Errorf("log = %q, want the missing-table Info", buf.String())
+	// The mid-run latch message covers both schemas (000020/000021).
+	if !strings.Contains(buf.String(), "the persistent cursor state is unavailable") {
+		t.Errorf("log = %q, want the unavailable-state Info", buf.String())
 	}
 }
 
@@ -374,19 +470,34 @@ func TestRetentionOnce_DoesNotTouchCursor(t *testing.T) {
 }
 
 // TestRetentionCursorLoadContract — the SQL texts of the persistent cursor
-// are pinned by anchors (the contract of migration 000020: a single row,
-// an upsert by PK, a DELETE on circles).
+// are pinned by anchors (the contract of migrations 000020/000021: a
+// single row, an upsert by PK with the debt state, a marker upsert, a
+// DELETE on circles).
 func TestRetentionCursorLoadContract(t *testing.T) {
-	if retentionCursorLoadSQL != "SELECT checked_at, zone_id, domain_id, subdomain_id, variant FROM retention_drain_cursor WHERE id = 1" {
-		t.Fatalf("retentionCursorLoadSQL diverged from the migration 000020 contract:\n%s", retentionCursorLoadSQL)
+	if retentionCursorLoadSQL != "SELECT checked_at, zone_id, domain_id, subdomain_id, variant, debt_seen FROM retention_drain_cursor WHERE id = 1" {
+		t.Fatalf("retentionCursorLoadSQL diverged from the migration 000020/000021 contract:\n%s", retentionCursorLoadSQL)
 	}
 	for _, want := range []string{
 		"INSERT INTO retention_drain_cursor",
 		"ON CONFLICT (id) DO UPDATE SET",
+		"debt_seen = EXCLUDED.debt_seen",
 		"updated_at = EXCLUDED.updated_at",
 	} {
 		if !strings.Contains(retentionCursorSaveSQL, want) {
 			t.Errorf("retentionCursorSaveSQL lost the fragment %q:\n%s", want, retentionCursorSaveSQL)
+		}
+	}
+	for _, want := range []string{
+		"INSERT INTO retention_drain_cursor",
+		"ON CONFLICT (id) DO UPDATE SET debt_seen = true",
+		// The zero-time literal (review of T-295, P3-1): the Go zero
+		// stamp scans into time.Time{} — the marker-only row loads as
+		// "no state"; '1970-01-01' would scan into time.Unix(0,0) and
+		// load as a 1970 position.
+		"VALUES (1, '0001-01-01 00:00:00+00', 0, 0, 0, 0, true, now())",
+	} {
+		if !strings.Contains(retentionDebtSeenSQL, want) {
+			t.Errorf("retentionDebtSeenSQL lost the fragment %q:\n%s", want, retentionDebtSeenSQL)
 		}
 	}
 	if retentionCursorDeleteSQL != "DELETE FROM retention_drain_cursor WHERE id = 1" {
@@ -395,13 +506,262 @@ func TestRetentionCursorLoadContract(t *testing.T) {
 }
 
 // TestRetentionLoadCursor_ZeroRow — an all-zero row (manual SQL) is
-// treated as "no state", not as a year-old position.
+// treated as "no state", not as a year-old position; the debt marker of
+// such a row (a marker-only insert of T-295) is still read.
 func TestRetentionLoadCursor_ZeroRow(t *testing.T) {
 	pool := drainPool(retentionTestNow())
+	debt := true
 	pool.cursorRow = &retentionCursor{}
-	cur, ok, err := retentionLoadCursor(context.Background(), pool)
+	pool.cursorDebt = &debt
+	cur, savedDebt, ok, err := retentionLoadCursor(context.Background(), pool)
 	if err != nil || ok || cur != (retentionCursor{}) {
 		t.Fatalf("load = (%+v, %v, %v), want an empty state without an error", cur, ok, err)
+	}
+	if savedDebt == nil || !*savedDebt {
+		t.Fatalf("the debt marker of the zero row = %v, want true (a marker-only row)", savedDebt)
+	}
+}
+
+// TestRetentionLoop_RestartsIntoDebtEra — the restart regression of
+// 09#P2-2: the debt-era marker (debt_seen, migration 000021) restores
+// the machine's debtEra state at the loop start. The finding's scenario:
+// the render-debt era ENDED while the process was down — the first
+// counter read of the new process already sees 0, the ">0 → 0"
+// transition is never observed, and without the marker the records
+// filtered out during the era stay behind the cursor forever; with the
+// marker restored, the first observed zero applies the catch-up circle.
+func TestRetentionLoop_RestartsIntoDebtEra(t *testing.T) {
+	now := retentionTestNow()
+	pool := drainPool(now)
+	// The "previous process" stopped inside the era at the first row and
+	// persisted the marker with the position (T-295).
+	saved := retentionCursor{checkedAt: pool.results[0].checkedAt, key: retentionKey{zone: 1, domain: 10, sub: 0, variant: 0}}
+	pool.cursorRow = &saved
+	debt := true
+	pool.cursorDebt = &debt
+	// The era ended in the downtime window: the counter is already 0
+	// (the pool's default — the row exists, migration 000015).
+
+	stats := runLoopPass(t, pool, RetentionOptions{BatchSize: 100})
+	if stats.Rows != 2 {
+		t.Fatalf("the starting pass = %+v, want 2 rows (the catch-up circle after the restored era)", stats)
+	}
+	if !reflect.DeepEqual(pool.queries[0].args, zeroArgs(100)) {
+		t.Fatalf("the first selection = %v, want the zero cursor (the circle)", pool.queries[0].args)
+	}
+	// The circle plan deleted the marker together with the position (the
+	// plan-time DELETE), and the circle's batch wrote a fresh row without
+	// the era.
+	if pool.cursorDelete != 1 {
+		t.Fatalf("cursor row deletes = %d, want 1 (the circle plan at the start)", pool.cursorDelete)
+	}
+	after := retentionCursor{checkedAt: pool.results[1].checkedAt, key: retentionKey{zone: 1, domain: 10, sub: 1, variant: 0}}
+	if pool.cursorRow == nil || *pool.cursorRow != after || pool.cursorDebt == nil || *pool.cursorDebt {
+		t.Fatalf("cursor row after the circle = %+v (debt=%v), want %+v with the era closed",
+			pool.cursorRow, pool.cursorDebt, after)
+	}
+}
+
+// TestRetentionLoop_UnknownDebtStatePlansCircle — a row written by a
+// pre-T-295 binary (debt_seen IS NULL): the debt state is unknown, and
+// the safe reading is a full catch-up circle from zero, not a guess — a
+// debt era that ended while the process was down must not stay behind
+// the cursor (09#P2-2). The circle heals the row: the first batch writes
+// a definite state.
+func TestRetentionLoop_UnknownDebtStatePlansCircle(t *testing.T) {
+	now := retentionTestNow()
+	pool := drainPool(now)
+	// The row of the OLD binary: a position, no debt state (NULL).
+	saved := retentionCursor{checkedAt: pool.results[0].checkedAt, key: retentionKey{zone: 1, domain: 10, sub: 0, variant: 0}}
+	pool.cursorRow = &saved
+	pool.cursorDebt = nil
+
+	var buf bytes.Buffer
+	stats := runLoopPass(t, pool, RetentionOptions{BatchSize: 100, Log: retentionTestLogger(&buf)})
+	if stats.Rows != 2 {
+		t.Fatalf("the starting pass = %+v, want 2 rows (a full catch-up from zero)", stats)
+	}
+	if !reflect.DeepEqual(pool.queries[0].args, zeroArgs(100)) {
+		t.Fatalf("the first selection = %v, want the zero cursor (the unknown-state circle)", pool.queries[0].args)
+	}
+	if !strings.Contains(buf.String(), "no debt state") {
+		t.Errorf("log = %q, want the unknown debt state Info", buf.String())
+	}
+	// The plan dropped the NULL row; the circle's batch wrote a definite
+	// state (the NULL heals on the first committed batch).
+	if pool.cursorDelete != 1 {
+		t.Fatalf("cursor row deletes = %d, want 1 (the plan-time DELETE of the NULL row)", pool.cursorDelete)
+	}
+	after := retentionCursor{checkedAt: pool.results[1].checkedAt, key: retentionKey{zone: 1, domain: 10, sub: 1, variant: 0}}
+	if pool.cursorRow == nil || *pool.cursorRow != after || pool.cursorDebt == nil {
+		t.Fatalf("cursor row = %+v (debt=%v), want %+v with a definite debt state",
+			pool.cursorRow, pool.cursorDebt, after)
+	}
+}
+
+// TestRetentionPass_DebtEraMarkerPersisted — the era observation is
+// persisted at the MOMENT it is made (retentionMarkDebtSeen, a separate
+// short transaction — a standstill pass commits no batch, but a restart
+// in the era must restore it); a repeated observation of the same era is
+// not a transition — the marker is not re-written on every pass; the
+// batch upserts of the era stamp the state by the same statement (a NULL
+// row heals on the first committed batch).
+func TestRetentionPass_DebtEraMarkerPersisted(t *testing.T) {
+	now := retentionTestNow()
+	pool := drainPool(now)
+	pool.counters["render_pending"] = 3 // the era is running
+
+	// Pass 1 — a standstill: the selection is empty (no rows at all), no
+	// batch is committed, but the marker must reach the DB.
+	pool.results = nil
+	st := &retentionState{persist: true}
+	if _, err := retentionPass(context.Background(), pool, retentionDefaultOpts(), st); err != nil {
+		t.Fatalf("pass 1 (the standstill): %v", err)
+	}
+	if pool.debtMarks != 1 {
+		t.Fatalf("debt marker upserts = %d, want 1 (the era persisted at the observation moment)", pool.debtMarks)
+	}
+	// The marker-only row: the zero position (a fresh insert) with the
+	// era flag — the load treats the zero stamp as "no state" but reads
+	// the marker (TestRetentionLoadCursor_ZeroRow).
+	if pool.cursorRow == nil || *pool.cursorRow != (retentionCursor{}) || pool.cursorDebt == nil || !*pool.cursorDebt {
+		t.Fatalf("cursor row = %+v (debt=%v), want the zero position with the era marker",
+			pool.cursorRow, pool.cursorDebt)
+	}
+
+	// Pass 2 — the era continues: not a transition, no second marker.
+	pool.results = nil
+	if _, err := retentionPass(context.Background(), pool, retentionDefaultOpts(), st); err != nil {
+		t.Fatalf("pass 2: %v", err)
+	}
+	if pool.debtMarks != 1 {
+		t.Fatalf("debt marker upserts = %d, want still 1 (the era is idempotent)", pool.debtMarks)
+	}
+
+	// Pass 3 — rows appear ahead (a standstill pass cannot purge them,
+	// but the batch upsert must stamp the era state with the position).
+	old := now.Add(-2 * DefaultRetention)
+	pool.results = []retentionRow{
+		{key: retentionKey{zone: 1, domain: 10, sub: 5, variant: 0}, checkedAt: old, hash: retentionHash16(0x55), jsonb: true},
+	}
+	pool.contents[retentionHash(0x55)] = retentionFakeContent{refc: 1, clen: 5000}
+	if _, err := retentionPass(context.Background(), pool, retentionDefaultOpts(), st); err != nil {
+		t.Fatalf("pass 3: %v", err)
+	}
+	want := retentionCursor{checkedAt: old, key: retentionKey{zone: 1, domain: 10, sub: 5, variant: 0}}
+	if pool.cursorRow == nil || *pool.cursorRow != want || pool.cursorDebt == nil || !*pool.cursorDebt {
+		t.Fatalf("cursor row = %+v (debt=%v), want %+v stamped with the era by the batch upsert",
+			pool.cursorRow, pool.cursorDebt, want)
+	}
+}
+
+// TestRetentionPass_DebtMarkerRetriedAfterFailure — the write-once era
+// entry lost the marker for the whole era when the single write hit a
+// transient failure (review of T-295, P3-3): while the era runs
+// unconfirmed, every debtActive observation retries the idempotent
+// marker upsert until it reaches the DB; a confirmed era writes nothing.
+func TestRetentionPass_DebtMarkerRetriedAfterFailure(t *testing.T) {
+	now := retentionTestNow()
+	pool := drainPool(now)
+	pool.counters["render_pending"] = 3 // the era is running
+	pool.results = nil                  // a standstill: no batches, the marker tx is the only path
+
+	// Pass 1 — the era entry: the marker write fails (a transient, not a
+	// missing table/column).
+	pool.debtMarkErr = errors.New("connection loss: unexpected EOF")
+	st := &retentionState{persist: true}
+	if _, err := retentionPass(context.Background(), pool, retentionDefaultOpts(), st); err != nil {
+		t.Fatalf("pass 1 (the failed marker): %v", err)
+	}
+	if st.mode != debtEraMode {
+		t.Fatalf("mode = %v, want debtEra (a write failure does not cancel the era)", st.mode)
+	}
+	if st.debtMarked {
+		t.Fatal("the era is confirmed after a FAILED marker write")
+	}
+
+	// Pass 2 — the same era (not a transition): the retry reaches the DB.
+	pool.debtMarkErr = nil
+	if _, err := retentionPass(context.Background(), pool, retentionDefaultOpts(), st); err != nil {
+		t.Fatalf("pass 2 (the marker retry): %v", err)
+	}
+	if !st.debtMarked {
+		t.Fatal("the era is not persisted after the retry")
+	}
+	if pool.debtMarks != 1 {
+		t.Fatalf("debt marker upserts = %d, want 1 (the retried entry)", pool.debtMarks)
+	}
+	// The marker-only row: the zero position with the era flag
+	// (TestRetentionLoadCursor_ZeroRow).
+	if pool.cursorRow == nil || *pool.cursorRow != (retentionCursor{}) || pool.cursorDebt == nil || !*pool.cursorDebt {
+		t.Fatalf("cursor row = %+v (debt=%v), want the zero position with the era marker",
+			pool.cursorRow, pool.cursorDebt)
+	}
+
+	// Pass 3 — the era continues confirmed: no further marker writes.
+	pool.results = nil
+	if _, err := retentionPass(context.Background(), pool, retentionDefaultOpts(), st); err != nil {
+		t.Fatalf("pass 3: %v", err)
+	}
+	if pool.debtMarks != 1 {
+		t.Fatalf("debt marker upserts = %d, want still 1 (a confirmed era writes nothing)", pool.debtMarks)
+	}
+}
+
+// TestRetentionPass_DebtMarkerAckedByBatch — the second confirmation
+// path (review of T-295, P3-3): a committed batch upsert of the era
+// stamps debt_seen=true with the position (the same statement), which
+// acknowledges the marker even while the point-upsert keeps failing —
+// and suppresses the retries after it.
+func TestRetentionPass_DebtMarkerAckedByBatch(t *testing.T) {
+	now := retentionTestNow()
+	pool := drainPool(now)
+	pool.counters["render_pending"] = 3 // the era is running
+	pool.results = nil                  // a standstill: the marker tx is the only path
+
+	// Pass 1 — the era entry: the marker write fails and KEEPS failing.
+	pool.debtMarkErr = errors.New("connection loss: unexpected EOF")
+	st := &retentionState{persist: true}
+	if _, err := retentionPass(context.Background(), pool, retentionDefaultOpts(), st); err != nil {
+		t.Fatalf("pass 1: %v", err)
+	}
+	if st.debtMarked {
+		t.Fatal("the era is confirmed after a FAILED marker write")
+	}
+
+	// Pass 2 — a row aged ahead: the batch upsert commits with the era
+	// stamp (the batch upserts do not share the marker's failure) — the
+	// ack comes from the batch, debtMarks stays at zero.
+	old := now.Add(-2 * DefaultRetention)
+	pool.results = []retentionRow{
+		{key: retentionKey{zone: 1, domain: 10, sub: 5, variant: 0}, checkedAt: old, hash: retentionHash16(0x55), jsonb: true},
+	}
+	pool.contents[retentionHash(0x55)] = retentionFakeContent{refc: 1, clen: 5000}
+	if _, err := retentionPass(context.Background(), pool, retentionDefaultOpts(), st); err != nil {
+		t.Fatalf("pass 2 (the batch of the era): %v", err)
+	}
+	if !st.debtMarked {
+		t.Fatal("the era is not confirmed by the batch upsert stamp")
+	}
+	if pool.debtMarks != 0 {
+		t.Fatalf("debt marker upserts = %d, want 0 (the point-upsert keeps failing; the stamp rode the batch)",
+			pool.debtMarks)
+	}
+	want := retentionCursor{checkedAt: old, key: retentionKey{zone: 1, domain: 10, sub: 5, variant: 0}}
+	if pool.cursorRow == nil || *pool.cursorRow != want || pool.cursorDebt == nil || !*pool.cursorDebt {
+		t.Fatalf("cursor row = %+v (debt=%v), want %+v stamped with the era by the batch upsert",
+			pool.cursorRow, pool.cursorDebt, want)
+	}
+
+	// Pass 3 — a standstill again: the era is confirmed by the batch
+	// stamp, no marker retries (the point-upsert would still fail — and
+	// must not even be attempted).
+	pool.results = nil
+	if _, err := retentionPass(context.Background(), pool, retentionDefaultOpts(), st); err != nil {
+		t.Fatalf("pass 3: %v", err)
+	}
+	if pool.debtMarks != 0 {
+		t.Fatalf("debt marker upserts = %d, want still 0 (the batch stamp is the ack)", pool.debtMarks)
 	}
 }
 
@@ -446,8 +806,8 @@ func TestRetentionPass_OverflowPlanResetsCursorAndSuppressesSaves(t *testing.T) 
 	// A is deferred (the list), B overflowed (the circle plan), C is also
 	// protected in the snapshot: Rows=0, the plan is set, applying — the
 	// next pass.
-	if stats.Rows != 0 || !st.circle {
-		t.Fatalf("pass = %+v (circle=%v), want 0 rows and a circle plan", stats, st.circle)
+	if stats.Rows != 0 || !st.circlePlanned() {
+		t.Fatalf("pass = %+v (mode=%v), want 0 rows and a circle plan", stats, st.mode)
 	}
 	if pool.cursorDelete != 1 {
 		t.Fatalf("cursor row deletes = %d, want 1 (the circle plan cleans the DB at plan time)", pool.cursorDelete)
@@ -505,7 +865,7 @@ func TestRetentionPass_PlanResetFailureWarns(t *testing.T) {
 	if _, err := retentionPass(context.Background(), pool, opts, st); err != nil {
 		t.Fatalf("the plan reflection failure is not a pass error: %v", err)
 	}
-	if !st.circle {
+	if !st.circlePlanned() {
 		t.Fatal("the circle plan lost on the DB reflection failure")
 	}
 	if pool.cursorRow != nil || pool.cursorSaves != 0 {

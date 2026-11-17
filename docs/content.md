@@ -750,25 +750,55 @@ isolated builds) neither reads nor writes the state — the owner is the
 http-worker loop.
 
 A batch holding queue-protected rows does **not** move the database
-position (the T-274 review): the retry list is not persistent, and its
-loss at a restart is compensated precisely by the cursor lagging
-behind — the start re-reads the protective window, the deferred keys
-are deferred again, and clean rows drop out of the selection by
-themselves; the in-memory cursor moves as before (the probe returns
-keys within the process lifetime). Forced catch-up circles
-(render-debt clearing, retry-list overflow, the fallback day) delete
-the row with a `DELETE` **at plan time** — a restart in the window
-between the plan and its application (≤ the pass interval) lands in a
-full catch-up from zero, not a continuation from the old position: the
-records behind it are cleaned precisely by the circle; position saving
-is suppressed until the circle is applied. A failure to reflect the
-plan — a Warn without a pass error (a restart in the window degrades
-to a continuation from the old position — more expensive, but without
-data loss). Before T-274 every restart meant a new catch-up from
-zero: ~60 min of traversing the clean prefix at idle, >60 min under
-full front load (the measurements of 10–11.11.2026 — the T-273
-incident: three passes under front load did not fit into the 3600 s
-cap, and the drain continued only in the quiet window).
+position (the T-274 review), and since T-295 the floor holds across
+batches (the 09#P2-1 hole: the check guarded only the batch with the
+deferrals themselves; a clean batch of the same pass after a deferred one
+moved the position past the deferred key — and the list is memory-only,
+a restart lost the key forever): while ANY deferred key is unresolved
+(the retry list is non-empty), position saves are suppressed entirely —
+the list is the floor of the saved position; when the probe resolves the
+list, the floor lifts with it. The list's loss at a restart is
+compensated precisely by the cursor lagging behind — the start re-reads
+the protective window, the deferred keys are deferred again, and clean
+rows drop out of the selection by themselves; the in-memory cursor moves
+as before (the probe returns keys within the process lifetime). Forced
+catch-up circles (render-debt clearing, retry-list overflow, the
+fallback day, an unknown debt state at the start) delete the row with a
+`DELETE` **at plan time** — a restart in the window between the plan and
+its application (≤ the pass interval) lands in a full catch-up from
+zero, not a continuation from the old position: the records behind it
+are cleaned precisely by the circle; position saving is suppressed until
+the circle is applied. A failure to reflect the plan — a Warn without a
+pass error (a restart in the window degrades to a continuation from the
+old position — more expensive, but without data loss). Before T-274
+every restart meant a new catch-up from zero: ~60 min of traversing the
+clean prefix at idle, >60 min under full front load (the measurements of
+10–11.11.2026 — the T-273 incident: three passes under front load did
+not fit into the 3600 s cap, and the drain continued only in the quiet
+window).
+
+**The debt-era state next to the cursor (T-295, migration 000021).**
+The `retention_drain_cursor` row carries `debt_seen` — the drain
+machine's "the render-debt era was observed, waiting for the lift"
+state (the 09#P2-2 hole: the flag lived in the http-worker memory, and
+after T-274 a restart that missed the counter's ">0 → 0" transition —
+the era ended in the downtime window — disabled the catch-up circle
+forever: the records filtered out during the era stayed behind the
+cursor, and the fallback-day anchor was refreshed by every successful
+zero read, so the fallback never fired). The marker is written at the
+moment the era is observed (a separate short transaction — a standstill
+pass commits no batch, but the marker must outrun a restart) and is
+stamped by every batch upsert; a transient failure of the write does not
+leave the era unmarked until its end: while the marker is unconfirmed,
+every debt-active pass retries the idempotent upsert, and a committed
+batch upsert of the era (debt_seen=true with the position) confirms it
+as well. A loop restart with the marker restores
+the era, and the first observed zero applies the catch-up circle.
+`NULL` — the state is unknown (a row written by a pre-T-295 binary):
+the safe reading is a full catch-up circle from zero, not a guess; a
+NULL row heals on the first committed batch (the upsert always writes a
+definite state). No column / no table — an Info and operation without
+saving (the T-175 counter style).
 
 **Plan pinning, timeouts, and backoff** (T-271; the production
 incident of 08–09.11.2026 — five PostgreSQL OOM kills overnight with
@@ -825,6 +855,13 @@ The first successful pass restores the regular interval. Pass errors
 are counted by the `crawler_content_retention_errors_total` metric
 (T-273) — before it, errors were visible only in journalctl (the
 :9104 metrics stayed at zero amid 70+ WARNs over the incident's day).
+Since T-295 the `OnError` hook also receives the PARTIAL statistics of
+the failed pass (09#P3-1): the batches committed before the error point
+are already in the DB — the work counters (`rows`, `refs`, `contents`,
+`freed_bytes`) credit them through the same observation instead of
+undercounting against the disk reality; the errored pass is counted
+only in `errors_total`, not in `passes_total` (the error is its
+result label).
 The heavy selection — under the shared scan gate of the http-worker
 `db.ScanGate`: retention and the late render republisher do not
 collide in PostgreSQL (the insurance against "1+1 GiB").
@@ -847,7 +884,12 @@ at all.
 
 The full circles are abolished — the explicit bounded mechanisms
 (`internal/content/retentiondrain.go`) replaced their role in retries
-(picking up protected rows on the next circle):
+(picking up protected rows on the next circle). Since T-295 the drain
+lifecycle itself is an explicit machine (09#P2-3, tasks/TZ-fsm.md):
+the modes `drain | debtEra | circlePlanned` with one transition
+function over the debt-counter observation (the table — in the doc
+comment of `nextDrainMode`, pinned by table tests; the former
+independent flags `circle`/`debtSeen` became the one mode variable):
 
 - **queue-protection retries** — a bounded list of keys (100K — the
   order of the stream depths at the watermarks), deferred by the
@@ -860,9 +902,10 @@ The full circles are abolished — the explicit bounded mechanisms
   is gone and the cleanup went through, the row was rewritten, a find)
   drop out; an overflow — a Warn and a conservative catch-up circle;
   the list loss (a restart) is covered by the persistent cursor
-  lagging behind — the database position does not move for the
-  deferred rows, the start re-reads the protective window and defers
-  the keys again (T-274);
+  lagging behind — while the list is non-empty the database position
+  does not move at all (the floor of 09#P2-1: the memory-only list is
+  exactly what a restart loses), the start re-reads the protective
+  window and defers the keys again (T-274/T-295);
 - **the render-debt catch-up** — records under the `render_pending`
   flag are silently filtered out by the selection, and the time cursor
   passes them by: a point read of `crawler_counters['render_pending']`
@@ -870,16 +913,20 @@ The full circles are abolished — the explicit bounded mechanisms
   to 0 — the moment all render protection is lifted at once — and
   schedules one full circle from the zero cursor (it catches up with
   everything that accumulated during the debt epoch; the frequency —
-  by the actual debt drains, not by the clock). A counter unavailable
-  — no row, no table (42P01, the normal state before migration
-  000015) or another read failure — fallback: a circle once a day from
-  the anchor, which is moved by successful reads and by the circles
-  themselves (fallback means "unavailable for a day IN A ROW", a
-  transient blip of a circle does not raise it). The hourly
-  discretization can miss a debt epoch that fit entirely between reads
-  (accumulated and drained to zero): the first observed zero picks it
-  up, as do a retry-list overflow or a restart — with a persistent
-  debt without zeros the class is held until one of those happens (a
+  by the actual debt drains, not by the clock). The era state is
+  persisted next to the cursor (`debt_seen`, T-295) and survives
+  restarts (see above); an era observed while a circle is already
+  waiting survives the circle's application — the lift after it still
+  schedules its own circle. A counter unavailable — no row, no table
+  (42P01, the normal state before migration 000015) or another read
+  failure — fallback: a circle once a day from the anchor, which is
+  moved by successful reads and by the circles themselves (fallback
+  means "unavailable for a day IN A ROW", a transient blip of a circle
+  does not raise it). The hourly discretization can miss a debt epoch
+  that fit entirely between reads (accumulated and drained to zero):
+  the first observed zero picks it up, as do a retry-list overflow or
+  a restart into an unknown debt state — with a persistent debt
+  without zeros the class is held until one of those happens (a
   deliberate residual; the "circle on debt decrease" trigger was
   rejected: a long drain would decrease every hour — the circles would
   come back).

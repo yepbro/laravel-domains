@@ -147,14 +147,22 @@ type retentionFakePool struct {
 	debtErr   error // the render-debt counter read failure
 	// cursorErr — the persistent cursor read failure at cycle start
 	// (T-274); cursorSaveErr — the cursor upsert failure in the batch
-	// transaction (the "batch ⟺ cursor" atomicity); cursorRow — the
-	// retention_drain_cursor row (nil — no state); cursorSaves/
-	// cursorDelete — the applied (committed) upserts and deletions.
+	// transaction (the "batch ⟺ cursor" atomicity; also the failure of
+	// the debt-marker upsert, T-295); debtMarkErr — the failure of the
+	// debt-marker upsert ALONE (the marker retry of the T-295 review,
+	// P3-3: the batch upserts keep succeeding); cursorRow — the
+	// retention_drain_cursor row (nil — no state); cursorDebt — the
+	// debt_seen value of the row (nil — NULL: the state is unknown, a
+	// pre-T-295 row); cursorSaves/cursorDelete — the applied (committed)
+	// upserts and deletions; debtMarks — the applied debt-marker upserts.
 	cursorErr     error
 	cursorSaveErr error
+	debtMarkErr   error
 	cursorRow     *retentionCursor
+	cursorDebt    *bool
 	cursorSaves   int
 	cursorDelete  int
+	debtMarks     int
 	// planErr — the plan pinning failure (SET LOCAL, T-271); selectBlock —
 	// a "stuck" SELECT of the selection: it answers only after the ctx
 	// deadline (the T-271 ctx timeout test);
@@ -293,7 +301,7 @@ func (p *retentionFakePool) Query(_ context.Context, sql string, args ...any) (p
 		}
 		return retentionResultRows([]any{
 			p.cursorRow.checkedAt, p.cursorRow.key.zone, p.cursorRow.key.domain,
-			p.cursorRow.key.sub, p.cursorRow.key.variant,
+			p.cursorRow.key.sub, p.cursorRow.key.variant, p.cursorDebt,
 		}), nil
 
 	case retentionDomainSQL:
@@ -406,7 +414,9 @@ type retentionFakeTx struct {
 	deleted map[Hash]struct{}             // deleted contents
 
 	savedCursor   *retentionCursor // the cursor upsert (T-274)
+	savedDebt     *bool            // the debt_seen value of the upsert (T-295)
 	deletedCursor bool             // the DELETE of the cursor row (a catch-up circle)
+	debtMark      bool             // the debt-era marker upsert (T-295)
 
 	calls      []retentionCall // all the transaction statements in order
 	isSelect   bool            // the plan-pinning tx wrapper (the first Exec is a SET LOCAL)
@@ -618,7 +628,8 @@ func (t *retentionFakeTx) Exec(_ context.Context, sql string, args ...any) (pgco
 	case sql == retentionCursorSaveSQL:
 		// The persistent cursor upsert (T-274): applied in Commit (the
 		// last write in the transaction wins); a failure rolls back the
-		// whole transaction (the atomicity with the batch).
+		// whole transaction (the atomicity with the batch). The debt_seen
+		// stamp rides the same statement (T-295).
 		if t.pool.cursorSaveErr != nil {
 			return pgconn.CommandTag{}, t.pool.cursorSaveErr
 		}
@@ -631,7 +642,20 @@ func (t *retentionFakeTx) Exec(_ context.Context, sql string, args ...any) (pgco
 				variant: args[4].(int16),
 			},
 		}
-		t.savedCursor = &cur
+		debt := args[5].(bool)
+		t.savedCursor, t.savedDebt = &cur, &debt
+		return pgconn.NewCommandTag("INSERT 0 1"), nil
+	case sql == retentionDebtSeenSQL:
+		// The debt-era marker (T-295): on conflict only debt_seen moves;
+		// a fresh insert writes the zero position (the load treats a zero
+		// stamp as "no state" but still reads the marker).
+		if t.pool.debtMarkErr != nil {
+			return pgconn.CommandTag{}, t.pool.debtMarkErr
+		}
+		if t.pool.cursorSaveErr != nil {
+			return pgconn.CommandTag{}, t.pool.cursorSaveErr
+		}
+		t.debtMark = true
 		return pgconn.NewCommandTag("INSERT 0 1"), nil
 	case sql == retentionCursorDeleteSQL:
 		t.deletedCursor = true
@@ -672,10 +696,21 @@ func (t *retentionFakeTx) Commit(context.Context) error {
 	if t.savedCursor != nil {
 		t.pool.cursorSaves++
 		t.pool.cursorRow = t.savedCursor
+		t.pool.cursorDebt = t.savedDebt
 	}
 	if t.deletedCursor {
 		t.pool.cursorDelete++
 		t.pool.cursorRow = nil
+		t.pool.cursorDebt = nil
+	}
+	if t.debtMark {
+		t.pool.debtMarks++
+		if t.pool.cursorRow == nil {
+			zero := retentionCursor{}
+			t.pool.cursorRow = &zero // the marker insert: the zero position
+		}
+		debt := true
+		t.pool.cursorDebt = &debt
 	}
 	return nil
 }
@@ -1198,7 +1233,7 @@ func TestRetentionLoop_OnError(t *testing.T) {
 		Interval:     20 * time.Millisecond,
 		ErrorBackoff: 60 * time.Millisecond,
 		BatchSize:    100,
-		OnError:      func(err error) { errs <- err },
+		OnError:      func(err error, _ RetentionStats) { errs <- err },
 	}
 	count := func() int {
 		pool.mu.Lock()
@@ -1246,6 +1281,67 @@ func TestRetentionLoop_OnError(t *testing.T) {
 	}
 	if last == nil || !strings.Contains(last.Error(), "unexpected EOF") {
 		t.Errorf("OnError received %v, want the pass error", last)
+	}
+}
+
+// TestRetentionLoop_OnErrorPartialStats — the core of 09#P3-1 (review of
+// T-295, P3-2): a pass that dies MID-DRAIN has its already committed
+// batches in force — the error hook must receive their PARTIAL statistics
+// (Rows/Batches > 0), not zeros: the work counters credit the committed
+// work via ObserveError. The first batch commits, the second dies on its
+// purge Commit.
+func TestRetentionLoop_OnErrorPartialStats(t *testing.T) {
+	pool := drainPool(retentionTestNow()) // two purgeable rows
+	pool.mu.Lock()
+	var selected int
+	pool.onSelect = func() {
+		selected++
+		if selected == 2 {
+			// The second batch's purge transaction dies on Commit; the
+			// first has already committed (the selection wrapper commits
+			// are not touched by commitErr — the injection roles).
+			pool.commitErr = errors.New("commit loss: unexpected EOF")
+		}
+	}
+	pool.mu.Unlock()
+
+	type failedPass struct {
+		err   error
+		stats RetentionStats
+	}
+	fails := make(chan failedPass, 16)
+	opts := RetentionOptions{
+		Retention:    DefaultRetention,
+		Interval:     20 * time.Millisecond,
+		ErrorBackoff: 60 * time.Millisecond,
+		BatchSize:    1,
+		OnError:      func(err error, stats RetentionStats) { fails <- failedPass{err, stats} },
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- RetentionLoop(ctx, pool, opts) }()
+
+	// The first failed pass: its partial statistics are the committed
+	// first batch (one row, one batch transaction).
+	var first failedPass
+	select {
+	case first = <-fails:
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnError was not called for the failed pass")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the loop did not finish after the ctx cancel")
+	}
+	if first.stats.Rows != 1 || first.stats.Batches != 1 {
+		t.Fatalf("OnError stats = %+v, want the partial work of the committed batch (Rows=1, Batches=1)",
+			first.stats)
+	}
+	if first.err == nil || !strings.Contains(first.err.Error(), "commit loss") {
+		t.Errorf("OnError received %v, want the pass error", first.err)
 	}
 }
 

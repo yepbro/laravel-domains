@@ -84,7 +84,7 @@ func NewRetentionMetrics(reg *metrics.Registry) *RetentionMetrics {
 		}).WithLabelValues(),
 		errors: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_content_retention_errors_total",
-			Help: "Failed retention passes (T-273): the pass aborted on an error — batches committed before it stay in force (the cursor advanced partially), the rest of the set repeats after a backoff. Before T-273 errors were visible only in the journal (the 2026-11-09–10 incident: a day of WARNs with zero pass metrics); a growing series = the drain stands still, watch the content disk and the Warn heading in journalctl.",
+			Help: "Failed retention passes (T-273): the pass aborted on an error — batches committed before it stay in force (the cursor advanced partially; their rows/refs/bytes are credited in the work counters via the same observation, T-295), the rest of the set repeats after a backoff. Before T-273 errors were visible only in the journal (the 2026-11-09–10 incident: a day of WARNs with zero pass metrics); a growing series = the drain stands still, watch the content disk and the Warn heading in journalctl.",
 		}).WithLabelValues(),
 		seconds: reg.MustHistogram(prometheus.HistogramOpts{
 			Name:    "crawler_content_retention_pass_seconds",
@@ -111,7 +111,8 @@ func NewRetentionMetrics(reg *metrics.Registry) *RetentionMetrics {
 // counter; skips in the middle of a drain (an interlock/error after some
 // batches) do not lose the work already done — Rows/Refs/Contents/Freed/
 // Deferred are credited in them too, since the batches are committed in the
-// DB.
+// DB; a FAILED pass credits its partial work the same way — via
+// ObserveError (T-295, review 09#P3-1).
 func (m *RetentionMetrics) Observe(res RetentionStats, d time.Duration) {
 	if m == nil {
 		return
@@ -133,15 +134,20 @@ func (m *RetentionMetrics) Observe(res RetentionStats, d time.Duration) {
 	m.observeWork(res)
 }
 
-// ObserveError — a failed pass (T-273): +1 to
-// crawler_content_retention_errors_total; wired in via the
-// RetentionOptions.OnError hook (the error value is not classified —
-// the text is visible in the journal Warn). A nil receiver is a no-op.
-func (m *RetentionMetrics) ObserveError(error) {
+// ObserveError — a failed pass (T-273; the partial statistics — T-295,
+// review 09#P3-1): +1 to crawler_content_retention_errors_total and the
+// work counters of the batches committed before the error point — they are
+// already in the DB (the cursor advanced partially), losing them
+// undercounted rows/refs/bytes against the disk reality; wired in via the
+// RetentionOptions.OnError hook (the error value is not classified — the
+// text is visible in the journal Warn). The pass is not counted in
+// passes_total: errors_total is its label. A nil receiver is a no-op.
+func (m *RetentionMetrics) ObserveError(_ error, partial RetentionStats) {
 	if m == nil {
 		return
 	}
 	m.errors.Inc()
+	m.observeWork(partial)
 }
 
 // observeWork — the counters of the work done by the pass (the common part

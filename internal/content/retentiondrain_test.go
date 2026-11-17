@@ -3,8 +3,9 @@
 // the next pass continues from the stop point), point offers of the
 // queue-guard retries (the PK probe, eviction of non-candidates, the list
 // bound), catch-up circles (the T-175 render-debt counter reset to zero,
-// the fallback day on a missing row, the list overflow), and the return of
-// a re-checked row to the drain after aging.
+// the fallback day on a missing row, the list overflow), the drain
+// machine itself (the transition table and observation sequences of
+// 09#P2-3), and the return of a re-checked row to the drain after aging.
 // The fake pool lives in retention_test.go (including the crawler_counters
 // counter).
 package content
@@ -13,6 +14,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"reflect"
 	"strings"
 	"testing"
@@ -361,8 +363,8 @@ func TestRetentionPass_RetryBound(t *testing.T) {
 	if _, err := retentionPass(context.Background(), pool, opts, st); err != nil {
 		t.Fatalf("pass 1: %v", err)
 	}
-	if !st.circle || len(st.retries) != 1 {
-		t.Fatalf("after pass 1: circle=%v, retries=%d (want the scheduled circle, the limit 1)", st.circle, len(st.retries))
+	if !st.circlePlanned() || len(st.retries) != 1 {
+		t.Fatalf("after pass 1: mode=%v, retries=%d (want the scheduled circle, the limit 1)", st.mode, len(st.retries))
 	}
 	// The Warn — exactly one per overflow episode (review of T-185, P3-1
 	// R2): the second and third batches with waiting keys stay silent, the
@@ -427,8 +429,8 @@ func TestRetentionPass_DebtCatchUp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pass 1 (the debt epoch): %v", err)
 	}
-	if stats.Rows != 1 || !st.debtSeen || st.circle {
-		t.Fatalf("pass 1 = %+v (debtSeen=%v): only domain 20, no circle planned", stats, st.debtSeen)
+	if stats.Rows != 1 || st.mode != debtEraMode || st.circlePlanned() {
+		t.Fatalf("pass 1 = %+v (mode=%v): only domain 20, no circle planned", stats, st.mode)
 	}
 
 	// The debt has been drained: the flag is lifted, the counter reset to
@@ -530,7 +532,7 @@ func TestRetentionPass_DebtReadError(t *testing.T) {
 	// retentionPass must set it — otherwise (the "remove the block"
 	// mutation) the fallback would immediately apply a circle and reset
 	// debtSeen (review of T-185, P3-1 R3).
-	st := &retentionState{debtSeen: true}
+	st := &retentionState{mode: debtEraMode}
 	stats, err := retentionPass(context.Background(), pool, opts, st)
 	if err != nil {
 		t.Fatalf("pass: %v", err)
@@ -538,8 +540,8 @@ func TestRetentionPass_DebtReadError(t *testing.T) {
 	if stats.Rows != 2 {
 		t.Fatalf("stats = %+v, want a regular drain with the counter error", stats)
 	}
-	if !st.debtSeen || st.circle {
-		t.Fatalf("the debt state: debtSeen=%v circle=%v, want kept without a circle", st.debtSeen, st.circle)
+	if st.mode != debtEraMode || st.circlePlanned() {
+		t.Fatalf("the debt state: mode=%v, want debtEra kept without a circle", st.mode)
 	}
 	if st.lastCircle.IsZero() {
 		t.Fatal("the fallback-day anchor not set at state creation")
@@ -566,8 +568,8 @@ func TestRetentionPass_DebtAnchorRefresh(t *testing.T) {
 	if _, err := retentionPass(context.Background(), pool, retentionDefaultOpts(), st); err != nil {
 		t.Fatalf("pass 1: %v", err)
 	}
-	if st.circle || st.cursor != anchor {
-		t.Fatalf("after pass 1: circle=%v cursor=%+v — a successful read must refresh the anchor, no circle raised", st.circle, st.cursor)
+	if st.circlePlanned() || st.cursor != anchor {
+		t.Fatalf("after pass 1: mode=%v cursor=%+v — a successful read must refresh the anchor, no circle raised", st.mode, st.cursor)
 	}
 
 	// The next hour — a read failure: the anchor is fresh, no circle is
@@ -576,8 +578,8 @@ func TestRetentionPass_DebtAnchorRefresh(t *testing.T) {
 	if _, err := retentionPass(context.Background(), pool, retentionDefaultOpts(), st); err != nil {
 		t.Fatalf("pass 2: %v", err)
 	}
-	if st.circle || st.cursor != anchor {
-		t.Fatalf("a transient read failure raised the circle: circle=%v cursor=%+v", st.circle, st.cursor)
+	if st.circlePlanned() || st.cursor != anchor {
+		t.Fatalf("a transient read failure raised the circle: mode=%v cursor=%+v", st.mode, st.cursor)
 	}
 }
 
@@ -826,5 +828,170 @@ func TestRetentionPass_NoMidPassProbe(t *testing.T) {
 		if q.sql == retentionProbeSQL {
 			t.Fatalf("the probe ran amid the drain (call %d) despite \"once per pass, before the drain\"", i)
 		}
+	}
+}
+
+// --- the drain machine (09#P2-3, tasks/TZ-fsm.md) -------------------------------
+
+// TestNextDrainModeTable — every cell of the transition table pinned in
+// the doc comment of nextDrainMode: the mode × the observation, with the
+// fallback-day guard (it weighs only in the debtUnavailable column). The
+// circlePlanned row of the table is the apply order, not a table cell —
+// a waiting circle is applied before the transition (catchUp); that order
+// is pinned by TestDrainMachineSequences below.
+func TestNextDrainModeTable(t *testing.T) {
+	cases := []struct {
+		name        string
+		from        retentionDrainMode
+		obs         retentionDebtObs
+		fallbackDue bool
+		want        retentionDrainMode
+		wantCircle  bool // the transition plans a circle (a why reason)
+	}{
+		{"drain/active", drainMode, debtActive, false, debtEraMode, false},
+		{"drain/lifted", drainMode, debtLifted, false, drainMode, false},
+		{"drain/unavailable", drainMode, debtUnavailable, false, drainMode, false},
+		{"drain/unavailable/fallback", drainMode, debtUnavailable, true, circlePlannedMode, true},
+		{"debtEra/active", debtEraMode, debtActive, false, debtEraMode, false},
+		{"debtEra/lifted", debtEraMode, debtLifted, false, circlePlannedMode, true},
+		{"debtEra/unavailable", debtEraMode, debtUnavailable, false, debtEraMode, false},
+		{"debtEra/unavailable/fallback", debtEraMode, debtUnavailable, true, circlePlannedMode, true},
+		{"circlePlanned/active", circlePlannedMode, debtActive, false, debtEraMode, false},
+		{"circlePlanned/lifted", circlePlannedMode, debtLifted, false, drainMode, false},
+		{"circlePlanned/unavailable", circlePlannedMode, debtUnavailable, false, circlePlannedMode, false},
+		{"circlePlanned/unavailable/fallback", circlePlannedMode, debtUnavailable, true, circlePlannedMode, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, why := nextDrainMode(tc.from, tc.obs, tc.fallbackDue)
+			if got != tc.want {
+				t.Fatalf("nextDrainMode(%v, %v, fallback=%v) = %v, want %v",
+					tc.from, tc.obs, tc.fallbackDue, got, tc.want)
+			}
+			if (why != "") != tc.wantCircle {
+				t.Fatalf("the circle reason = %q, want a non-empty verdict: %v", why, tc.wantCircle)
+			}
+		})
+	}
+}
+
+// drainEvent — one step of the machine's life for the sequence tests: a
+// debt observation at a pass start, or the mid-pass retry list overflow
+// (deferRetries → planCircle; the apply waits for the next pass start).
+type drainEvent struct {
+	obs      retentionDebtObs
+	overflow bool
+	// fallbackAged — age the fallback-day anchor beyond the day before
+	// the step (the debtUnavailable row of the table).
+	fallbackAged bool
+}
+
+// TestDrainMachineSequences — observation sequences → state sequences:
+// the machine is driven through the PRODUCTION transition application
+// (observe/planCircle) with a non-persistent state (no DB), and after
+// every step the mode and the cursor position are pinned. The cursor is
+// the circle's observable: applyCircle resets it to zero.
+func TestDrainMachineSequences(t *testing.T) {
+	moved := retentionCursor{checkedAt: retentionTestNow(), key: retentionKey{zone: 1, domain: 10, sub: 7, variant: 0}}
+	cases := []struct {
+		name   string
+		events []drainEvent
+		// want — after every event: the mode and whether the cursor was
+		// reset by a circle apply in that step.
+		want []struct {
+			mode   retentionDrainMode
+			circle bool
+		}
+	}{
+		{
+			// The era → the lift: one full circle (§4.4).
+			name:   "era then lift",
+			events: []drainEvent{{obs: debtActive}, {obs: debtLifted}},
+			want: []struct {
+				mode   retentionDrainMode
+				circle bool
+			}{{debtEraMode, false}, {drainMode, true}},
+		},
+		{
+			// A zero counter without an era is no event (the hour
+			// discretization — the era that fit between reads is picked
+			// up by other mechanisms, the catchUp comment).
+			name:   "lift without era",
+			events: []drainEvent{{obs: debtLifted}, {obs: debtLifted}},
+			want: []struct {
+				mode   retentionDrainMode
+				circle bool
+			}{{drainMode, false}, {drainMode, false}},
+		},
+		{
+			// An era OBSERVED while a circle was waiting is not erased by
+			// the apply (the former flags lost it — an edge of 09#P2-2):
+			// overflow (pass N) → the apply and a fresh era (pass N+1) →
+			// the lift circles (pass N+2).
+			name:   "era survives the waiting circle",
+			events: []drainEvent{{overflow: true}, {obs: debtActive}, {obs: debtLifted}},
+			want: []struct {
+				mode   retentionDrainMode
+				circle bool
+			}{{circlePlannedMode, false}, {debtEraMode, true}, {drainMode, true}},
+		},
+		{
+			// The lift while a circle is already waiting: one circle, not
+			// two (the plan is idempotent).
+			name:   "lift with a waiting circle",
+			events: []drainEvent{{overflow: true}, {obs: debtLifted}},
+			want: []struct {
+				mode   retentionDrainMode
+				circle bool
+			}{{circlePlannedMode, false}, {drainMode, true}},
+		},
+		{
+			// The era holds through unavailable reads (the state is kept,
+			// review of T-185, P3-1 R3); the aged anchor is the fallback
+			// day — a circle from debtEra too (it resets the era state).
+			name:   "era holds, then the fallback day",
+			events: []drainEvent{{obs: debtActive}, {obs: debtUnavailable}, {obs: debtUnavailable, fallbackAged: true}},
+			want: []struct {
+				mode   retentionDrainMode
+				circle bool
+			}{{debtEraMode, false}, {debtEraMode, false}, {drainMode, true}},
+		},
+		{
+			// A repeated active observation is not a transition (the
+			// marker is written once per era, not per pass).
+			name:   "era is idempotent",
+			events: []drainEvent{{obs: debtActive}, {obs: debtActive}, {obs: debtLifted}},
+			want: []struct {
+				mode   retentionDrainMode
+				circle bool
+			}{{debtEraMode, false}, {debtEraMode, false}, {drainMode, true}},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			log := slog.New(slog.DiscardHandler)
+			// The production starting state of a pass: the anchor set
+			// (retentionPass), the cursor moved by the previous passes.
+			st := &retentionState{persist: false, lastCircle: time.Now(), cursor: moved}
+			if len(tc.events) != len(tc.want) {
+				t.Fatalf("the case is malformed: %d events, %d verdicts", len(tc.events), len(tc.want))
+			}
+			for i, ev := range tc.events {
+				var circled bool
+				if ev.fallbackAged {
+					st.lastCircle = time.Now().Add(-DefaultRetentionFallbackCircle - time.Minute)
+				}
+				if ev.overflow {
+					st.planCircle(context.Background(), nil, log, "the queue-guard retry list overflowed — the circle will rebuild the set")
+				} else {
+					st.observe(context.Background(), nil, log, ev.obs)
+				}
+				circled = st.cursor == (retentionCursor{})
+				if st.mode != tc.want[i].mode || circled != tc.want[i].circle {
+					t.Fatalf("step %d (%+v): mode=%v circle=%v, want mode=%v circle=%v",
+						i, ev, st.mode, circled, tc.want[i].mode, tc.want[i].circle)
+				}
+			}
+		})
 	}
 }

@@ -466,14 +466,16 @@ type RetentionOptions struct {
 	// style of CleanupOptions.OnPass T-020/T-099). Must be fast and not
 	// panic.
 	OnPass func(RetentionStats, time.Duration)
-	// OnError — the pass error hook (T-273): called after the Warn on
-	// every failed pass (a ctx cancellation is a normal stop — the hook
-	// is not called). The cycle error counter
-	// crawler_content_retention_errors_total — before T-273 pass errors
-	// were visible only in journalctl (the :9104 metrics were zeros at
-	// 70+ WARNs per day, the 2026-11-09/10 incident). Must be fast and
-	// not panic.
-	OnError func(error)
+	// OnError — the pass error hook (T-273; the stats argument — T-295,
+	// review 09#P3-1): called after the Warn on every failed pass with
+	// the PARTIAL statistics of the batches committed before the error
+	// point (the work is already in the DB — the counters must credit
+	// it; a ctx cancellation is a normal stop — the hook is not called).
+	// The cycle error counter crawler_content_retention_errors_total —
+	// before T-273 pass errors were visible only in journalctl (the
+	// :9104 metrics were zeros at 70+ WARNs per day, the 2026-11-09/10
+	// incident). Must be fast and not panic.
+	OnError func(error, RetentionStats)
 }
 
 // withDefaults replaces invalid zeros with the defaults; Retention is not
@@ -766,12 +768,13 @@ func retentionProbe(ctx context.Context, pool RetentionDB, o RetentionOptions, k
 // of subdomain_results (cutting the reference and the jsonb) → decreasing
 // the refcount of the actually cut references → deleting contents without
 // references. A crash at any step rolls everything back (spec 3.4): the
-// rows and the refcount do not diverge. cursor != nil — a persistent drain
-// cursor is committed together with the batch (T-274,
-// retentioncursor.go): the atomicity of "batch committed ⟺ position
-// saved"; nil — a purge outside the drain cursor (the retry probe, the
-// point drain of a domain T-187) or non-persistent state (RetentionOnce).
-func retentionPurge(ctx context.Context, pool RetentionDB, o RetentionOptions, batch []retentionCandidate, cursor *retentionCursor) (RetentionStats, error) {
+// rows and the refcount do not diverge. save != nil — the persistent drain
+// state (the position and the debt-era flag of the machine, T-274/T-295)
+// is committed together with the batch (retentioncursor.go): the atomicity
+// of "batch committed ⟺ position saved"; nil — a purge outside the drain
+// state (the retry probe, the point drain of a domain T-187) or
+// non-persistent state (RetentionOnce).
+func retentionPurge(ctx context.Context, pool RetentionDB, o RetentionOptions, batch []retentionCandidate, save *retentionSave) (RetentionStats, error) {
 	var st RetentionStats
 	zones := make([]int16, len(batch))
 	domains := make([]int64, len(batch))
@@ -834,10 +837,10 @@ func retentionPurge(ctx context.Context, pool RetentionDB, o RetentionOptions, b
 			return st, err
 		}
 	}
-	// The persistent cursor — by the same transaction (T-274): the saved
-	// position cannot overtake the committed batch.
-	if cursor != nil {
-		if err := retentionSaveCursorTx(ctx, tx, *cursor); err != nil {
+	// The persistent drain state — by the same transaction (T-274): the
+	// saved position cannot overtake the committed batch.
+	if save != nil {
+		if err := retentionSaveCursorTx(ctx, tx, *save); err != nil {
 			return st, err
 		}
 	}
@@ -974,36 +977,60 @@ func RetentionLoop(ctx context.Context, pool RetentionDB, opts RetentionOptions)
 	// from the saved point, not a full catch-up from zero (the penalty of
 	// ~an hour of traversing the clean prefix is abolished). A missing
 	// state (the first run, a circle reset it) — the zero cursor, the
-	// previous behavior. No table (migration 000020) — an Info and
-	// operation without persistence (the render-debt counter style); an
-	// invalid state (a stamp in the future) and a read failure — a Warn
-	// and a start from zero: full state is more honest than guesses, and
-	// the pass is idempotent.
+	// previous behavior. No table (migration 000020) or no debt column
+	// (000021) — an Info and operation without persistence (the
+	// render-debt counter style); an invalid state (a stamp in the future)
+	// and a read failure — a Warn and a start from zero: full state is
+	// more honest than guesses, and the pass is idempotent. The debt-era
+	// flag of the row (debt_seen, T-295) restores the drain machine's
+	// debtEra state; NULL — unknown (a row of a pre-T-295 binary): the
+	// safe reading is a full catch-up circle from zero, not a guess —
+	// a debt era that ended while the process was down must not stay
+	// behind the cursor forever (09#P2-2).
 	state := &retentionState{persist: true}
-	switch cur, ok, err := retentionLoadCursor(ctx, pool); {
+	switch cur, debt, ok, err := retentionLoadCursor(ctx, pool); {
 	case err != nil && errors.Is(err, errRetentionNoCursorTable):
 		state.persist = false
 		log.Info("retention: the persistent cursor table is missing — restarts give a full catch-up (migration 000020 not applied?)")
+	case err != nil && errors.Is(err, errRetentionNoDebtColumn):
+		state.persist = false
+		log.Info("retention: the debt state column is missing — restarts give a full catch-up (migration 000021 not applied?)")
 	case err != nil && errors.Is(err, errRetentionCursorInvalid):
 		log.Warn("retention: the saved drain cursor is malformed — starting from zero (a full catch-up)", "err", err)
 	case err != nil:
 		log.Warn("retention: the persistent cursor was not read — starting from zero (a full catch-up)", "err", err)
-	case ok:
-		state.cursor = cur
-		log.Info("retention: the drain continues from the persistent cursor",
-			"checked_at", cur.checkedAt.Format(time.RFC3339),
-			"zone_id", cur.key.zone, "domain_id", cur.key.domain)
+	default:
+		if ok {
+			state.cursor = cur
+			log.Info("retention: the drain continues from the persistent cursor",
+				"checked_at", cur.checkedAt.Format(time.RFC3339),
+				"zone_id", cur.key.zone, "domain_id", cur.key.domain)
+		}
+		switch {
+		case debt == nil && ok:
+			// A row without a debt state (written by a binary before
+			// T-295): plan a circle from zero — planCircle reflects it in
+			// the DB immediately (the row is deleted, the marker with it).
+			state.planCircle(ctx, pool, log, "the saved debt state is unknown — a full catch-up")
+			log.Info("retention: the saved drain cursor has no debt state — the restart runs a catch-up circle from zero")
+		case debt != nil && *debt:
+			state.mode = debtEraMode
+			state.debtMarked = true // the marker was just read from the DB
+			log.Info("retention: the drain resumes in the render-debt era — the lift plans a catch-up circle")
+		}
 	}
 	pass := func() error {
 		start := time.Now()
 		stats, err := retentionPass(ctx, pool, o, state)
 		if err != nil {
 			// A cancellation during the pass is part of the stop, not an
-			// alarm.
+			// alarm. The hook receives the partial statistics: the
+			// batches committed before the error point stay in force —
+			// the work counters must credit them (09#P3-1).
 			if ctx.Err() == nil {
-				log.Warn("content retention pass", "err", err)
+				log.Warn("content retention pass", "err", err, "rows_done", stats.Rows)
 				if o.OnError != nil {
-					o.OnError(err)
+					o.OnError(err, stats)
 				}
 			}
 			return err

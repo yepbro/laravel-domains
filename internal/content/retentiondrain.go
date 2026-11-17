@@ -1,5 +1,5 @@
 // Retention drain state that survives passes (T-185; spec
-// TZ_slow_retention_drain.md §4.2–4.4 — the diagnosis of slow-query log
+// TZ_slow_retention_drain.md §4.2–§4.4 — the diagnosis of slow-query log
 // entry #13 of Oct 24: hourly full circles over PK re-read the heap of the
 // entire traversed history; the trail grew with the table at ≈3M rows per
 // day, the median 76 s, 63 min of DB time over 2.4 h).
@@ -18,7 +18,7 @@
 // stop point — the slice that ages over an hour ≈ the inflow, and the
 // window is served by the subdomain_results_checked_idx index (T-171).
 //
-// Explicit retries instead of full circles (§4.3–4.4): the hourly circle
+// Explicit retries instead of full circles (§4.3–§4.4): the hourly circle
 // was at once a retry (picking up protected records) and a trail
 // (re-reading history) — the replacement:
 //
@@ -35,6 +35,15 @@
 //     every pass and plans one full circle from the zero cursor. A missing
 //     counter row (the DB before the T-175 deploy) — a fallback: a circle
 //     once per day (a constant; no config knob is introduced, spec §4.4).
+//     Since T-295 the observed era is persisted next to the cursor
+//     (debt_seen, migration 000021) — a restart restores the machine's
+//     "waiting for the lift" state instead of losing the circle (09#P2-2).
+//
+// The drain lifecycle is an explicit machine (09#P2-3, tasks/TZ-fsm.md —
+// the former scattered flags circle/debtSeen became one mode variable):
+// the states, events and the transition table — retentionDrainMode and
+// nextDrainMode below; the machine's invariants are pinned by the table
+// tests of retentiondrain_test.go.
 //
 // What does not change (§4.5): purge/decref/delete with guard re-checks,
 // the retentionBlocked interlock, the retentionPendingSnapshot snapshots
@@ -74,20 +83,142 @@ const (
 	DefaultRetentionFallbackCircle = 24 * time.Hour
 )
 
+// retentionDrainMode — the lifecycle state of the drain machine (09#P2-3,
+// tasks/TZ-fsm.md): ONE variable instead of the former independent flags
+// circle/debtSeen. The machine's input events are the debt-counter
+// observation at a pass start (retentionDebtObs) and the mid-pass retry
+// list overflow; the transitions — nextDrainMode (the table in its doc
+// comment) and planCircle.
+type retentionDrainMode uint8
+
+const (
+	// drainMode — the regular drain from the cursor: no render debt is
+	// held, no circle is waiting.
+	drainMode retentionDrainMode = iota
+	// debtEraMode — the render-debt counter was observed > 0 after the
+	// last circle: records under the render_pending flag are filtered
+	// out by the selection and the time cursor passes them; the era ends
+	// with the counter's transition to 0 — a catch-up circle (§4.4). The
+	// state is persisted (debt_seen, T-295) and survives a restart.
+	debtEraMode
+	// circlePlannedMode — a full catch-up circle is planned: the next
+	// pass start (or the same one, when the plan came from the counter
+	// read) applies it — the cursor and the retry list are reset, the
+	// drain continues from zero. The plan is reflected in the persistent
+	// state immediately (planCircle deletes the row, T-274).
+	circlePlannedMode
+)
+
+// String — the mode name for logs and tests.
+func (m retentionDrainMode) String() string {
+	switch m {
+	case drainMode:
+		return "drain"
+	case debtEraMode:
+		return "debtEra"
+	case circlePlannedMode:
+		return "circlePlanned"
+	default:
+		return "unknown"
+	}
+}
+
+// retentionDebtObs — the observation of the render-debt counter at a pass
+// start: the single external input event of the machine (the retry list
+// overflow is the second, mid-pass one).
+type retentionDebtObs uint8
+
+const (
+	// debtActive — the counter is > 0: the era is running.
+	debtActive retentionDebtObs = iota
+	// debtLifted — the counter is 0: if the machine was in the era, all
+	// render protection has been lifted at once.
+	debtLifted
+	// debtUnavailable — no row, no table (migration 000015 not applied)
+	// or a read failure: the fallback-day guard decides.
+	debtUnavailable
+)
+
+// nextDrainMode — the transition table of the drain machine over the
+// debt observation. Pure: side effects (the debt marker persistence, the
+// persistent state reset) belong to the callers (enterDebtEra,
+// planCircle). fallbackDue — the fallback-day guard (the counter
+// unavailable for a day IN A ROW, spec §4.4) — applies only to the
+// debtUnavailable row.
+//
+//	┌───────────────┬─────────────────┬──────────────────────┬─────────────────────┐
+//	│ mode \ obs    │ debtActive      │ debtLifted           │ debtUnavailable     │
+//	├───────────────┼─────────────────┼──────────────────────┼─────────────────────┤
+//	│ drain         │ debtEra         │ drain                │ drain¹              │
+//	│ debtEra       │ debtEra         │ circlePlanned²       │ debtEra¹            │
+//	│ circlePlanned │ applied first (→ drain), then the drain row of the same column │
+//	└───────────────┴─────────────────┴──────────────────────┴─────────────────────┘
+//
+//	¹ unless fallbackDue: → circlePlanned ("the fallback day") from either
+//	  mode — the circle resets the era state together with the cursor.
+//	² "the render debt counter dropped to zero": one full circle catches
+//	  up everything that accumulated over the era behind the cursor.
+//
+// The mid-pass overflow event (deferRetries) plans a circle from any mode.
+// A debtActive observation is re-applied AFTER a circle applied in the
+// same catchUp (the era that started while the circle was waiting is not
+// erased by the apply — the former flags lost it, 09#P2-2 adjacent).
+func nextDrainMode(from retentionDrainMode, obs retentionDebtObs, fallbackDue bool) (retentionDrainMode, string) {
+	switch obs {
+	case debtActive:
+		return debtEraMode, ""
+	case debtLifted:
+		if from == debtEraMode {
+			return circlePlannedMode, "the render debt counter dropped to zero — the render guard lifted"
+		}
+		return drainMode, ""
+	default: // debtUnavailable
+		if fallbackDue {
+			return circlePlannedMode, "the render debt counter is unavailable (no row/table — migration 000015) — the fallback day"
+		}
+		return from, ""
+	}
+}
+
 // retentionState — the drain state of the cycle that survives passes
 // (T-185). The owner is the RetentionLoop cycle (a single ticker
 // goroutine); the one-off RetentionOnce works with a clean state. A nil
 // retries map means "no retries".
+//
+// Not machine states (deliberately, 09#P2-3): noCounterTable and persist —
+// process latches about the ENVIRONMENT (which migrations the DB has),
+// flipped once, with no transitions back; debtMarked — the persistence
+// ACK of debtEra (the DB holds the marker), not a mode: it gates only
+// the marker retry; the ticker backoff of
+// RetentionLoop — the pacing of the cycle, not the drain lifecycle; the
+// retries set — data (the keys awaiting their probe), not a mode: it
+// constrains the persistent saves (the floor, 09#P2-1) but adds no
+// transitions.
 type retentionState struct {
 	// cursor — the time-based drain cursor (§4.2): the last visited row;
 	// advanced only by committed batches.
 	cursor retentionCursor
 	// retries — the bounded set of keys deferred by the queue guards
 	// (§4.3): the next pass offers them with the retentionProbeSQL probe.
+	// While it is non-empty, the persistent cursor is not saved (09#P2-1):
+	// the list is the floor of the DB position — the earliest unresolved
+	// deferral must stay ahead of it (the list is memory-only; a restart
+	// re-reads from the floor and defers the keys again).
 	retries map[retentionKey]struct{}
-	// debtSeen — the render-debt counter was observed > 0 after the last
-	// circle (§4.4): the next read's transition to 0 — a catch-up circle.
-	debtSeen bool
+	// mode — the lifecycle state of the drain machine (retentionDrainMode):
+	// drain | debtEra | circlePlanned; circleWhy — the journal reason of
+	// a planned circle (kept until the apply).
+	mode      retentionDrainMode
+	circleWhy string
+	// debtMarked — the debtEra mode is persisted (the marker upsert of
+	// retentionMarkDebtSeen or a batch upsert stamping debt_seen=true has
+	// reached the DB). While it is false, every debtActive observation
+	// retries the idempotent marker (review of T-295, P3-3): during a
+	// real debt era the queue guards defer keys, the retry-list floor
+	// suppresses the batch upserts, and the marker transaction is the
+	// ONLY persistence path — a single best-effort write at the era entry
+	// would leave the whole era unmarked on one transient failure.
+	debtMarked bool
 	// lastCircle — the anchor of the fallback day: successful debt counter
 	// reads and completed circles (fallback means "unavailable for a day
 	// IN A ROW"; a transient blip does not move it); the initial anchor is
@@ -96,11 +227,6 @@ type retentionState struct {
 	// noCounterTable — the crawler_counters table was not there yet (one
 	// Info per process, review of T-185, P3-4 R3).
 	noCounterTable bool
-	// circle — the next pass starts from the zero cursor (§4.2–4.4):
-	// the render-debt lift, the retry list overflow, the fallback day;
-	// circleWhy — the reason for the journal.
-	circle    bool
-	circleWhy string
 
 	// retryLimit — the retry list limit (DefaultRetentionRetryLimit);
 	// a field for unit tests — less fiddling with a hundred thousand keys.
@@ -108,13 +234,18 @@ type retentionState struct {
 
 	// persist — the state belongs to the service cycle (RetentionLoop):
 	// the batch cursor is committed to the DB (retention_drain_cursor,
-	// T-274, migration 000020); forced circles clear the saved position.
+	// T-274, migration 000020; the debt-era flag — T-295, migration
+	// 000021); forced circles clear the saved position.
 	// The one-off RetentionOnce and the unit tests of the selection
 	// criteria work without persistence (the pre-T-274 behavior); reset to
-	// false when the table is missing (the migration not applied — one
-	// Info, the noCounterTable style).
+	// false when the table (or its debt column) is missing (the migration
+	// not applied — one Info, the noCounterTable style).
 	persist bool
 }
+
+// circlePlanned — whether a catch-up circle waits for the apply (the
+// machine state read by retentionPass to suppress position saves).
+func (st *retentionState) circlePlanned() bool { return st.mode == circlePlannedMode }
 
 // limit — the effective retry list limit.
 func (st *retentionState) limit() int {
@@ -226,34 +357,45 @@ func retentionPass(ctx context.Context, pool RetentionDB, opts RetentionOptions,
 		batch = pending.deferBatch(batch, &out)
 		if len(batch) > 0 {
 			// The persistent cursor — by the batch transaction (T-274), but
-			// only if the batch did NOT jump over rows deferred by the
-			// guards: the position in the DB does not move past unpurged
-			// rows — the loss of the retry list on a restart is compensated
-			// by re-reading the guard window (the keys will be deferred
-			// again), and the trimmed rows fall out of the selection on
-			// their own (review of T-274, P1). The in-memory cursor moves
-			// as before: within the process lifetime the probe will return
+			// only if no unpurged row is being jumped over: neither by this
+			// batch (a deferral removed rows from it — the position in the
+			// DB does not move past them, review of T-274, P1) nor by an
+			// EARLIER one (the retry list still holds unresolved deferrals —
+			// the floor of the position, 09#P2-1: the list is memory-only,
+			// so while any deferred key is outstanding, the saved position
+			// must stay behind it — a restart re-reads the guard window and
+			// defers the keys again; the trimmed rows fall out of the
+			// selection on their own). The in-memory cursor moves as
+			// before: within the process lifetime the probe will return
 			// the keys. A planned circle suppresses the saving (planCircle
 			// has already deleted the row — a new position before the
 			// circle apply would resurrect it).
-			var save *retentionCursor
-			if st.persist && !st.circle && len(batch) == selected {
-				save = &next
+			var save *retentionSave
+			if st.persist && !st.circlePlanned() && len(batch) == selected && len(st.retries) == 0 {
+				save = &retentionSave{cursor: next, debtEra: st.mode == debtEraMode}
 			}
 			stp, err := retentionPurge(ctx, pool, o, batch, save)
 			if err != nil {
 				// The cursor table is missing (migration 000020 not
-				// applied — an old bench): persistence is disabled for the
+				// applied — an old bench) or its debt column
+				// (000021): persistence is disabled for the
 				// process, the batch is rolled back as a whole and retried
 				// by the next pass (the cursor did not move — no loss).
-				if errors.Is(err, errRetentionNoCursorTable) {
+				if errors.Is(err, errRetentionNoCursorTable) || errors.Is(err, errRetentionNoDebtColumn) {
 					st.persist = false
-					log.Info("retention: the persistent cursor table is missing — running without saving (migration 000020 not applied?)")
+					log.Info("retention: the persistent cursor state is unavailable — running without saving (migration 000020/000021 not applied?)")
 					return out, nil
 				}
 				return out, err
 			}
 			out.add(stp)
+			// A committed batch upsert of the era stamps debt_seen=true
+			// with the position (the same statement) — the marker ack
+			// (review of T-295, P3-3): no point-upsert retries while the
+			// batches carry the marker themselves.
+			if save != nil && save.debtEra {
+				st.debtMarked = true
+			}
 		}
 		st.cursor = next
 		if !full {
@@ -277,24 +419,70 @@ func retentionPass(ctx context.Context, pool RetentionDB, opts RetentionOptions,
 	}
 }
 
-// catchUp — the catch-up circle decision at the start of a pass (§4.4):
-// a point read of the render-debt counter and the application of a deferred
-// circle (the retry list overflow, the fallback day). An unavailable
-// counter — no row, no table (42P01: the DB before the migration 000015
-// deploy — treated as "no counter", without a Warn) or a read failure: the
-// fallback is a guard day whose anchor is moved by successful reads —
-// fallback means "unavailable for a day IN A ROW"; a transient blip after
-// weeks of healthy operation does not raise a full circle (review of
-// T-185, P3-2 R3). The hour discretization: a debt era that fit entirely
-// between reads (accumulated and drained to zero) will not see the
-// transition to 0 — its records are caught up by the first observed zero
-// after it (a circle from zero trims everything behind the cursor), the
-// list overflow, the fallback, or a restart. The trigger "a substantial
-// debt decrease" was rejected deliberately: a long drain (443k, stage 25)
-// would decrease every hour — the circles would come back. The persistent
-// circle state is cleared by planCircle at the moment of the plan (T-274).
+// catchUp — the catch-up decision at the start of a pass (§4.4), driven
+// through the drain machine (nextDrainMode): a point read of the
+// render-debt counter, the application of a deferred circle (the retry
+// list overflow, the fallback day, a restart with an unknown debt state),
+// and the transition on the observation. An unavailable counter — no row,
+// no table (42P01: the DB before the migration 000015 deploy — treated as
+// "no counter", without a Warn) or a read failure: the fallback is a
+// guard day whose anchor is moved by successful reads — fallback means
+// "unavailable for a day IN A ROW"; a transient blip after weeks of
+// healthy operation does not raise a full circle (review of T-185, P3-2
+// R3). The hour discretization: a debt era that fit entirely between
+// reads (accumulated and drained to zero) will not see the transition to
+// 0 — its records are caught up by the first observed zero after it (a
+// circle from zero trims everything behind the cursor), the list
+// overflow, the fallback, or a restart with an unknown debt state (the
+// marker of T-295 makes the era itself survive the restart). The trigger
+// "a substantial debt decrease" was rejected deliberately: a long drain
+// (443k, stage 25) would decrease every hour — the circles would come
+// back. The persistent circle state is cleared by planCircle at the
+// moment of the plan (T-274).
 func (st *retentionState) catchUp(ctx context.Context, pool RetentionDB, log *slog.Logger) {
-	if debt, ok, err := retentionDebt(ctx, pool); err != nil && errors.Is(err, errRetentionNoCounterTable) {
+	st.observe(ctx, pool, log, st.readDebt(ctx, pool, log))
+}
+
+// observe — applying the machine's reaction to one debt observation: a
+// circle planned earlier (the overflow of the previous pass, an unknown
+// debt state at the start) is applied BEFORE the observation transition —
+// the circle resets the machine to drain, and the fresh observation then
+// applies on top; in particular an era observed while the circle was
+// waiting re-enters debtEra instead of being erased by the apply (the
+// former flags lost it — an edge of 09#P2-2). The table tests of the
+// machine drive observe with observation sequences directly, without a
+// DB (a non-persistent state touches none).
+func (st *retentionState) observe(ctx context.Context, pool RetentionDB, log *slog.Logger, obs retentionDebtObs) {
+	st.applyCircle(log)
+	if next, why := nextDrainMode(st.mode, obs, st.fallbackDue()); next != st.mode {
+		switch next {
+		case debtEraMode:
+			st.enterDebtEra(ctx, pool, log)
+		case circlePlannedMode:
+			st.planCircle(ctx, pool, log, why)
+			st.applyCircle(log)
+		}
+		return
+	}
+	// The era continues unconfirmed: the marker write of the entry may
+	// have failed (a transient) — retry the idempotent upsert until the
+	// era is persisted (review of T-295, P3-3). A confirmed era writes
+	// nothing; the table tests drive this through observe unchanged
+	// (a non-persistent state touches no DB).
+	if st.mode == debtEraMode && st.persist && !st.debtMarked {
+		st.debtMarked = st.persistDebtMarker(ctx, pool, log)
+	}
+}
+
+// readDebt — the point read of the render-debt counter and its
+// side effects (the observation of the machine): the one-per-process Info
+// latch for a missing counter table, the Warn for a read failure (the
+// debt state is kept, the fallback-day guard applies), the fallback-day
+// anchor refresh on a successful read.
+func (st *retentionState) readDebt(ctx context.Context, pool RetentionDB, log *slog.Logger) retentionDebtObs {
+	debt, ok, err := retentionDebt(ctx, pool)
+	switch {
+	case err != nil && errors.Is(err, errRetentionNoCounterTable):
 		// The counter table is missing (migration 000015 not applied) — a
 		// normal state of an old bench: one Info per process, then silence
 		// (review of T-185, P3-4 R3: full silence would postpone the
@@ -304,18 +492,18 @@ func (st *retentionState) catchUp(ctx context.Context, pool RetentionDB, log *sl
 			st.noCounterTable = true
 			log.Info("retention: the render debt counter table is missing — running on the fallback day (migration 000015 not applied?)")
 		}
-		st.fallbackCircle(ctx, pool, log)
-	} else if err != nil {
+		return debtUnavailable
+	case err != nil:
 		if ctx.Err() == nil {
 			log.Warn("retention: the render debt counter was not read — the debt state is kept, the fallback-day guard applies",
 				"err", err)
 		}
-		st.fallbackCircle(ctx, pool, log)
-	} else if !ok {
+		return debtUnavailable
+	case !ok:
 		// The counter row is missing (the DB before the T-175 deploy) — the
 		// same fallback.
-		st.fallbackCircle(ctx, pool, log)
-	} else {
+		return debtUnavailable
+	default:
 		st.lastCircle = time.Now() // the fallback-day anchor: the read succeeded
 		if debt < 0 {
 			// Not produced by code (the bit transitions are a ±1 pair,
@@ -324,48 +512,84 @@ func (st *retentionState) catchUp(ctx context.Context, pool RetentionDB, log *sl
 			log.Warn("retention: a negative render debt counter — desync (runbooks §6)", "debt", debt)
 		}
 		if debt > 0 {
-			st.debtSeen = true
-		} else if st.debtSeen {
-			// The transition to 0: all render protection is lifted — one
-			// full circle catches up everything that accumulated over the
-			// debt era behind the cursor.
-			st.planCircle(ctx, pool, log, "the render debt counter dropped to zero — the render guard lifted")
+			return debtActive
 		}
+		return debtLifted
 	}
+}
 
-	if !st.circle {
+// fallbackDue — the fallback-day guard (§4.4): the counter unavailable
+// for a day IN A ROW from the anchor (the state creation or the last
+// successful read / circle).
+func (st *retentionState) fallbackDue() bool {
+	return time.Since(st.lastCircle) >= DefaultRetentionFallbackCircle
+}
+
+// enterDebtEra — the machine transition into the debt era: the in-memory
+// state first (it works regardless), then the best-effort persistence of
+// the marker (retentionMarkDebtSeen, T-295): a restart inside the era
+// must restore the state and raise the catch-up circle when the debt
+// lifts. A persistence failure is a Warn without a pass error: this
+// process keeps the era, and the next debtActive observation retries the
+// marker (persistDebtMarker via observe — review of T-295, P3-3: the
+// write-once era entry lost the marker for the whole era when the single
+// write hit a transient failure).
+func (st *retentionState) enterDebtEra(ctx context.Context, pool RetentionDB, log *slog.Logger) {
+	st.mode = debtEraMode
+	st.debtMarked = false
+	if !st.persist {
 		return
 	}
-	// The circle: the cursor to the start, the retry list will be rebuilt
-	// by the circle itself (protected keys are deferred by it too), the
-	// debt era is closed. The persistent state has already been reset at
-	// the moment of the plan (planCircle, T-274). A noop circle (the cursor
-	// is already zero, no list) — Debug: the starting state of a fresh
-	// process; it changes no operations.
+	st.debtMarked = st.persistDebtMarker(ctx, pool, log)
+}
+
+// persistDebtMarker — the marker upsert and its error handling: true —
+// the era is persisted (the ack of debtMarked). A transient failure — a
+// Warn: the in-memory era keeps working, the retry comes with the next
+// debtActive observation; 42P01/42703 — the table/column is missing (a
+// migration not applied): persistence is disabled for the process (a
+// degradation, not a breakage).
+func (st *retentionState) persistDebtMarker(ctx context.Context, pool RetentionDB, log *slog.Logger) bool {
+	if err := retentionMarkDebtSeen(ctx, pool); err != nil {
+		if errors.Is(err, errRetentionNoCursorTable) || errors.Is(err, errRetentionNoDebtColumn) {
+			st.persist = false
+			log.Info("retention: the persistent cursor state is unavailable — running without saving (migration 000020/000021 not applied?)")
+			return false
+		}
+		if ctx.Err() == nil {
+			log.Warn("retention: the debt era was not persisted — a restart inside the era may skip the catch-up circle",
+				"err", err)
+		}
+		return false
+	}
+	return true
+}
+
+// applyCircle — the application of a planned circle (the next pass start,
+// or the same one when the plan came from the counter read): the cursor
+// and the retry list are reset — the circle itself rebuilds the list
+// (protected keys are deferred by it too), and the era is closed (the
+// persistent state has already been reset at the moment of the plan —
+// planCircle, T-274). A noop circle (the cursor is already zero, no
+// list) — Debug: the starting state of a fresh process; it changes no
+// operations.
+func (st *retentionState) applyCircle(log *slog.Logger) {
+	if st.mode != circlePlannedMode {
+		return
+	}
 	why := st.circleWhy
 	noop := st.cursor == (retentionCursor{}) && len(st.retries) == 0
 	st.cursor = retentionCursor{}
 	st.retries = nil
-	st.debtSeen = false
+	st.mode = drainMode
+	st.circleWhy = ""
+	st.debtMarked = false // the circle closes the era: a new one re-marks
 	st.lastCircle = time.Now()
-	st.circle, st.circleWhy = false, ""
 	if noop {
 		log.Debug("retention: a catch-up circle is already in place (the zero cursor)", "reason", why)
 		return
 	}
 	log.Info("retention: a catch-up circle from the zero cursor", "reason", why)
-}
-
-// fallbackCircle — the guard day when the debt counter is unavailable
-// (§4.4): a circle once per DefaultRetentionFallbackCircle from the anchor
-// (the state creation or the last circle). The spec's "quiet hour" is
-// understood as "a day from the anchor", not an hour of the day: the anchor
-// is moved by the circles themselves, and a separate schedule was
-// deliberately not introduced (a config knob is forbidden by the spec).
-func (st *retentionState) fallbackCircle(ctx context.Context, pool RetentionDB, log *slog.Logger) {
-	if time.Since(st.lastCircle) >= DefaultRetentionFallbackCircle {
-		st.planCircle(ctx, pool, log, "the render debt counter is unavailable (no row/table — migration 000015) — the fallback day")
-	}
 }
 
 // planCircle — a planned catch-up circle for the next apply turn (the
@@ -375,15 +599,19 @@ func (st *retentionState) fallbackCircle(ctx context.Context, pool RetentionDB, 
 // restart in the window between the plan and the apply must land in a full
 // catch-up from zero, not continue from the old position (it is exactly the
 // circle that trims the records behind it); further position saves are
-// suppressed until the circle apply (retentionPass). A deletion failure is
-// a Warn without a pass error: the circle will still happen in memory; on a
-// restart in the window the cycle degrades to the T-273 behavior
-// (continuing from the old position) — costlier, but without data loss.
+// suppressed until the circle apply (retentionPass). The deletion also
+// drops the debt marker: the circle closes the era it was planned for (a
+// stale marker heals on the first committed batch after the apply). A
+// deletion failure is a Warn without a pass error: the circle will still
+// happen in memory; on a restart in the window the cycle degrades to the
+// T-273 behavior (continuing from the old position) — costlier, but
+// without data loss.
 func (st *retentionState) planCircle(ctx context.Context, pool RetentionDB, log *slog.Logger, why string) {
-	if st.circle {
+	if st.mode == circlePlannedMode {
 		return
 	}
-	st.circle, st.circleWhy = true, why
+	st.mode, st.circleWhy = circlePlannedMode, why
+	st.debtMarked = false // the plan drops the marker row with the position
 	if !st.persist {
 		return
 	}
@@ -426,7 +654,7 @@ func (st *retentionState) deferRetries(ctx context.Context, pool RetentionDB, ba
 			// plan is already set, and it stays silent until the next
 			// overflow (review of T-185, P3-1 — do not be noisy with every
 			// standstill batch).
-			if !st.circle {
+			if !st.circlePlanned() {
 				log.Warn("retention: the queue-guard retry list overflowed — the next pass runs as a catch-up circle",
 					"limit", st.limit())
 			}

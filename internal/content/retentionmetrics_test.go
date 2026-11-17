@@ -226,12 +226,29 @@ func TestRetentionMetricsErrorsCounter(t *testing.T) {
 	if got := retentionCounterValue(t, reg, name); got != 0 {
 		t.Fatalf("%s before the errors = %v, want 0 (success/skips do not count)", name, got)
 	}
-	m.ObserveError(nil)
-	m.ObserveError(nil)
+	m.ObserveError(nil, RetentionStats{})
+	m.ObserveError(nil, RetentionStats{Rows: 4, Refs: 4, Contents: 2, FreedBytes: 5000})
 	if got := retentionCounterValue(t, reg, name); got != 2 {
 		t.Fatalf("%s after two failed passes = %v, want 2", name, got)
 	}
+	// The partial statistics of a failed pass are credited in the work
+	// counters too (T-295, 09#P3-1): the batches committed before the
+	// error point are already in the DB.
+	if got := retentionCounterValue(t, reg, "crawler_content_retention_rows_total"); got != 4 {
+		t.Errorf("rows after the errored passes = %v, want 4 (the partial work credited)", got)
+	}
+	if got := retentionCounterValue(t, reg, "crawler_content_retention_contents_total"); got != 2 {
+		t.Errorf("contents after the errored passes = %v, want 2", got)
+	}
+	if got := retentionCounterValue(t, reg, "crawler_content_retention_freed_bytes_total"); got != 5000 {
+		t.Errorf("freed after the errored passes = %v, want 5000", got)
+	}
+	// The errored passes are not counted as passes{ok} — errors_total is
+	// their label (the 1 here is the successful Observe above).
+	if got := retentionCounterByLabels(t, reg, "crawler_content_retention_passes_total", map[string]string{"result": "ok"}); got != 1 {
+		t.Errorf("passes{ok} = %v, want 1 (the errored passes add nothing)", got)
+	}
 
 	// A nil receiver (a service without a registry) — a no-op, no panic.
-	NewRetentionMetrics(nil).ObserveError(nil)
+	NewRetentionMetrics(nil).ObserveError(nil, RetentionStats{Rows: 1})
 }
