@@ -1257,6 +1257,15 @@ func TestContent_RetentionCursorRestart(t *testing.T) {
 			return s, nil
 		case <-time.After(time.Minute):
 			cancel()
+			// Join the loop goroutine on the failure path too (the success
+			// branch does cancel(); <-done): a still-running RetentionLoop
+			// would keep the pool busy after the test's cleanup. The pass
+			// is already a minute overdue — a short extra bound instead of
+			// another full wait (18#P3-4 of the bulk review).
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+			}
 			return content.RetentionStats{}, errors.New("the loop's starting pass did not finish")
 		}
 	}

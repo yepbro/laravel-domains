@@ -21,6 +21,10 @@
 //	item 4  TestAccept04 — version/score analysis + reanalyze without a refetch
 //	item 5  TestAccept05 — selections from laravel_domains/laravel_findings (e2e)
 //	item 6  TestAccept06 — zone progress updates automatically + metrics
+//	                     (the metrics half — the "metrics" subtest against
+//	                     the running monitor service: make test-integration
+//	                     and CI start no app services, so there it is
+//	                     skipped — the manual make up profile covers it)
 //	item 7  — a target server under a 24 h load: outside the dev bench, task
 //	         T-093 (blocked until the production hardware is deployed)
 //	item 8  TestAccept08 — the recheck interval (6 months by default,
@@ -1274,8 +1278,8 @@ func TestAccept03_RenderFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctxA, cancelA := context.WithCancel(ctx)
-	runADone := make(chan struct{})
-	go func() { defer close(runADone); _ = renderworker.Run(ctxA, wA, optsA) }()
+	runADone := make(chan error, 1)
+	go func() { runADone <- renderworker.Run(ctxA, wA, optsA) }()
 
 	// The task went to q:render-fallback (the first delivery — an error,
 	// the claim with attempts=2 — a publication and an XACK).
@@ -1283,7 +1287,13 @@ func TestAccept03_RenderFallback(t *testing.T) {
 		return streamLen(t, env.rdb, queue.StreamRenderFallback) == 1
 	})
 	cancelA()
-	<-runADone
+	// The OnRun graceful-shutdown contract (T-012): a clean nil exit after
+	// the cancel; a premature error exit must surface here, not drown up
+	// to an accWaitFor timeout (18#P3-5, the pattern of
+	// render_stream_test).
+	if err := <-runADone; err != nil {
+		t.Errorf("worker A's Run exited with an error: %v", err)
+	}
 
 	t.Run("the primary worker: the row waits for the fallback without a marker", func(t *testing.T) {
 		row := accRows(t, env.pool, ids["spa-shell"])[0]
@@ -1339,8 +1349,8 @@ func TestAccept03_RenderFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctxB, cancelB := context.WithCancel(ctx)
-	runBDone := make(chan struct{})
-	go func() { defer close(runBDone); _ = renderworker.Run(ctxB, wB, optsB) }()
+	runBDone := make(chan error, 1)
+	go func() { runBDone <- renderworker.Run(ctxB, wB, optsB) }()
 
 	accWaitFor(t, "worker B rendered the fallback row", 90*time.Second, func() bool {
 		rows := accRows(t, env.pool, ids["spa-shell"])
@@ -1355,7 +1365,11 @@ func TestAccept03_RenderFallback(t *testing.T) {
 		return pendingCount(t, env.rdb, queue.StreamRenderFallback, "acc-render-fb-b") == 0
 	})
 	cancelB()
-	<-runBDone
+	// The OnRun graceful-shutdown contract (T-012): see worker A's join
+	// above (18#P3-5).
+	if err := <-runBDone; err != nil {
+		t.Errorf("worker B's Run exited with an error: %v", err)
+	}
 
 	t.Run("worker B: the DOM stored, q:analyze published", func(t *testing.T) {
 		after := accRows(t, env.pool, ids["spa-shell"])[0]
@@ -1487,8 +1501,8 @@ func TestAccept03b_RenderEngineSkip(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctxA, cancelA := context.WithCancel(ctx)
-	runADone := make(chan struct{})
-	go func() { defer close(runADone); _ = renderworker.Run(ctxA, wA, optsA) }()
+	runADone := make(chan error, 1)
+	go func() { runADone <- renderworker.Run(ctxA, wA, optsA) }()
 
 	// The task went to q:render-fallback — from the FIRST delivery (the
 	// match is deterministic on the URL, no attempts are burned). The XACK
@@ -1502,7 +1516,13 @@ func TestAccept03b_RenderEngineSkip(t *testing.T) {
 		return pendingCount(t, env.rdb, queue.StreamRender, "acc-render-skip") == 0
 	})
 	cancelA()
-	<-runADone
+	// The OnRun graceful-shutdown contract (T-012): a clean nil exit after
+	// the cancel; a premature error exit must surface here, not drown up
+	// to an accWaitFor timeout (18#P3-5, the pattern of
+	// render_stream_test).
+	if err := <-runADone; err != nil {
+		t.Errorf("worker A's Run exited with an error: %v", err)
+	}
 
 	t.Run("worker A: no navigation, the row waits for the fallback without a marker", func(t *testing.T) {
 		if n := atomic.LoadInt32(&skipRenderer.calls); n != 0 {
@@ -1566,8 +1586,8 @@ func TestAccept03b_RenderEngineSkip(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctxB, cancelB := context.WithCancel(ctx)
-	runBDone := make(chan struct{})
-	go func() { defer close(runBDone); _ = renderworker.Run(ctxB, wB, optsB) }()
+	runBDone := make(chan error, 1)
+	go func() { runBDone <- renderworker.Run(ctxB, wB, optsB) }()
 
 	accWaitFor(t, "worker B rendered the skipped row", 90*time.Second, func() bool {
 		rows := accRows(t, env.pool, ids["spa-shell"])
@@ -1577,7 +1597,11 @@ func TestAccept03b_RenderEngineSkip(t *testing.T) {
 		return pendingCount(t, env.rdb, queue.StreamRenderFallback, "acc-render-skip-b") == 0
 	})
 	cancelB()
-	<-runBDone
+	// The OnRun graceful-shutdown contract (T-012): see worker A's join
+	// above (18#P3-5).
+	if err := <-runBDone; err != nil {
+		t.Errorf("worker B's Run exited with an error: %v", err)
+	}
 
 	t.Run("worker B: the page opens in chromium, the DOM stored, q:analyze published", func(t *testing.T) {
 		after := accRows(t, env.pool, ids["spa-shell"])[0]
@@ -2064,27 +2088,31 @@ func TestAccept06_ZoneProgressAutomatic(t *testing.T) {
 	// the dev bench's Prometheus scrapes (docker DNS monitor:9100, as in
 	// deploy/docker/prometheus/prometheus.yml). An HTTP request to the
 	// service, not a local registry: a forgotten route, a wrong port or a
-	// silent handler fail here due to the production code. If the
-	// application service is not up (make test-integration starts only the
-	// infrastructure and the testbed) — an honest skip, not the tautology
-	// of "own registry → own handler".
-	url := accMonitorMetricsURL()
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(url)
-	if err != nil {
-		t.Skipf("the monitor service unavailable (%s: %v) — bring up the app profile (make up): the real /metrics exposure needs a running service", url, err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		t.Fatalf("read %s: %v", url, err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("the monitor service's /metrics: code %d, want 200", resp.StatusCode)
-	}
-	if !strings.Contains(string(body), `crawler_service_up{service="monitor"} 1`) {
-		t.Errorf("the monitor exposure without crawler_service_up{service=\"monitor\"} 1:\n%s", string(body))
-	}
+	// silent handler fail here due to the production code. A separate
+	// subtest (18#P2-1): the skip of an unavailable service (make
+	// test-integration and CI start only the infrastructure and the
+	// testbed, no app services) must not blank the already-earned pass
+	// checks of the item above — without it the whole TestAccept06 came
+	// out SKIP in every regular run.
+	t.Run("metrics", func(t *testing.T) {
+		url := accMonitorMetricsURL()
+		client := &http.Client{Timeout: 5 * time.Second}
+		resp, err := client.Get(url)
+		if err != nil {
+			t.Skipf("the monitor service unavailable (%s: %v) — bring up the app profile (make up): the real /metrics exposure needs a running service", url, err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		if err != nil {
+			t.Fatalf("read %s: %v", url, err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("the monitor service's /metrics: code %d, want 200", resp.StatusCode)
+		}
+		if !strings.Contains(string(body), `crawler_service_up{service="monitor"} 1`) {
+			t.Errorf("the monitor exposure without crawler_service_up{service=\"monitor\"} 1:\n%s", string(body))
+		}
+	})
 }
 
 // ---------------------------------------------------------------- item 8
@@ -2353,11 +2381,13 @@ func TestAccept10_DomainSearchByName(t *testing.T) {
 	}
 
 	t.Run("the IDN domain in any writing form", func(t *testing.T) {
-		// The input forms: unicode (case, a dot), punycode — the
-		// internal/idn normalization before the DB call, as crawlerctl
-		// domain (T-081).
+		// The input forms: unicode in mixed case with a trailing dot
+		// (the case-insensitivity of the normalization, spec 5.2 item 1 —
+		// a lowercase-only input would not tell a case-folding regression
+		// from a pass), punycode with edge spaces — the internal/idn
+		// normalization before the DB call, as crawlerctl domain (T-081).
 		forms := []string{
-			accIDNLabelU + "." + accIDNZoneUni + ".",     // сайт.Проверка.TEST.
+			"Сайт.Проверка.TEST.",                        // unicode, mixed case (сайт.проверка.test.)
 			"  " + accIDNLabel + "." + accIDNZone + "  ", // punycode with edge spaces
 		}
 		var canonical map[string]any

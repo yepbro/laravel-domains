@@ -526,12 +526,24 @@ func TestInfra_Postgres(t *testing.T) {
 		t.Fatalf("the domains table missing — the migrations not applied (err=%v)", err)
 	}
 
+	// The seed of migration 000001 is applied: enabled subdomains exist,
+	// and the known www record of the spec 5.10 initial set is enabled.
+	// An exact count would be brittle — a new migration may legitimately
+	// add or disable entries, which must not fail an environment smoke
+	// (18#P3-3 of the bulk review).
 	var subdomains int
 	if err := pool.QueryRow(ctx, "SELECT count(*) FROM subdomains WHERE enabled").Scan(&subdomains); err != nil {
 		t.Fatalf("the subdomains table: %v", err)
 	}
-	if subdomains != 6 {
-		t.Errorf("enabled subdomains = %d, want 6 (migration 000001)", subdomains)
+	if subdomains == 0 {
+		t.Error("no enabled subdomains — the seed of migration 000001 is missing")
+	}
+	var www bool
+	if err := pool.QueryRow(ctx, "SELECT enabled FROM subdomains WHERE label = 'www'").Scan(&www); err != nil {
+		t.Fatalf("the seeded www subdomain: %v", err)
+	}
+	if !www {
+		t.Error("the www subdomain of the initial set (spec 5.10) must stay enabled")
 	}
 
 	if _, err := pool.Exec(ctx, "SELECT 1"); err != nil {

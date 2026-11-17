@@ -1477,3 +1477,57 @@ telegram-env.sh, telegram-notify.sh}; deploy/systemd/{crawler-render-
 worker@.service, crawler-chromium2.service};
 .github/workflows/{ops-telegram-env.yml, deploy.yml};
 docs/{deploy.md, ci-cd.md, operations.md, runbooks.md}.
+
+### D-048 — T-304: e2e/интеграционные тесты — skip метрик изолирован в подтест, до-проверки контрактов стадий
+Дата: 2026-11-17.
+Проблема: находки bulk-ревью стадии 18 (e2e/integration). 18#P2-1 —
+проверка /metrics монитор-сервиса в TestAccept06 стояла на родительском
+тесте: make test-integration (и CI) не поднимает app-сервисы, `t.Skipf`
+гасил весь тест — уже отработавшие проверки прохода зон теряли зелёный
+сигнал, а метрическая половина критерия §11.4 item 6 не исполнялась
+нигде, кроме ручного `make up`-профиля. 18#P3-1…P3-5 — заявленная
+граница «at the threshold» не сидировалась (24ч-батча в тесте не было);
+комментарий обещал case-вариант IDN при нижнерегистровом входе; хардкод
+`subdomains != 6` в infra-smoke; при таймауте хелпера loop() горутина
+RetentionLoop не джойнилась; `_ = renderworker.Run(...)` в четырёх
+render-сценариях проглатывал возврат — контракт graceful shutdown
+(T-012) не проверялся.
+Решение: /metrics вынесен в подтест `t.Run("metrics", …)` — skip
+касается только его; в acceptance-карте (шапка acceptance_test.go)
+пометлено, что метрика item 6 в CI не покрывается (только ручной make
+up-профиль). Третий сид ровно `now−StaleBatchAge`: по контракту
+batchIDBefore (нулевый случайный хвост, DELETE строго `<`) выживает —
+счётчики want 6, ClearBatch-цикл расширен. IDN-форма заменена на
+смешанный регистр «Сайт.Проверка.TEST.» (регистронезависимость
+idn.Normalize подтверждена scratch-прогоном в tools-контейнере:
+→ xn--80aswg.xn--80adjurfhd.test). Infra-smoke: вместо точного числа —
+`enabled > 0` + известная запись 'www' (спец 5.10) включена. В ветке
+таймаута loop() добавлен bounded-join (`select` done/5s). Четыре
+render-горутины шлют результат в буферизованный `chan error`, после
+cancel — `err == nil` (образец render_stream_test.go:122,151-159).
+18#P3-6 (negative-wait в resilience) — отдельная идея T-312, сюда не
+входила. Прод-код не менялся.
+Проверки: COMPOSE_PROJECT_NAME=crawler make test — ok (test/integration
+компилируется в unit-прогоне); make lint — 0 issues; интеграционный
+прогон изменённых тестов — финальным make test-integration в основном
+дереве (в worktree запрещён): TestAccept03_RenderFallback,
+TestAccept03b_RenderEngineSkip, TestAccept06_ZoneProgressAutomatic,
+TestAccept10_DomainSearchByName, TestContent_RetentionCursorRestart,
+TestIngest_CleanupStaleBatches, TestInfra_Postgres.
+Ревью: один раунд, deepseek (opencode-go/deepseek-v4.1-flash, отчёт
+tmp/review/31-t304.md): approve-with-findings, P0–P2 нет. P3-1 —
+комментарий сида cutID объяснял выживание «хвостом > 0», хотя при
+строгом `<` сид выживает при любом хвосте (нулевой хвост = ровно
+граница) — исправлено (формулировка без ложного намёка на флак). P3-2 —
+docs-карта приёмки (dev-environment.md, § Acceptance tests) не отражала
+CI-пробел item 6 — исправлено (строка таблицы + абзац Specifics).
+Отклонённых находок нет. Вне объёма (не находки коммита, отмечены
+ревьюером): предсуществующий FAIL TestNormalizeZeroWidth на хостовом
+go1.27.3 (воспроизводится на master e88eeed, контейнерный тулчейн
+зелёный); предпосылка «tail > 0» в stage_test.go:176-178.
+Ссылки: T-304; bulk-ревью 18#P2-1, 18#P3-1..P3-5
+(tmp/review/stage-report.md, tmp/review/00-consolidated.md); ревью раунда —
+tmp/review/31-t304.md; test/integration/{acceptance_test.go,
+content_test.go, env_test.go, ingest_stage_cleanup_test.go};
+docs/dev-environment.md (acceptance map item 6);
+internal/ingest/{cleanup.go (batchIDBefore), stage.go}.

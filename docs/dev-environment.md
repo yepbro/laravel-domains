@@ -971,7 +971,7 @@ ingest/schema), not duplicate them; the coverage map:
 | item 3 | SPA: DOM + cookies; HTML; dedup/compression; reading back | `TestAccept03_SPADomCookiesContent` |
 | item 4 | analysis (versions/score) + reanalyze without re-downloading | `TestAccept04_ReanalyzeNoRefetch` |
 | item 5 | selections from `laravel_domains`/`laravel_findings` | `TestAccept05_LaravelTablesQueries` |
-| item 6 | zone progress updates automatically; metrics | `TestAccept06_ZoneProgressAutomatic` |
+| item 6 | zone progress updates automatically; metrics (the metrics half — only under the manual `make up` app profile; `make test-integration`/CI start no app services, so the `metrics` subtest is skipped there) | `TestAccept06_ZoneProgressAutomatic` |
 | item 7 | a daily run within the memory budget on the target server | outside the dev bench — task T-093, done ([load-measurements.md](load-measurements.md) §13) |
 | item 8 | the recheck interval (6 months, config) | `TestAccept08_RecheckInterval` |
 | item 9 | service restarts: no losses or "stuck" domains (lease) | `TestAccept09_RestartNoStuckDomains` |
@@ -985,7 +985,11 @@ the navigation is substituted with `http://` — the internal Caddy CA is not tr
 the dev stack's Chromium (production renders public certificates), the live render
 tests go the same way; the sample expectations (items 4, 5, 10, 11) are read
 from the corpus's `meta.yaml` (`rules.LoadSamples`) — the acceptance suite keeps no
-copies of the references.
+copies of the references. The item 6 metrics
+(`crawler_service_up{service="monitor"}`) are the exposure of the running
+monitor service: `make test-integration` and CI start no app services, so
+the `metrics` subtest skips there — the manual `make up` profile covers it
+(T-304).
 
 
 ## 8. Troubleshooting common problems

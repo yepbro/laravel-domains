@@ -50,8 +50,8 @@ func (e *ingestEnv) stageOrphanRows(t *testing.T, batchID []byte, zoneID int16, 
 }
 
 // TestIngest_CleanupStaleBatches — the batch older than the threshold
-// is removed; the one at the threshold (but younger) and the fresh one
-// survive; a repeated pass is a no-op.
+// is removed; the batches exactly at the cutoff, an hour younger than
+// the threshold and fresh survive; a repeated pass is a no-op.
 func TestIngest_CleanupStaleBatches(t *testing.T) {
 	skipUnlessIntegration(t)
 	e := newIngestEnv(t)
@@ -67,10 +67,20 @@ func TestIngest_CleanupStaleBatches(t *testing.T) {
 	}
 
 	now := time.Now()
-	oldID := stageBatchID(t, now.Add(-ingest.StaleBatchAge-time.Hour))  // a day and an hour ago
+	oldID := stageBatchID(t, now.Add(-ingest.StaleBatchAge-time.Hour)) // a day and an hour ago
+	// Exactly at the cutoff (the 24 h age): batchIDBefore builds the
+	// range boundary with a zero random tail and the DELETE takes only
+	// what is strictly below it — any random tail keeps this batch at or
+	// above the boundary (a zero tail lands exactly on it, still excluded
+	// by the strict <), so the survival does not depend on the tail. The
+	// boundary arithmetic itself is pinned at the unit level
+	// (stage_test.go TestBatchIDAgeOrdering); here — the live range
+	// semantics of the SQL (18#P3-1 of the bulk review).
+	cutID := stageBatchID(t, now.Add(-ingest.StaleBatchAge))            // exactly at the cutoff
 	edgeID := stageBatchID(t, now.Add(-ingest.StaleBatchAge+time.Hour)) // an hour younger than the threshold
 	freshID := stageBatchID(t, now)                                     // fresh batch
 	e.stageOrphanRows(t, oldID, z.id, 3)
+	e.stageOrphanRows(t, cutID, z.id, 2)
 	e.stageOrphanRows(t, edgeID, z.id, 2)
 	e.stageOrphanRows(t, freshID, z.id, 2)
 
@@ -81,8 +91,8 @@ func TestIngest_CleanupStaleBatches(t *testing.T) {
 	if rows != 3 {
 		t.Errorf("rows deleted = %d, want 3 (only the batch older than the threshold)", rows)
 	}
-	if n := e.countOf(t, "ingest_stage"); n != 4 {
-		t.Errorf("ingest_stage rows = %d, want 4: the at-threshold and fresh batches stay untouched", n)
+	if n := e.countOf(t, "ingest_stage"); n != 6 {
+		t.Errorf("ingest_stage rows = %d, want 6: the at-cutoff, an-hour-younger and fresh batches stay untouched", n)
 	}
 
 	// A repeated pass at the same point in time is a no-op (the cleaned
@@ -94,12 +104,12 @@ func TestIngest_CleanupStaleBatches(t *testing.T) {
 	if rows != 0 {
 		t.Errorf("repeat cleanup deleted %d, want 0", rows)
 	}
-	if n := e.countOf(t, "ingest_stage"); n != 4 {
-		t.Errorf("ingest_stage rows after the repeat = %d, want 4", n)
+	if n := e.countOf(t, "ingest_stage"); n != 6 {
+		t.Errorf("ingest_stage rows after the repeat = %d, want 6", n)
 	}
 
 	// Fresh batches leave staging the normal way — ClearBatch of their own batch.
-	for _, id := range [][]byte{edgeID, freshID} {
+	for _, id := range [][]byte{cutID, edgeID, freshID} {
 		var bid ingest.BatchID
 		copy(bid[:], id)
 		if _, err := ingest.ClearBatch(ctx, e.pool, bid); err != nil {
