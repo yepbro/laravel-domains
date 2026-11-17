@@ -294,3 +294,10 @@ pause, Telegram notification episodes, the dashboard ready-latch, the rule
 reloader, the service skeleton, the DNS client (exchange/fallback/adaptive).
 For them the audit records: localized, behavior deliberate; decision-table
 documentation is added within the regular task cycle on first touch.
+
+Already documented on first touch: the analyzer's analysis-status
+machines — the `subdomain_results` row analysis state (`rules_version`
+NULL/stale/current) and the `laravel_domains` row presence — formalized
+by the bulk review (T-301, finding 07#P2-1): the transition tables are
+in the `internal/analyzer/{worker,aggregate}.go` doc comments, the pure
+transition decision is `aggDecideTransition`.

@@ -63,6 +63,46 @@
 // "stamp → domains" chain would close into a cycle with the T-058
 // recheck transaction (UPDATE domains → DELETE subdomain_results);
 // only analyzer recalculations take an advisory key of this class — no wait cycles.
+//
+// # The laravel_domains presence FSM (T-301)
+//
+// Formalized per the project rule (AGENTS.md; the registry —
+// tasks/TZ-fsm.md) without a behavior change. States of a domain's row:
+// absent (no row — no confident hits, the §13.1 threshold) and present.
+// The event is one recalculation inside a delivery transaction; the
+// transition class is decided by the pure aggDecideTransition over the
+// recalculation facts (the truth table is pinned by
+// TestAggregate_TransitionTable):
+//
+//	facts (findings, existed, deleted, fresh)  transition         side effects
+//	findings > 0 ∧ ¬existed                    absent → present   upsert; the zone counter +1 (T-178);
+//	                                                              on fresh — history appeared + the
+//	                                                              cumulative (T-118)
+//	findings > 0 ∧ existed                     present → present  upsert (a rewrite); none
+//	findings = 0 ∧ existed ∧ deleted ∧ fresh   present → absent   delete; the zone counter −1; history
+//	                                                              lost + the cumulative (T-118)
+//	findings = 0 ∧ existed ∧ deleted ∧ ¬fresh  present → absent   delete; the zone counter −1; NO
+//	                                                              history (a rule change is not a site
+//	                                                              fact, T-118); the T-187 drain signal
+//	                                                              (unfound → worker.drainUnfound)
+//	findings = 0 ∧ ¬(existed ∧ deleted)        absent → absent    delete (DELETE 0); none
+//
+// INVARIANT (what makes the table well-defined): only analyzer
+// recalculations change the PRESENCE of a laravel_domains row —
+// INSERT/DELETE (aggregateUpsertSQL / aggregateDeleteSQL); every
+// recalculation takes pg_advisory_xact_lock(domain_id) as its FIRST
+// statement — the recalculations of one domain are serialized, existed
+// is read and the row is written under the same lock, so no parallel
+// delivery can slip between the check and the write; hence, among
+// recalculations, existed ⟺ the DELETE's RowsAffected == 1 in the
+// delete branch. The one other writer is the console
+// `crawlerctl zones collapse` (collapse.moveLaravelSQL): it only
+// re-zones existing rows (UPDATE zone_id) inside a maintenance window
+// and never changes presence; a row moved to another zone between
+// aggregateExistsSQL and aggregateDeleteSQL yields existed=true with
+// RowsAffected=0 — exactly what the double condition of
+// aggDecideTransition treats as no transition (the guard against that
+// race, see the T-M10 note in aggregateDomain).
 package analyzer
 
 import (
@@ -85,11 +125,16 @@ var (
 
 	// aggregateSelectSQL — the recalculation input: the domain's confident hits.
 	// Read in the worker transaction — it sees this delivery's own findings
-	// write. The order is by PK (the leaf partition key sort), deterministic:
-	// equal bounds written differently ("9.19" and "9.19.0") put the first
-	// one into the aggregate.
+	// write. The order is fixed by an explicit ORDER BY over the
+	// laravel_findings PK tail (the equality prefix zone_id/domain_id is
+	// already fixed by the WHERE): PostgreSQL does not guarantee row order
+	// without ORDER BY, and equal bounds written differently ("9.19" and
+	// "9.19.0" — rules.CompareVersions == 0) must deterministically put
+	// the first one into the aggregate (07#P3-1: the leaf partition key
+	// sort is an implementation detail, not a contract).
 	aggregateSelectSQL = "SELECT subdomain_id, score, ver_min, ver_max FROM laravel_findings " +
-		"WHERE zone_id = $1::int2 AND domain_id = $2::int8 AND is_laravel"
+		"WHERE zone_id = $1::int2 AND domain_id = $2::int8 AND is_laravel " +
+		"ORDER BY subdomain_id, variant"
 
 	// aggregateUpsertSQL — writing the aggregate: an upsert by the
 	// laravel_domains PK (§3.5 rewrite, §6.1): repeated deliveries and
@@ -154,6 +199,56 @@ const (
 	counterLaravelLost     = "laravel_lost_total"
 )
 
+// aggTransition is the class of the laravel_domains row presence
+// transition over one recalculation (the FSM table is in the package
+// doc comment; T-301). aggNoTransition means "the row is rewritten in
+// place / nothing changes presence-wise".
+type aggTransition int
+
+const (
+	aggNoTransition aggTransition = iota
+	aggAppeared                   // absent → present (the row is born)
+	aggLost                       // present → absent, a fresh episode (a site fact, T-118)
+	aggLostUnfound                // present → absent, re-analysis (the T-187 drain signal)
+)
+
+// aggDecideTransition — the pure decision "which transition" of the
+// laravel_domains row over one recalculation (the transition table of
+// the package doc comment; the truth table is pinned by
+// TestAggregate_TransitionTable — the FR-1/FR-4 format of
+// tasks/TZ-fsm.md). The facts:
+//
+//   - findings — the domain's confident hits read by the recalculation
+//     (> 0 — the row must exist, 0 — it must not, §13.1);
+//   - existed — the row presence BEFORE the recalculation, read under
+//     the advisory lock;
+//   - deletedRows — RowsAffected of the aggregate DELETE (1 — the row
+//     was really removed, 0 — there was nothing to delete); consulted
+//     only at findings == 0: under the serialization invariant (only
+//     recalculations write laravel_domains, they are serialized by the
+//     advisory lock) existed=true ⟺ deletedRows=1 there, and the double
+//     condition is a guard against a broken invariant (the T-M10 note
+//     in aggregateDomain);
+//   - fresh — the delivery of a fresh HTTP episode (queue.Result.Fresh):
+//     only a fresh episode is a site fact (the history journal and the
+//     cumulative, T-118); a non-fresh removal is the T-187 drain signal.
+func aggDecideTransition(findings int, existed bool, deletedRows int64, fresh bool) aggTransition {
+	switch {
+	case findings > 0:
+		if existed {
+			return aggNoTransition // present → present: the row is rewritten
+		}
+		return aggAppeared
+	case existed && deletedRows > 0:
+		if fresh {
+			return aggLost
+		}
+		return aggLostUnfound
+	default:
+		return aggNoTransition // absent → absent: DELETE 0, nothing changed
+	}
+}
+
 // aggregateDomain recalculates the domain's laravel_domains row from
 // its findings. It is called from the worker transaction (T-071) after
 // the findings are written: the SELECT sees this transaction's writes,
@@ -172,14 +267,21 @@ const (
 // came back with a fresh episode" leaves a single appeared (appearance)
 // without a paired lost — the price of protection against rule noise; the trend over a set of domains is correct.
 //
+// Which transition this recalculation makes — none/appeared/lost/
+// lost-unfound — is decided by the pure aggDecideTransition (the FSM
+// table in the package doc comment; T-301); the side effects of each
+// class (the row write, the zone counter delta, the history journal and
+// the cumulatives, the unfound signal) are executed below per the table.
+//
 // The unfound return is the signal of a find removal by re-analysis
 // (T-187): the laravel_domains row existed and was removed by a
-// delivery WITHOUT fresh (RowsAffected > 0 ∧ ¬fresh ∧ existed). The
-// domain's old subdomain_results rows are not rewritten by such a
-// delivery and return to the retention candidate set behind the drain
-// cursor (T-185) — the caller answers with the domain content point
-// drain (content.DrainDomain, worker.drainUnfound). On fresh the signal
-// is false: the fresh episode rewrote the rows with marks ahead of the cursor (T-058).
+// delivery WITHOUT fresh (aggLostUnfound: RowsAffected > 0 ∧ ¬fresh ∧
+// existed). The domain's old subdomain_results rows are not rewritten
+// by such a delivery and return to the retention candidate set behind
+// the drain cursor (T-185) — the caller answers with the domain
+// content point drain (content.DrainDomain, worker.drainUnfound). On
+// fresh the signal is false: the fresh episode rewrote the rows with
+// marks ahead of the cursor (T-058).
 func aggregateDomain(ctx context.Context, tx pgx.Tx, zoneID int16, domainID int64, version int32, fresh bool) (unfound bool, err error) {
 	// The lock first: the recalculations of one domain line up in a queue,
 	// the second reads the findings after the first one's commit.
@@ -210,22 +312,25 @@ func aggregateDomain(ctx context.Context, tx pgx.Tx, zoneID int16, domainID int6
 		if err != nil {
 			return false, fmt.Errorf("deleting domain row: %w", err)
 		}
-		// Equivalent mutants (T-M10): RowsAffected of a DELETE is 0 or 1,
-		// and existed is read under the advisory lock BEFORE the delete
-		// (only recalculations write laravel_domains, they are serialized) —
-		// existed=true ⟺ the DELETE will affect 1: weakening "> 0" to ">= 0" /
-		// "> -1" and cutting out existed are distinguishable only at
-		// RowsAffected == 0 ∧ existed — unreachable. Row granularity also kills
-		// the killable fresh cut — it is covered by TestAggregate_History
-		// (re-analysis writes no history); trade-off §4 docs/mutation-testing.md.
-		// mutator-disable-next-line expression/comparison, expression/remove, numbers/decrementer
-		if tag.RowsAffected() > 0 && existed {
+		// The transition decision — the pure aggDecideTransition (the FSM
+		// table in the package doc comment; the truth table is pinned by
+		// TestAggregate_TransitionTable). Equivalent mutants (T-M10) moved
+		// with the guard into the pure function and are killed there by
+		// the table test (the RowsAffected/existed combinations are its
+		// cases); the integration-level equivalence is unchanged:
+		// RowsAffected == 0 ∧ existed is unreachable under the advisory-lock
+		// serialization (the INVARIANT of the package doc comment). Row
+		// granularity also kills the killable fresh cut — it is covered by
+		// TestAggregate_History (re-analysis writes no history); trade-off
+		// §4 docs/mutation-testing.md.
+		tr := aggDecideTransition(agg.findings, existed, tag.RowsAffected(), fresh)
+		if tr == aggLost || tr == aggLostUnfound {
 			// The row existed and disappeared — the zone counter −1 (a presence
 			// transition, T-178); on fresh — lost in the journal and the cumulative (T-118).
 			if err := aggregateShiftZoneLaravel(ctx, tx, zoneID, -1); err != nil {
 				return false, err
 			}
-			if fresh {
+			if tr == aggLost {
 				if _, err := tx.Exec(ctx, aggregateHistorySQL, zoneID, domainID, false); err != nil {
 					return false, fmt.Errorf("history write (lost): %w", err)
 				}
@@ -235,7 +340,7 @@ func aggregateDomain(ctx context.Context, tx pgx.Tx, zoneID int16, domainID int6
 			}
 			// The T-187 signal: a transition without fresh — re-analysis removed
 			// the find without rewriting the domain's rows (see the function doc comment).
-			return !fresh, nil
+			return tr == aggLostUnfound, nil
 		}
 		return false, nil
 	}
@@ -248,7 +353,9 @@ func aggregateDomain(ctx context.Context, tx pgx.Tx, zoneID int16, domainID int6
 	if tag.RowsAffected() != 1 {
 		return false, fmt.Errorf("writing domain row: %d rows affected", tag.RowsAffected())
 	}
-	if existed {
+	// The transition decision — aggDecideTransition (deletedRows is not
+	// consulted at findings > 0; the upsert above has already happened).
+	if aggDecideTransition(agg.findings, existed, 0, fresh) != aggAppeared {
 		return false, nil
 	}
 	// There was no row and one appeared — the zone counter +1 (a presence
@@ -347,7 +454,8 @@ func scanAggregate(rows pgx.Rows) (domainAggregate, error) {
 		// Bounds: a NULL (no bound/conflict) is remembered as a flag — the
 		// union is unbounded on that side; from the known bounds the
 		// extreme is taken (min for the lower, max for the upper); equal
-		// bounds written differently keep the first (the PK order is deterministic).
+		// bounds written differently keep the first (the ORDER BY of the
+		// select is deterministic).
 		if r.verMin == nil {
 			unboundedMin = true
 		} else if !haveMin || rules.CompareVersions(*r.verMin, minStr) < 0 {

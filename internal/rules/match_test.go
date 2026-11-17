@@ -324,6 +324,55 @@ func TestMatchRuleValueSizeCap(t *testing.T) {
 	}
 }
 
+// TestMatchCapsCutOnRuneBoundary — htmlCap/valueCap cut multibyte input
+// at a rune boundary (07#P3-2): a byte-level cut severs the trailing
+// rune, RE2 reads the remains as U+FFFD, and a rule with a multibyte
+// literal at the boundary (an end anchor over the last intact rune)
+// stops firing. The caps roll the severed rune's bytes back — no suffix
+// (unlike the evidence trim, the caps are invisible input bounds).
+func TestMatchCapsCutOnRuneBoundary(t *testing.T) {
+	lim := DefaultLimits()
+	lim.MaxValueBytes = 7 // "абвг" is 8 bytes: byte 7 is inside "г"
+	lim.MaxHTMLBytes = 7
+	multibyte := "абвг" // Cyrillic letters are 2 bytes each in UTF-8
+
+	if got := lim.valueCap(multibyte); got != "абв" {
+		t.Errorf("valueCap = %q (%d bytes), want абв (the cut rolled back to the rune boundary)",
+			got, len(got))
+	}
+	if got := string(lim.htmlCap([]byte(multibyte))); got != "абв" {
+		t.Errorf("htmlCap = %q (%d bytes), want абв (the cut rolled back to the rune boundary)",
+			got, len(got))
+	}
+
+	// End-to-end: the end anchor over the last INTACT rune — with a byte
+	// cut the capped value ends with a torn "г" and `в$` does not match;
+	// after the rune-boundary rollback the value is "абв" and it does.
+	if _, ok := matchRule(bgCtx(), Rule{Target: TargetCookieValue, Regex: `в$`},
+		Page{Cookies: []Cookie{{Name: "c", Value: multibyte}}}, lim); !ok {
+		t.Error("the end-anchored rule over the last intact rune did not fire — valueCap tears the rune")
+	}
+	if _, ok := matchRule(bgCtx(), Rule{Target: TargetHeaderValue, Regex: `в$`},
+		Page{Headers: map[string][]string{"X-M": {multibyte}}}, lim); !ok {
+		t.Error("the end-anchored rule over the last intact rune did not fire — valueCap tears the rune (headers)")
+	}
+	if _, ok := matchRule(bgCtx(), Rule{Target: TargetHTML, Regex: `в$`},
+		Page{HTML: []byte(multibyte)}, lim); !ok {
+		t.Error("the end-anchored rule over the last intact rune did not fire — htmlCap tears the rune")
+	}
+
+	// A rune ending exactly AT the cap is kept whole — the boundary
+	// itself is not a cut (an even cap over 2-byte runes).
+	lim.MaxValueBytes = 6
+	if got := lim.valueCap(multibyte); got != "абв" {
+		t.Errorf("valueCap at the exact rune boundary = %q, want абв", got)
+	}
+	if _, ok := matchRule(bgCtx(), Rule{Target: TargetCookieValue, Regex: `в$`},
+		Page{Cookies: []Cookie{{Name: "c", Value: multibyte}}}, lim); !ok {
+		t.Error("a rule over a rune ending exactly at the cap did not fire")
+	}
+}
+
 func TestMatchRuleContextCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

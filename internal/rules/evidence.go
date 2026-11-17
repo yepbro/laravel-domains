@@ -58,9 +58,10 @@ func capName(name string) string {
 
 // finalizeEvidence brings a raw evidence to its stored form: invalid
 // UTF-8 → U+FFFD (json.Marshal would do the same on output — we fix it
-// here so the evidence is valid already in memory), control characters → "·"
-// (a single line without terminal escape sequences), truncation to the
-// limit at a rune boundary with an ellipsis.
+// here so the evidence is valid already in memory), control characters
+// (C0, C1, DEL) → "·" (a single line without terminal escape
+// sequences), truncation to the limit at a rune boundary with an
+// ellipsis.
 func finalizeEvidence(s string, lim Limits) string {
 	s = cleanEvidence(s)
 	max := lim.snippetCap()
@@ -70,46 +71,46 @@ func finalizeEvidence(s string, lim Limits) string {
 	return truncateUTF8(s, max) + "…"
 }
 
-// cleanEvidence sanitizes untrusted text: valid UTF-8, no control
-// characters (C0, DEL).
-func cleanEvidence(s string) string {
-	if !utf8.ValidString(s) {
-		s = strings.ToValidUTF8(s, "\uFFFD")
-	}
-	if !strings.ContainsAny(s, "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f"+
-		"\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x7f") {
-		return s // the fast path of ordinary pages
-	}
+// controlCutset — the sanitized control runes for the fast path: C0
+// (U+0000..U+001F), DEL and the C1 range (U+0080..U+009F). Built in
+// code: strings.ContainsAny matches UTF-8-encoded code points, and after
+// ToValidUTF8 every C1 code point is exactly the bytes C2 80..C2 9F —
+// the cutset is precise, a page with ordinary multibyte text
+// (continuation bytes 80..BF of OTHER runes) does not fall through to
+// the slow path.
+var controlCutset = buildControlCutset()
+
+func buildControlCutset() string {
 	var b strings.Builder
-	b.Grow(len(s))
-	for _, r := range s {
-		if r < 0x20 || r == 0x7f {
-			r = '·'
-		}
+	for r := rune(0); r < 0x20; r++ {
+		b.WriteRune(r)
+	}
+	b.WriteRune(0x7f)
+	for r := rune(0x80); r <= 0x9f; r++ {
 		b.WriteRune(r)
 	}
 	return b.String()
 }
 
-// truncateUTF8 truncates a string to at most max bytes without splitting a
-// rune in half: the trailing bytes of an incomplete rune are rolled back
-// (a leading byte without a continuation is as broken as a severed
-// continuation).
-func truncateUTF8(s string, max int) string {
-	if max <= 0 {
-		return ""
+// cleanEvidence sanitizes untrusted text: valid UTF-8, no control
+// characters (C0, C1, DEL). The C1 range U+0080..U+009F (Unicode
+// category Cc; U+009B is the CSI analog) is sanitized like C0 — the
+// promise "a single line without terminal escape sequences" must hold
+// for it too (07#P3-3).
+func cleanEvidence(s string) string {
+	if !utf8.ValidString(s) {
+		s = strings.ToValidUTF8(s, "\uFFFD")
 	}
-	if len(s) <= max {
-		return s
+	if !strings.ContainsAny(s, controlCutset) {
+		return s // the fast path of ordinary pages
 	}
-	s = s[:max]
-	for len(s) > 0 {
-		r, size := utf8.DecodeLastRuneInString(s)
-		if r == utf8.RuneError && size == 1 {
-			s = s[:len(s)-1] // a broken/incomplete rune at the tail
-			continue
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
+			r = '·'
 		}
-		break
+		b.WriteRune(r)
 	}
-	return s
+	return b.String()
 }

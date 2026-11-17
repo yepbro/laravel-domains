@@ -46,8 +46,8 @@ type anDomain struct {
 }
 
 // Query implements aggregateSelectSQL in the fake transaction: the
-// domain's confident hits (is_laravel) in PK order — deterministically,
-// like a PostgreSQL partition leaf; the transaction's own writes (this
+// domain's confident hits (is_laravel) in the select's ORDER BY order
+// (subdomain_id, variant) — mirroring the real statement; the transaction's own writes (this
 // delivery's findings) are visible — the fake's Exec changes the state
 // directly, Rollback restores the snapshot. The aggScanErr/aggRowsErr
 // and onClose injections are for the T-M10 mutation tests (row
@@ -207,6 +207,25 @@ func TestAggregate_SQLContract(t *testing.T) {
 	}
 }
 
+// TestAggregate_SelectOrderDeterministic — the select must carry an
+// explicit ORDER BY (07#P3-1): PostgreSQL guarantees row order only with
+// ORDER BY, and equal numeric bounds written differently ("9.19" vs
+// "9.19.0" — rules.CompareVersions == 0, the scan keeps the first one)
+// must land in the aggregate deterministically, not by the plan's mercy.
+// The (subdomain_id, variant) tail is the laravel_findings PK minus the
+// equality prefix (zone_id, domain_id). The pin is a text contract in
+// the TestAggregate_SQLContract style: the fake (anFakeTx.Query) mirrors
+// this ORDER BY by sorting its rows by (subdomain_id, variant) itself,
+// and the tie-break semantics "equal numeric bounds → the first one
+// wins" are pinned behaviorally by TestAggregate_ScanSemantics (the
+// "equal bounds in a different notation" / "neighboring rows" cases).
+func TestAggregate_SelectOrderDeterministic(t *testing.T) {
+	if !strings.Contains(aggregateSelectSQL, "ORDER BY subdomain_id, variant") {
+		t.Fatal("aggregateSelectSQL: no ORDER BY subdomain_id, variant — " +
+			"the read order of equal numeric bounds is not deterministic")
+	}
+}
+
 // --- scanAggregate: range union, mask, maximum -----------------------------
 
 func TestAggregate_ScanSemantics(t *testing.T) {
@@ -337,6 +356,43 @@ func TestAggregate_InvalidSubdomainID(t *testing.T) {
 	_, err := scanAggregate(&anAggRows{rows: [][]any{{int16(63), float32(0.7), nil, nil}}})
 	if err == nil {
 		t.Fatal("subdomain_id 63 (bit 63 is the sign bit) — an error is expected")
+	}
+}
+
+// TestAggregate_TransitionTable — the transition table of the
+// laravel_domains row presence (the FSM specification in the
+// aggregate.go doc comment; the FR-1/FR-4 format of tasks/TZ-fsm.md):
+// the pure decision aggDecideTransition over the recalculation facts.
+// The table pins the behavior formalized by T-301 — nothing changes:
+// the cases mirror the aggregateDomain branches one to one.
+func TestAggregate_TransitionTable(t *testing.T) {
+	cases := []struct {
+		name        string
+		findings    int
+		existed     bool
+		deletedRows int64
+		fresh       bool
+		want        aggTransition
+	}{
+		{"a row is born from a fresh delivery", 2, false, 0, true, aggAppeared},
+		{"a row is born from re-analysis (no history)", 1, false, 0, false, aggAppeared},
+		{"an existing row is rewritten — no transition", 3, true, 0, true, aggNoTransition},
+		{"an existing row is rewritten by re-analysis — no transition", 1, true, 0, false, aggNoTransition},
+		{"the row disappears on a fresh episode — lost", 0, true, 1, true, aggLost},
+		{"the row disappears by re-analysis — lost-unfound (the T-187 drain)", 0, true, 1, false, aggLostUnfound},
+		{"there was no row and none appears — DELETE 0 (fresh)", 0, false, 0, true, aggNoTransition},
+		{"there was no row and none appears — DELETE 0 (re-analysis)", 0, false, 0, false, aggNoTransition},
+		{"a broken invariant guard: existed but the DELETE removed nothing", 0, true, 0, true, aggNoTransition},
+		{"a broken invariant guard: existed but the DELETE removed nothing (no fresh)", 0, true, 0, false, aggNoTransition},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := aggDecideTransition(tc.findings, tc.existed, tc.deletedRows, tc.fresh)
+			if got != tc.want {
+				t.Fatalf("aggDecideTransition(findings=%d, existed=%v, deleted=%d, fresh=%v) = %d, want %d",
+					tc.findings, tc.existed, tc.deletedRows, tc.fresh, got, tc.want)
+			}
+		})
 	}
 }
 

@@ -48,6 +48,76 @@
 // aggregate"). A find removal by re-analysis (non-fresh) after the
 // commit starts the domain content point drain (T-187, drainUnfound →
 // content.DrainDomain): the domain's rows returned to the retention candidates behind the drain cursor (T-185).
+//
+// # Analysis-status FSM (T-301)
+//
+// The project rule (AGENTS.md: behavioral logic as an explicit machine,
+// not scattered flags; the registry — tasks/TZ-fsm.md) is formalized
+// here without a behavior change. Two machines: the row analysis state
+// (this file) and the laravel_domains row presence (aggregate.go).
+//
+// The row machine — the analysis state of one subdomain_results row
+// (the key of a q:analyze task). The state is not a column: it is
+// derived from the row's existence and its rules_version against the
+// current rule set snapshot (Reloader.Set):
+//
+//	absent     the row does not exist (the episode was rechecked without
+//	           this key, the domain was cleaned up);
+//	unanalyzed rules_version IS NULL (a fresh episode written by the
+//	           T-058 recheck or the T-067 render carries no stamp; rows
+//	           older than T-071);
+//	stale      rules_version <> Set.Version (an old rule set; the
+//	           re-analysis drain T-074 returns to such rows);
+//	current    rules_version = Set.Version.
+//
+// Events × guards × transitions × side effects. The guards are the
+// analyzeMarkSQL WHERE clause; every write side effect happens inside
+// the single delivery transaction (spec 3.4) — a rollback returns the
+// row to its previous state:
+//
+//	event         guard                                   transition     side effects
+//	delivery      absent                                  —              success, XACK, no write
+//	delivery      unanalyzed/stale ∧ content_hash same ∧   → current      stamp; findings upsert (hits) or
+//	              domain live                                            delete (no hits, §3.5); the aggregate
+//	                                                                     recalc; the tail bucket of the row's
+//	                                                                     episode hour −1 (a NULL/stale→current
+//	                                                                     move, T-204)
+//	redelivery    current ∧ content_hash same             — (no-op,      success, XACK; the stamp UPDATE
+//	                                                      T-204)         affects 0 rows, nothing is written
+//	content       the content_hash guard fails (another   → unanalyzed   by the rewriter, not by this delivery:
+//	change        episode rewrote the row)                              T-058 DELETE+INSERT / the T-067 render
+//	                                                                     set rules_version=NULL; the new episode
+//	                                                                     publishes its own q:analyze
+//	partial scan  res.Partial (EvalTimeout/ctx)           —              success, XACK; the row stays
+//	                                                                     unanalyzed/stale for re-analysis (T-074)
+//	no rule set   sets.Set() == nil                       —              success, XACK; the row stays for
+//	                                                                     re-analysis (T-074)
+//	domain        the NOT EXISTS guard (§8/§13.1)         —              success, XACK; the leftover
+//	deleted                                                              subdomain_results rows and their
+//	                                                                     content references are cleaned by
+//	                                                                     T-020; the domain's laravel_findings
+//	                                                                     and laravel_domains rows are not
+//	                                                                     touched (the T-020 plan, ingest/cleanup.go)
+//
+// Re-analysis (the T-074 drain over stale rows) is not a separate
+// event: it is the same delivery with rules_version stale and
+// Fresh=false — the transition and the side effects are those of the
+// delivery row above. Fresh=false changes nothing in THIS machine; it
+// matters only in the aggregate machine (aggregate.go): no history
+// journal and no cumulative for such a transition (T-118), and a
+// removal becomes the T-187 unfound drain signal instead of a lost.
+//
+// Invariant: a NON-NULL rules_version is written only by analyzeMarkSQL
+// inside the delivery transaction, together with the findings write and
+// the aggregate recalculation — there is no path that stamps a row
+// without rewriting its findings (spec 3.4: the stamp, the findings and
+// the aggregate either commit or roll back together). NULL-stamped rows
+// are created by every content writer — the T-058 recheck episode
+// INSERT (recordInsertSQL: the literal NULL), the T-067 render rewrite
+// (renderUpdateSQL), the fixtures import (rules_version from the dump) —
+// and each such write is followed by a q:analyze publication (directly
+// by the episode writer, for the fixtures import via its q:render pass),
+// so an unanalyzed row is always picked up by a later delivery.
 package analyzer
 
 import (
@@ -98,8 +168,9 @@ var (
 	// reanalyze: (the RETURNING below): repeated deliveries (tick
 	// republications, XAUTOCLAIM) have no paired write increment. The
 	// "domain is not deleted" guard — §8/§13.1: no result is written for a
-	// deleted domain, the leftover rows and findings will be cleaned by
-	// the background cleanup (T-020). RETURNING r.checked_at (T-204) is
+	// deleted domain; the background cleanup (T-020) removes its leftover
+	// subdomain_results rows and their content references, but not the
+	// laravel_* finds (ingest/cleanup.go). RETURNING r.checked_at (T-204) is
 	// the tail bucket hour for the decrement (analyzeReanalyzeConsumeSQL):
 	// the hour of the row's EPISODE, like the write/render increments; an
 	// empty result (pgx.ErrNoRows) means the guards cut it off (no row,

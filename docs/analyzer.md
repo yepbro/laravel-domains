@@ -86,7 +86,8 @@ storable form (`finalizeEvidence`):
   hostile long name does not push the value out of the trim window;
 - **invalid UTF-8** → U+FFFD (the evidence is valid already in
   memory, not only after `json.Marshal`);
-- **control characters** (C0, DEL, including tabs and line breaks) →
+- **control characters** (C0, including tabs and line breaks; C1
+  U+0080..U+009F, including the CSI analog U+009B; and DEL) →
   `·` — a single line without terminal escape sequences when read by
   an operator.
 
@@ -104,8 +105,8 @@ explicit ones):
 
 | Limit | Value | What it bounds |
 |---|---|---|
-| `MaxHTMLBytes` | 2 MiB | the inspected HTML/DOM: trimmed **before** matching (the html and meta targets) |
-| `MaxValueBytes` | 64 KiB | one cookie/header value (and the header names) |
+| `MaxHTMLBytes` | 2 MiB | the inspected HTML/DOM: trimmed **before** matching (the html and meta targets) at a UTF-8 rune boundary (without tearing a rune) |
+| `MaxValueBytes` | 64 KiB | one cookie/header value (and the header names); the trim is at a rune boundary too — a severed rune would read as U+FFFD and a rule with a multibyte literal at the boundary would stop firing |
 | `MaxPatternBytes` | 4 KiB | the length of one rule's regex pattern |
 | `MaxSnippetBytes` | 64 | the evidence (see above) |
 | `EvalTimeout` | 5 s | the budget for the whole page (through the context) |
@@ -239,8 +240,10 @@ would order "10" before "5.3". A NULL bound at any hit (no bound or a
 T-070 conflict) propagates to the domain: the union from that side is
 unbounded, the domain's bound is NULL; a bound inversion is impossible
 — every hit has `ver_min ≤ ver_max` (T-070). Equal bounds in different
-notations ("9.19" and "9.19.0") keep the first one — the read order by
-PK is deterministic.
+notations ("9.19" and "9.19.0") keep the first one — the select's
+explicit `ORDER BY subdomain_id, variant` (the findings PK tail) makes
+the read order deterministic; PostgreSQL does not guarantee row order
+without `ORDER BY`.
 
 **`rules_version`** — the version of the ruleset the recomputation was
 performed with (the delivery's `rules.Set.Version`): in the transition
@@ -279,6 +282,25 @@ T-071 stamp), and the "stamp → domains" chain would close into a cycle
 with the T-058 recheck transaction (UPDATE domains → DELETE
 subdomain_results); the advisory key of this class is taken only by
 the analyzer's recomputations — there are no waiting cycles.
+
+This is the **invariant of the `laravel_domains` presence machine**
+(formalized by T-301 as an explicit FSM — the transition table
+"recalculation facts → none/appeared/lost/lost-unfound" lives in the
+`internal/analyzer/aggregate.go` doc comment, the pure decision is
+`aggDecideTransition`): only analyzer recomputations change the
+presence of a `laravel_domains` row (INSERT/DELETE), and each takes
+the advisory lock as its first statement — the recomputations of one
+domain are serialized, "row existed before" is read and the row is
+written under the same lock, so a parallel delivery cannot slip
+between the check and the write. The one other writer is the console
+`crawlerctl zones collapse`: it only re-zones existing rows (moves
+`zone_id`) in a maintenance window and never changes presence — a row
+moved to another zone between the presence check and the DELETE is
+what the "existed AND the DELETE removed a row" double condition
+guards against. The row analysis state itself
+(`subdomain_results.rules_version` against the current ruleset:
+absent/unanalyzed/stale/current) is specified the same way in the
+`worker.go` package doc comment.
 
 `updated_at` — the database server's `now()`: the transaction time (in
 the style of `httpworker/record.go`).

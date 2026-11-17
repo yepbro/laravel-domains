@@ -1277,3 +1277,70 @@ pool}.go + тесты; internal/dnsworker/fallbackmetrics.go; internal/config
 deploy/docker/unbound/unbound.testbed.conf; config.example.yaml;
 docs/{configuration,services,runbooks}.md; инцидент 24.10
 (internal/dnsworker/result.go:205-208).
+
+### D-045 — T-301: FSM статусов анализа формализована (таблицы + чистая aggDecideTransition), ORDER BY в aggregateSelectSQL, UTF-8-капы по границе руны, C1 в evidence
+Дата: 2026-11-17.
+Проблема: четыре находки стадии 07-analyzer-rules bulk-ревью.
+(1) 07#P2-1: жизненный цикл статусов анализа размазан по флагам
+(rules_version NULL/stale/current, Partial, ErrNoRows, RowsAffected,
+unfound) — нарушение FSM-правила проекта, машина не поименована в
+реестре TZ-fsm. (2) 07#P3-1: aggregateSelectSQL обещает
+детерминированный порядок, но ORDER BY нет — при равных числовых
+версиях («9.19» vs «9.19.0», CompareVersions==0) в laravel_domains
+может попасть то одна, то другая строка. (3) 07#P3-2: htmlCap/
+valueCap режут UTF-8 по байтам — разорванная руна читается RE2 как
+U+FFFD, правило с многобайтным литералом на границе не срабатывает.
+(4) 07#P3-3: cleanEvidence не санитизирует C1 (U+0080..U+009F, включая
+CSI-аналог U+009B) вопреки обещанию docs/analyzer.md «a single line
+without terminal escape sequences».
+Решение: (1) Формализация БЕЗ изменения поведения: таблица машины
+строки (absent/unanalyzed/stale/current × события delivery/redelivery/
+content change/partial/no-set/deleted → guard → переход → побочные
+эффекты) — в doc-комментарии пакета worker.go; таблица машины
+присутствия laravel_domains (findings/existed/deleted/fresh →
+none/appeared/lost/lost-unfound → побочные эффекты) + явный ИНВАРИАНТ
+(только рекалькуляции пишут laravel_domains, каждая берёт
+pg_advisory_xact_lock(domain_id) первым выражением — existed ⟺
+RowsAffected DELETE) — в doc-комментарии aggregate.go и в
+docs/analyzer.md; решение «какой переход» вынесено из aggregateDomain
+в чистую aggDecideTransition (findings, existed, deletedRows, fresh) →
+aggTransition, таблица истины пинируется TestAggregate_TransitionTable
+(формат FR-1/FR-4 TZ-fsm). T-M10 эквивалентные мутанты сравнения
+RowsAffected>0&&existed переехали в чистую функцию и стали убиваемыми
+таблицей теста; mutator-disable над строкой удалён. (2) Добавлен
+ORDER BY subdomain_id, variant (хвост PK laravel_findings после
+equality-префикса WHERE), комментарий и docs переписаны с «leaf
+partition key sort» на контракт ORDER BY; тест-контракт
+TestAggregate_SelectOrderDeterministic (красный до фикса). (3)
+truncateUTF8 вынесен из evidence.go в общий helper truncate.go + байтовый
+брат truncateUTF8Bytes; оба капа режут по границе руны без суффикса;
+тест TestMatchCapsCutOnRuneBoundary — руна ровно на границе (красный до
+фикса: `в$` на «абвг» с капом 7 байт не срабатывал). (4) cleanEvidence
+расширен до C0+C1+DEL (r < 0x20 || 0x7f..0x9f); fast-path ContainsAny
+пересобран на программный катсет controlCutset (32 C1-руны:
+ContainsAny матчит code points, после ToValidUTF8 катсет точен —
+обычная кириллица не падает в медленный путь); тесты
+TestCleanEvidenceC1 + расширенный TestEvaluateEvidenceTrimmedAndSafe
+(U+009B), красные до фикса.
+Ревью (deepseek, tmp/review/30-t301.md, один раунд): P0/P1 нет.
+P2-1/P2-2/P2-3 приняты — неточные формулировки инвариантов (второй
+писатель laravel_domains — crawlerctl zones collapse: перенос zone_id,
+presence не меняет; NULL-стэмп создают все content-писатели — T-058
+episode INSERT, T-067 render, fixtures import, — а non-NULL пишет
+только analyzeMarkSQL; T-020 чистит subdomain_results и content-ссылки,
+но не laravel_findings/laravel_domains) — исправлены текстом без
+изменения кода: INVARIANT в aggregate.go, инвариант и строка таблицы
+«domain deleted» в worker.go + источник в комментарии analyzeMarkSQL,
+дубль в docs/analyzer.md. P3-1 (комментарий к контракт-тесту: фейк
+зеркалит ORDER BY, семантику пинит TestAggregate_ScanSemantics), P3-2
+(примечание: reanalysis — не отдельное событие), P3-3 (разорванная
+фраза в aggregateDomain), P3-4 (формулировка C0/C1/DEL в docs), P3-5
+(строка в §6 TZ-fsm) — приняты. Отклонённых находок нет; поведение
+не менялось.
+Проверки: make test / make lint — зелёные (analyzer/rules не в
+RACE_PKGS).
+Ссылки: T-301; bulk-ревью 07#P2-1, 07#P3-1..3
+(tmp/review/stage-report.md); internal/analyzer/{worker,aggregate}.go +
+aggregate_test.go; internal/rules/{truncate.go,evidence.go,limits.go} +
+{match,engine}_test.go; docs/analyzer.md; tasks/TZ-fsm.md (§4 принципы,
+§6 реестр).

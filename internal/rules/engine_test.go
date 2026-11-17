@@ -317,8 +317,8 @@ rules:
 	// a multibyte fragment: truncation does not split a rune
 	utf8Frag := []byte("ЗДЕСЬ-" + strings.Repeat("тест", 100))
 	// control characters and broken UTF-8 are sanitized: (?s).+ captures
-	// everything, including \x00, ESC and the invalid byte \xff
-	ctrl := []byte("CTRL-a\x00b\x1bc\xffd")
+	// everything, including \x00, ESC, C1 (U+009B) and the invalid byte \xff
+	ctrl := []byte("CTRL-a\x00b\x1bc\xffd\u009be")
 
 	lim := DefaultLimits()
 	for name, html := range map[string][]byte{"long": long, "utf8": utf8Frag, "ctrl": ctrl} {
@@ -331,7 +331,7 @@ rules:
 			if !utf8.ValidString(ev) {
 				t.Errorf("%s: the evidence is not valid UTF-8: %q", name, ev)
 			}
-			if strings.ContainsAny(ev, "\x00\x01\x1b\x7f") {
+			if strings.ContainsAny(ev, "\x00\x01\x1b\x7f\u009b") {
 				t.Errorf("%s: control characters are not sanitized: %q", name, ev)
 			}
 			if len(ev) == lim.MaxSnippetBytes+len("…") && !strings.HasSuffix(ev, "…") {
@@ -344,6 +344,33 @@ rules:
 	res := set.EvaluateCtx(context.Background(), Page{HTML: []byte("LONG-" + strings.Repeat("a", 59))}, lim)
 	if ev := res.Signals[0].Evidence; len(ev) != 64 || strings.HasSuffix(ev, "…") {
 		t.Errorf("an evidence exactly at the limit must stay whole: %q (%d)", ev, len(ev))
+	}
+}
+
+// TestCleanEvidenceC1 — the C1 control range (U+0080..U+009F, Unicode
+// category Cc) is sanitized like C0/DEL (07#P3-3): U+009B is the CSI
+// analog, and the promise "a single line without terminal escape
+// sequences" (docs/analyzer.md "Evidence") must hold for it too.
+func TestCleanEvidenceC1(t *testing.T) {
+	if got := cleanEvidence("a\u0098b\u009bc"); got != "a·b·c" {
+		t.Errorf("cleanEvidence = %q, want a·b·c (C1 → ·)", got)
+	}
+	if got := cleanEvidence("\u0080\u009f"); got != "··" {
+		t.Errorf("cleanEvidence of the C1 edges = %q, want ··", got)
+	}
+	// Not controls: U+00A0 (nbsp, Zs) and U+00BF (¿, Po) neighbor the C1
+	// range byte-wise (C2 A0 / C2 BF) — they survive as is.
+	if got := cleanEvidence("a\u00a0b\u00bfd"); got != "a\u00a0b\u00bfd" {
+		t.Errorf("cleanEvidence keeps the non-control neighbors: %q", got)
+	}
+	// The fast path (ContainsAny) must see C1 too — the slow path alone
+	// would leave the string unreplaced.
+	if got := cleanEvidence("\u009b"); got != "·" {
+		t.Errorf("cleanEvidence(U+009B) = %q, want ·", got)
+	}
+	// Through the stored form: finalizeEvidence sanitizes before trimming.
+	if got := finalizeEvidence("x\u009by", DefaultLimits()); got != "x·y" {
+		t.Errorf("finalizeEvidence = %q, want x·y", got)
 	}
 }
 

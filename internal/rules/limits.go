@@ -69,17 +69,21 @@ func DefaultLimits() Limits {
 
 // htmlCap applies MaxHTMLBytes (called per rule — cheap; the protection
 // also works when matchRule is called directly without EvaluateCtx).
+// The cut lands on a rune boundary (truncateUTF8Bytes, 07#P3-2): a
+// severed trailing rune would be read by RE2 as U+FFFD and a rule with
+// a multibyte literal at the boundary would stop firing.
 func (l Limits) htmlCap(b []byte) []byte {
 	if l.MaxHTMLBytes > 0 && len(b) > l.MaxHTMLBytes {
-		return b[:l.MaxHTMLBytes]
+		return truncateUTF8Bytes(b, l.MaxHTMLBytes)
 	}
 	return b
 }
 
-// valueCap applies MaxValueBytes to a string value (cookie/header).
+// valueCap applies MaxValueBytes to a string value (cookie/header) — on
+// a rune boundary, like htmlCap (07#P3-2).
 func (l Limits) valueCap(s string) string {
 	if l.MaxValueBytes > 0 && len(s) > l.MaxValueBytes {
-		return s[:l.MaxValueBytes]
+		return truncateUTF8(s, l.MaxValueBytes)
 	}
 	return s
 }
