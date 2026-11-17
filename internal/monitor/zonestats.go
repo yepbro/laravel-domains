@@ -32,7 +32,12 @@
 //     increments that land between the old reads and the writes are
 //     exactly the streaming drift positions (daily:*, retry_mature:*,
 //     rendered:*, results:*, reanalyze:* — observable on the gauge,
-//     outside the Warn), reconciled by the next pass. REPEATABLE READ
+//     outside the Warn), reconciled by the next pass. The hourly cur
+//     windows are bounded above by the pass hour (T-315): rows of the
+//     NEXT hour, inserted while a boundary-crossing pass is still
+//     running (now() pinned to the previous one), are left to their
+//     increments only — the reader of the two live baskets
+//     (status.throughputSQL) does not double them. REPEATABLE READ
 //     would not add clock consistency (already there) and would abort
 //     the pass with "could not serialize access" whenever a concurrent
 //     result-record increment touched a counters row after the pass
@@ -302,30 +307,49 @@ const laravelAggQuerySQL = "SELECT zone_id, count(*) AS laravel FROM laravel_dom
 const historyAggSQL = "SELECT count(*) FILTER (WHERE appeared) AS h_appeared, " +
 	"count(*) FILTER (WHERE NOT appeared) AS h_lost FROM laravel_history"
 
+// hourCurBoundSQL — the cur FILTER window of hourlyAggSQL: the closed
+// calendar hour of the pass's pinned now(). The upper bound is MANDATORY
+// (T-315, the T-289 review P3-4): now() is pinned to the START of the
+// pass transaction, a pass crossing the hour boundary (the slow-query
+// window of T-199: median 39 s, max 501 s) evaluates with the previous
+// hour's trunc, and rows inserted after the boundary — their own now()
+// is already the next hour — would fall into the open cur window
+// [trunc(now), …) and be written into the closing hour's basket, while
+// their increments (record.go: the hour of the write's now();
+// renderworker: the hour of the row's episode) have already counted
+// them in the new hour's basket: the reader (status.throughputSQL) sums
+// exactly the two live baskets and would double these rows until the
+// next pass. The closed window [trunc(now), trunc(now)+1h) leaves the
+// next hour's rows to their increments only — one source for the three
+// cur positions (results/rendered/reanalyze), the families cannot drift
+// apart in the bound.
+const hourCurBoundSQL = "checked_at >= date_trunc('hour', now()) AND checked_at < date_trunc('hour', now()) + interval '1 hour'"
+
 // hourlyAggSQL — the live aggregate of the hourly baskets (T-203): the
 // two-live-hours window over subdomain_results (the bounds are computed
 // by the DB — date_trunc('hour', now()), the checked_at index serves the
 // range), the FILTER positions are the same predicates as the former
 // live results_hour/rendered_hour subqueries of throughputSQL (the same
 // "last hour" boundary, calendar one: prev — the rows of the hour
-// [trunc(now−1h), trunc(now)), cur — [trunc(now), …]; WHERE — the lower
-// window bound). rendered — the async flag of the render stage: the hour
-// position counts the rows rendered LATER than their check — like the
-// renderworker increment (the hour of the row's episode), which is why
-// the baskets converge with the live count(*) over the calendar hour.
-// prev_reanalyze/cur_reanalyze (T-204) — the reanalysis tails: rows with
-// rules_version IS NULL (never analyzed — an insert of a result record
-// or a content replacement by render) — the predicate of the tick pass
-// guard (analyzer/reanalyze.go); the FILTER column costs zero on the
-// same scan. A scalar aggregate without GROUP BY — exactly one row (an
-// empty window — zeros, not an empty set).
+// [trunc(now−1h), trunc(now)), cur — the closed hour
+// [trunc(now), trunc(now)+1h) — hourCurBoundSQL, T-315; WHERE — the
+// lower window bound). rendered — the async flag of the render stage:
+// the hour position counts the rows rendered LATER than their check —
+// like the renderworker increment (the hour of the row's episode), which
+// is why the baskets converge with the live count(*) over the calendar
+// hour. prev_reanalyze/cur_reanalyze (T-204) — the reanalysis tails:
+// rows with rules_version IS NULL (never analyzed — an insert of a
+// result record or a content replacement by render) — the predicate of
+// the tick pass guard (analyzer/reanalyze.go); the FILTER column costs
+// zero on the same scan. A scalar aggregate without GROUP BY — exactly
+// one row (an empty window — zeros, not an empty set).
 const hourlyAggSQL = "SELECT " +
 	"count(*) FILTER (WHERE checked_at < date_trunc('hour', now())) AS prev_results, " +
 	"count(*) FILTER (WHERE checked_at < date_trunc('hour', now()) AND rendered) AS prev_rendered, " +
-	"count(*) FILTER (WHERE checked_at >= date_trunc('hour', now())) AS cur_results, " +
-	"count(*) FILTER (WHERE checked_at >= date_trunc('hour', now()) AND rendered) AS cur_rendered, " +
+	"count(*) FILTER (WHERE " + hourCurBoundSQL + ") AS cur_results, " +
+	"count(*) FILTER (WHERE " + hourCurBoundSQL + " AND rendered) AS cur_rendered, " +
 	"count(*) FILTER (WHERE checked_at < date_trunc('hour', now()) AND rules_version IS NULL) AS prev_reanalyze, " +
-	"count(*) FILTER (WHERE checked_at >= date_trunc('hour', now()) AND rules_version IS NULL) AS cur_reanalyze " +
+	"count(*) FILTER (WHERE " + hourCurBoundSQL + " AND rules_version IS NULL) AS cur_reanalyze " +
 	"FROM subdomain_results " +
 	"WHERE checked_at >= date_trunc('hour', now() - interval '1 hour')"
 
@@ -601,7 +625,11 @@ const (
 // one, the tempo divisor is the actual length of the covered window; the
 // baskets' convergence with the live count(*) is guaranteed over the
 // calendar hour — here (hourlyAggSQL,
-// the prev/cur FILTER positions). The pass keeps EXACTLY TWO live
+// the prev/cur FILTER positions; the cur window is CLOSED by the pass
+// hour — hourCurBoundSQL, T-315: a pass crossing the hour boundary must
+// not fold the next hour's fresh rows into the closing basket — their
+// increments have already counted them, and the reader sums exactly
+// the two live baskets). The pass keeps EXACTLY TWO live
 // baskets of each family: the previous hour is the "tail of the reading
 // window" (late rendered-increments of the past hour's rows keep working
 // its basket all through the current hour — hence it is recomputed, not

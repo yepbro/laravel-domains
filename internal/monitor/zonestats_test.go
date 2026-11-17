@@ -1642,6 +1642,67 @@ func TestRecountSQLContracts(t *testing.T) {
 	}
 }
 
+// TestHourlyAggSQLCurWindowBound — the cur FILTER positions of the hourly
+// aggregate carry the upper bound of the calendar hour (T-315, the T-289
+// review P3-4): now() of the pass transaction is pinned to its start, a
+// pass crossing the hour boundary (median 39 s, max 501 s of the
+// slow-query window, T-199) evaluates the aggregate with the previous
+// hour's trunc — rows inserted after the boundary (their own now() is
+// already the next hour) must NOT fall into an open cur window: their
+// increments (record.go — the hour of the write's now(), renderworker —
+// the episode hour of the row) have already counted them in the new
+// hour's basket, and the reader (status.throughputSQL) sums exactly the
+// two live baskets — an unbounded cur would double these rows until the
+// next pass. The prev positions are already closed by the shared
+// operator bound (checked_at < trunc(now)); the WHERE keeps only the
+// lower window bound (the checked_at index range).
+func TestHourlyAggSQLCurWindowBound(t *testing.T) {
+	// The one source of the cur bound: the closed calendar hour of the
+	// pass's pinned now().
+	wantBound := "checked_at >= date_trunc('hour', now()) AND checked_at < date_trunc('hour', now()) + interval '1 hour'"
+	if hourCurBoundSQL != wantBound {
+		t.Errorf("hourCurBoundSQL:\n%s\nwant:\n%s", hourCurBoundSQL, wantBound)
+	}
+	// All three cur positions (results/rendered/reanalyze) go through it —
+	// the families cannot drift apart in the bound.
+	lower := "FILTER (WHERE checked_at >= date_trunc('hour', now())"
+	if got := strings.Count(hourlyAggSQL, lower); got != 3 {
+		t.Fatalf("hourlyAggSQL: %d cur FILTER positions, want 3 (results/rendered/reanalyze):\n%s", got, hourlyAggSQL)
+	}
+	closed := "FILTER (WHERE " + hourCurBoundSQL
+	if got := strings.Count(hourlyAggSQL, closed); got != 3 {
+		t.Errorf("hourlyAggSQL: %d of 3 cur FILTER positions carry the closed hour window (T-315):\n%s", got, hourlyAggSQL)
+	}
+	// The exact per-family positions: cur_results (the bare window),
+	// cur_rendered and cur_reanalyze (the window × the family predicate).
+	for _, cur := range []string{
+		"FILTER (WHERE " + hourCurBoundSQL + ") AS cur_results",
+		"FILTER (WHERE " + hourCurBoundSQL + " AND rendered) AS cur_rendered",
+		"FILTER (WHERE " + hourCurBoundSQL + " AND rules_version IS NULL) AS cur_reanalyze",
+	} {
+		if !strings.Contains(hourlyAggSQL, cur) {
+			t.Errorf("hourlyAggSQL without the cur position bounded by the hour (T-315):\n%s\nwant the clause:\n%s", hourlyAggSQL, cur)
+		}
+	}
+	// The prev positions stay closed by the shared operator bound only —
+	// the upper bound of cur does not leak into them (the prev window is
+	// [trunc(now−1h), trunc(now)) by the WHERE + the operator).
+	for _, prev := range []string{
+		"FILTER (WHERE checked_at < date_trunc('hour', now())) AS prev_results",
+		"FILTER (WHERE checked_at < date_trunc('hour', now()) AND rendered) AS prev_rendered",
+		"FILTER (WHERE checked_at < date_trunc('hour', now()) AND rules_version IS NULL) AS prev_reanalyze",
+	} {
+		if got := strings.Count(hourlyAggSQL, prev); got != 1 {
+			t.Errorf("hourlyAggSQL: the prev position %q occurs %d times, want 1:\n%s", prev, got, hourlyAggSQL)
+		}
+	}
+	// The WHERE is still the lower window bound alone (the checked_at
+	// index range of the two live hours).
+	if !strings.Contains(hourlyAggSQL, "WHERE checked_at >= date_trunc('hour', now() - interval '1 hour')") {
+		t.Errorf("hourlyAggSQL without the lower window bound in WHERE:\n%s", hourlyAggSQL)
+	}
+}
+
 // --- VerifyCounters ---------------------------------------------------------
 
 // TestVerifyCounters — the check without writing: the mismatches of the

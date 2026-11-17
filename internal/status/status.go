@@ -131,7 +131,12 @@ var zoneStatsSQL = "SELECT z.id, z.name, coalesce(z.name_unicode, '') AS name_un
 // (the hour of the episode, not of the render — that is what the live
 // window counted: the rendered share among the results of the window).
 // The convergence of the buckets with the live count(*) is per calendar
-// hour (the monitor reconciliation, the FILTER positions of the pass);
+// hour (the monitor reconciliation, the FILTER positions of the pass;
+// the pass's cur window is CLOSED by the hour — T-315: a pass crossing
+// the hour boundary does not fold the next hour's fresh rows into the
+// closing bucket, so the two buckets this reader sums never double
+// them). The reader itself needs no window bound: it selects the two
+// live bucket NAMES (prev/cur by its own now()), not rows by a window;
 // between passes the discrepancy is the streaming difference of the
 // semantics (duplicate deliveries, episode rewrites), as with the daily
 // rows. coalesce OUTSIDE: before the first increments there are no

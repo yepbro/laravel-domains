@@ -1811,3 +1811,44 @@ docs/services.md (Liveness). Проверки: make test, make lint — зелё
 (stageStream), internal/service/service.go (serve — образец),
 internal/ingest/pipeline_test.go (TestPipelineProducerPanic,
 TestStageStreamProducerPanic), docs/services.md.
+
+### D-059 — T-315: верхняя граница часового окна cur в hourlyAggSQL — проход реконсиляции через границу часа не двоит строки в живых корзинах
+Дата: 2026-11-17.
+Проблема: находка ревью T-289 (P3-4, tmp/review/hy4bulk/task-review-t289.md)
+internal/monitor/zonestats.go — у cur-окна hourlyAggSQL не было верхней
+границы: `checked_at >= date_trunc('hour', now())` без «< час + 1». now()
+пиннится на СТАРТ транзакции прохода (медиана 39 с, максимум 501 с
+медленного окна T-199), поэтому проход, стартовавший до границы часа,
+исполняет агрегат с trunc предыдущего часа уже ПОСЛЕ границы: строки,
+вставленные в первые секунды нового часа (их собственный now() — уже
+новый час), попадали в открытое cur-окно и писались в корзину
+завершающегося часа `results:…T(H−1)`, хотя их инкременты
+(httpworker/record.go — час now() записи; renderworker/worker.go — час
+эпизода строки) уже учли их в `results:…TH`. Читатель
+status.throughputSQL суммирует ровно две живые корзины — до следующего
+прохода эти строки считались дважды (~0.5–1 событие в сутки,
+самоисправлялось).
+Решение: закрыть окно cur по ТЗ — `AND checked_at < date_trunc('hour',
+now()) + interval '1 hour'` для cur_results/cur_rendered/cur_reanalyze;
+предикат вынесен в один источник hourCurBoundSQL (три cur-позиции трёх
+семейств не могут разъехаться в границе, стиль statusAggCols). Строки
+нового часа остаются только в инкрементах — инвариант «читатель суммирует
+ровно две живые корзины, без двоения» восстановлен. prev-позиции уже
+закрыты общей операторной границей (checked_at < trunc(now)), WHERE —
+по-прежнему только нижняя граница (индексный диапазон checked_at), цена
+FILTER-конъюнкта нулевая. Симметрия с throughputSQL: читателю та же
+граница НЕ нужна и он не менялся — он выбирает две живые корзины ПО
+ИМЕНАМ (собственный now() читателя), а не строки по окну; граница на
+стороне прохода — то, что гарантирует отсутствие двоения (решение
+зафиксировано в комментарии status.go и здесь). Обновлены шапка-комментарий
+zonestats.go (снимок данных), комментарий семейства T-203, комментарий
+hourlyAggSQL, docs/schema.md и docs/services.md. Тест:
+TestHourlyAggSQLCurWindowBound — фиксация закрытого окна во всех трёх
+cur-позициях, неизменность prev/WHERE (SQL-раннера в юнит-тестах нет,
+паттерн TestRecountSQLContracts; поведенческое покрытие — интеграционные
+тесты прохода, вне worktree). Проверки: make test, make lint, make
+test-race (monitor входит в RACE_PKGS) — зелёные.
+Ссылки: ревью T-289 P3-4; T-315; internal/monitor/zonestats.go
+(hourlyAggSQL, hourCurBoundSQL), internal/status/status.go
+(throughputSQL — комментарий), internal/monitor/zonestats_test.go
+(TestHourlyAggSQLCurWindowBound), docs/schema.md, docs/services.md.

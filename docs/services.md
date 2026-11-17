@@ -1008,7 +1008,12 @@ the periodic reconciliation of the pipeline's incremental counters:
   as the previous live subqueries, the stage 27 checkpoint; tails —
   `rules_version IS NULL`, the predicate of the re-analysis tick guard)
   writes
-  prev and cur of each family (prev — the tail of the read window: late
+  prev and cur of each family (cur — a closed calendar hour
+  `[trunc(now), trunc(now)+1h)`, T-315: a pass crossing the hour
+  boundary — `now()` is pinned to the transaction start — leaves the
+  next hour's rows to their increments, otherwise the reader of the two
+  live buckets would double them until the next pass; prev — the tail of
+  the read window: late
   rendered
   increments and stamp decrements keep finishing it throughout the
   current hour),

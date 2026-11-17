@@ -482,7 +482,13 @@ TZ_incremental spec
   The authority — reconciliation: a SEPARATE aggregate of the two live hours'
   window over `subdomain_results` (prev/cur FILTER positions of both families;
   `rendered` — an asynchronous flag: a late render of a past-hour row is accounted
-  to the bucket of its hour) writes prev and cur of each family — prev is
+  to the bucket of its hour) writes prev and cur of each family — cur is a
+  CLOSED hour window `[trunc(now), trunc(now)+1h)` (T-315: `now()` of the pass
+  transaction is pinned to its start, and a pass crossing the hour boundary
+  must not fold the next hour's fresh rows into the closing bucket — their
+  increments have already counted them, while the reader sums exactly the two
+  live buckets; without the bound those rows would be doubled until the next
+  pass); prev is
   recomputed, not only cur, because rendered increments keep updating it for
   the whole current hour (the tail of the read window); the stale buckets (older
   than the previous hour) are deleted by the pass — the buckets are the live
