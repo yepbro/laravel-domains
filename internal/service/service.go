@@ -303,12 +303,7 @@ func Run(opts Options) error {
 		opts.ExtraMux(mux)
 	}
 
-	srv := &http.Server{
-		Addr:              opts.MetricsAddr,
-		Handler:           mux,
-		ReadHeaderTimeout: 5 * time.Second,
-		ErrorLog:          slog.NewLogLogger(opts.Logger.Handler(), slog.LevelError),
-	}
+	srv := newMetricsServer(opts.MetricsAddr, mux, opts.Logger)
 
 	// The pool is closed by the framework at graceful shutdown — last,
 	// after OnRun finishes and the metrics HTTP server stops, and also on
@@ -398,6 +393,27 @@ func healthzHandler(pool *pgxpool.Pool) http.HandlerFunc {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
+	}
+}
+
+// newMetricsServer assembles the probes/metrics HTTP server of a
+// service. The socket timeouts (T-298, the stage 15 review P3-3):
+// ReadHeaderTimeout — the slowloris cap; ReadTimeout/WriteTimeout —
+// the scrape budget (the Prometheus defaults the project runs with:
+// scrape_interval 15s, scrape_timeout 10s; the exposition of the
+// largest registry fits in seconds, 30s to write is a generous
+// ceiling); IdleTimeout — the keep-alive parking between scrapes
+// (without it IdleTimeout defaults to ReadTimeout = 0 — no limit, a
+// parked connection holds a descriptor until the shutdown drain).
+func newMetricsServer(addr string, handler http.Handler, logger *slog.Logger) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelError),
 	}
 }
 

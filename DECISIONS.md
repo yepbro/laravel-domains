@@ -932,3 +932,74 @@ journalRawDomain, handleCheckDomainLive), web.go (Run);
 internal/web/api_test.go, unix_test.go, web_test.go (webCheckRows);
 docs/services.md; migrations/000012 (контракт web_checks, без правок).
 
+### D-042 — T-298: NaN/±Inf отсекаются общим хелпером floatInRange во всех пяти float-полях конфига; web.timeout ужесточён до заявленного коридора 1s..10m
+Дата: 2026-11-16.
+Проблема: находка bulk-ревью стадии 15 (core-infra). (1) 15#P2-1:
+Validate() проверял четыре float-поля шаблоном `x <= lo || x > hi` —
+для NaN обе операции сравнения дают false, ошибка не собирается;
+setFloat принимает NaN из ParseFloat (env CRAWLER_*), YAML .nan тоже
+декодируется в NaN. Достижимо и молча отключает защиту:
+ingest.max_error_ratio — файл со 100% бракованных строк не фейлится
+(сравнение доли с NaN всегда false); content.disk_free_percent — пауза
+записи при переполнении диска не включается никогда (порог
+монитор-алертов тоже); analyzer.laravel_min_score — детекция Laravel
+возвращает 0 находок всем конвейером; monitor.alerts.psi_cpu_percent —
+PSI-алерт молчит. Образец правильной формы уже был (render.fallback.
+share_percent, T-233: `!(p >= 0 && p <= 100)`). ±Inf старая форма
+отсекала (Inf > hi == true), баг специфичен для NaN. (2) 15#P3-2:
+проверка web.timeout пропускала любое положительное значение, а
+сообщение обещало «expected 1s..10m». (3) 15#P3-1: ByteSize.String()
+для 0 возвращал «0GiB» (0 % любой степени двойки == 0 — срабатывает
+первая ветка каскада). (4) 15#P3-3: metrics/health-сервер фреймворка
+собирался только с ReadHeaderTimeout — IdleTimeout по умолчанию равен
+ReadTimeout (0 = без лимита): паркованное keep-alive соединение держит
+дескриптор до shutdown-дрейна.
+Решение: (1) общий хелпер floatInRange(x, lo, hi) с явными
+math.IsNaN/math.IsInf и коридором (lo, hi]; применён ко всем пяти
+float-полям (четыре новых + share_percent переведён на него с
+сохранением семантики «0 = отключено» через внешний guard p != 0);
+NaN-кейсы для четырёх полей в TestValidate по образцу существующего
+«fallback share_percent NaN», +Inf-кейс — регрессионный замок
+(отсекался и старой формой). Форма хелпера — позитивная с явным
+отсечением, а не буквальный инвертированный диапазон !(x > lo &&
+x <= hi): для NaN/±Inf эквивалентна, но читается как коридор, а не как
+двойное отрицание. (2) проверка web.timeout ужесточена до
+< 1s (сообщение оставлено): сообщение документирует
+операторский коридор, а sub-second таймаут полного пайплайна live-check
+(DNS → HTTP → render → анализ) — заведомая ошибка конфигурации;
+границы 1s/10m добавлены в boundary-блок TestValidate. (3) в
+ByteSize.String() добавлен case b == 0 → "0" (нулевой размер —
+«отключено» у опциональных капов — рендерится как 0, а не «0 гигабайт»);
+TestByteSizeString фиксирует форму (красный до фикса: "0GiB" ≠ "0").
+(4) сборка сервера вынесена в newMetricsServer с таймаутами:
+ReadTimeout 10s / WriteTimeout 30s (бюджет скрейпа: прометеевские
+дефолты проекта — scrape_interval 15s, scrape_timeout 10s), IdleTimeout
+2m (keep-alive между скрейпами); TestNewMetricsServerTimeouts требует
+положительные значения всех четырёх таймаутов (красный до фикса:
+Read/Write/Idle = 0). Публичный web-сервер (internal/web/web.go) не
+трогался — его таймауты в зоне T-297.
+Ревью фикса (tmp/review/29-t298.md): один раунд, первичный
+ревьюер deepseek-v4.1-flash; запуск пережил рестарт основной сессии
+(отчёт дописан после снимка «оборвано» — раунд засчитан, перезапуск
+не потребовался). 0×P0/P1/P2, 4×P3, вердикт «приемлем». Диспозиции:
+P3-1 (сообщение psi_cpu_percent «0–100» vs проверка (0, 100] — тот же
+класс рассинхрона, что 15#P3-2) — принят: сообщение → «(0, 100]»,
+таблица docs/configuration.md → range (0, 100]; P3-3 (тест таймаутов
+фиксировал только «> 0») — принят: пин точных значений 5s/10s/30s/2m;
+P3-4 (нет -Inf-кейса и env-пути достижимости) — принят частично:
+добавлены -Inf в TestValidate и TestEnvNaNRejected (CRAWLER_* →
+setFloat → ParseFloat("NaN") → ошибка валидации с именем поля);
+YAML .nan-кейс не добавлен — путь эквивалентен env (тот же setFloat-
+независимый Decode → Validate), ценность дубли минимальна. P3-2
+(NaN-слепой guard в internal/ingest/validate.go:229 — вторая линия
+обороны) — отклонён с обоснованием: файл вне зоны задачи T-298
+(config/service; ingest — стадия 01/T-287, параллельные worktree),
+прод-путь закрыт config.Validate (главный фикс), достижимость только
+в обход валидации конфига; кандидат в INBOX.
+Ссылки: T-298; bulk-ревью 15#P2-1, 15#P3-1, 15#P3-2, 15#P3-3
+(tmp/review/stage-report.md); прецедент формы — T-233
+(render.fallback.share_percent); internal/config/config.go
+(floatInRange, Validate), types.go (ByteSize.String),
+load.go (setFloat — источник достижимости NaN через env);
+internal/service/service.go (newMetricsServer); config_test.go,
+service_test.go; docs/configuration.md, docs/services.md.

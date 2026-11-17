@@ -15,6 +15,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"net"
 	"net/netip"
 	"net/url"
@@ -1605,7 +1606,7 @@ func (c *Config) Validate() error {
 		problems = append(problems, fmt.Sprintf("ingest.scan_interval: expected %s..%s, got %s",
 			Duration(10*time.Millisecond), Duration(time.Hour), c.Ingest.ScanInterval))
 	}
-	if c.Ingest.MaxErrorRatio <= 0 || c.Ingest.MaxErrorRatio > 1 {
+	if !floatInRange(c.Ingest.MaxErrorRatio, 0, 1) {
 		problems = append(problems, fmt.Sprintf("ingest.max_error_ratio: expected (0, 1], got %v", c.Ingest.MaxErrorRatio))
 	}
 	// The archive limits (T-133) cannot be disabled with zero: the zip
@@ -2007,14 +2008,13 @@ func (c *Config) Validate() error {
 	// restart_every_pages (a record counter); the streak threshold — like
 	// timeout_attempts; the share is a percent (0, 100] with disabling by
 	// zero (the style of mem_limit, not disk_free_percent: the control is
-	// optional). The form !(p >= 0 && p <= 100), not p < 0 || p > 100:
-	// NaN is insensitive to comparisons and would pass through, silently
-	// disabling the protective ceiling (the T-233 review; setFloat
-	// accepts NaN from ParseFloat).
+	// optional). NaN and ±Inf are rejected — the shared floatInRange
+	// (the T-233 review closed this field alone; T-298 made the form
+	// common to all the float fields).
 	if !inRange(c.Render.Fallback.WorkerRate, 1, 1000000) {
 		problems = append(problems, rangeMsg("render.fallback.worker_rate", c.Render.Fallback.WorkerRate, 1, 1000000))
 	}
-	if p := c.Render.Fallback.SharePercent; p != 0 && !(p >= 0 && p <= 100) {
+	if p := c.Render.Fallback.SharePercent; p != 0 && !floatInRange(p, 0, 100) {
 		problems = append(problems, fmt.Sprintf("render.fallback.share_percent: expected 0 (no cap) or (0..100], got %v", p))
 	}
 	if !inRange(c.Render.Fallback.HealthGateStreak, 1, 100) {
@@ -2035,8 +2035,9 @@ func (c *Config) Validate() error {
 	}
 	// The disk overflow threshold (spec 8): 0 would disable the write
 	// pause mandatory for the spec; > 95 would stop writing on a
-	// demonstrably live volume.
-	if c.Content.DiskFreePercent <= 0 || c.Content.DiskFreePercent > 95 {
+	// demonstrably live volume. floatInRange — a NaN threshold would
+	// never trip the pause comparison (T-298).
+	if !floatInRange(c.Content.DiskFreePercent, 0, 95) {
 		problems = append(problems, fmt.Sprintf("content.disk_free_percent: expected (0, 95], got %v", c.Content.DiskFreePercent))
 	}
 	// Retention (T-166): 0 — disabled; the corridor 1m..30d: a window
@@ -2085,7 +2086,7 @@ func (c *Config) Validate() error {
 	if c.Analyzer.RulesDir == "" {
 		problems = append(problems, "analyzer.rules_dir: not set (the Laravel YAML rules directory)")
 	}
-	if c.Analyzer.LaravelMinScore <= 0 || c.Analyzer.LaravelMinScore > 1 {
+	if !floatInRange(c.Analyzer.LaravelMinScore, 0, 1) {
 		problems = append(problems, fmt.Sprintf("analyzer.laravel_min_score: expected (0, 1], got %v", c.Analyzer.LaravelMinScore))
 	}
 
@@ -2197,9 +2198,9 @@ func (c *Config) Validate() error {
 		problems = append(problems, fmt.Sprintf("monitor.alerts.queue_freeze_window: expected %s..%s, got %s",
 			Duration(time.Minute), Duration(6*time.Hour), c.Monitor.Alerts.QueueFreeze))
 	}
-	if c.Monitor.Alerts.PSICPUPercent <= 0 || c.Monitor.Alerts.PSICPUPercent > 100 {
+	if !floatInRange(c.Monitor.Alerts.PSICPUPercent, 0, 100) {
 		problems = append(problems, fmt.Sprintf(
-			"monitor.alerts.psi_cpu_percent: expected 0–100 (a %% share), got %v",
+			"monitor.alerts.psi_cpu_percent: expected (0, 100] (a %% share), got %v",
 			c.Monitor.Alerts.PSICPUPercent))
 	}
 	if c.Monitor.Alerts.PSIWindow < Duration(time.Minute) || c.Monitor.Alerts.PSIWindow > Duration(6*time.Hour) {
@@ -2254,7 +2255,11 @@ func (c *Config) Validate() error {
 	if !inRange(c.Web.LiveConcurrency, 1, 64) {
 		problems = append(problems, rangeMsg("web.live_concurrency", c.Web.LiveConcurrency, 1, 64)+" (concurrent live checks)")
 	}
-	if c.Web.Timeout <= 0 || c.Web.Timeout > Duration(10*time.Minute) {
+	// The cap of a live form check (the full pipeline of one name: DNS →
+	// HTTP → render → analysis): under a second the pipeline has no time
+	// even for the DNS stage — the check matches the message corridor
+	// 1s..10m (T-298, the stage 15 review P3-2).
+	if c.Web.Timeout < Duration(time.Second) || c.Web.Timeout > Duration(10*time.Minute) {
 		problems = append(problems, fmt.Sprintf("web.timeout: expected %s..%s, got %s",
 			Duration(time.Second), Duration(10*time.Minute), c.Web.Timeout))
 	}
@@ -2366,6 +2371,19 @@ func checkHostPort(s string) error {
 }
 
 func inRange(v, lo, hi int) bool { return v >= lo && v <= hi }
+
+// floatInRange — the (lo, hi] corridor for the float64 fields, with an
+// explicit NaN/±Inf cutoff. NaN is insensitive to comparisons: the
+// equivalent-looking x <= lo || x > hi form is all-false for NaN and
+// lets it through validation, and a NaN threshold silently disables
+// the protection behind it (every comparison with NaN in the consumer
+// is false too). setFloat accepts NaN and ±Inf from ParseFloat (the
+// CRAWLER_* env values), and YAML .nan decodes to NaN as well. The
+// T-233 review closed share_percent alone; T-298 (the bulk stage 15
+// review P2-1) extended the form to all the float fields.
+func floatInRange(x, lo, hi float64) bool {
+	return !math.IsNaN(x) && !math.IsInf(x, 0) && x > lo && x <= hi
+}
 
 // sortedKeys — the map keys in ascending order (a deterministic order of
 // the validation messages; Go maps are unordered).

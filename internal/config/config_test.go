@@ -646,6 +646,30 @@ func TestParseSizeForms(t *testing.T) {
 	}
 }
 
+// TestByteSizeString — the human-readable form of the size values in
+// validation messages and logs (T-298, the stage 15 review P3-1): zero
+// — the "disabled" value of the optional caps — must render as a plain
+// 0, not as 0GiB (0 % any unit == 0, so the unit cascade caught it).
+func TestByteSizeString(t *testing.T) {
+	tests := []struct {
+		in   ByteSize
+		want string
+	}{
+		{0, "0"},
+		{1, "1"},
+		{1 << 10, "1KiB"},
+		{1 << 20, "1MiB"},
+		{1 << 30, "1GiB"},
+		{512 << 20, "512MiB"},
+		{3<<30 + 1, "3221225473"},
+	}
+	for _, tt := range tests {
+		if got := tt.in.String(); got != tt.want {
+			t.Errorf("ByteSize(%d).String() = %q, want %q", int64(tt.in), got, tt.want)
+		}
+	}
+}
+
 func TestEnvOverrides(t *testing.T) {
 	cfg := mustLoad(t, "postgres:\n  dsn: \"postgres://yaml@db/crawler\"\n", map[string]string{
 		"CRAWLER_POSTGRES_DSN":                     "postgres://env@db/crawler",
@@ -964,6 +988,19 @@ func TestEnvBadValues(t *testing.T) {
 	}
 }
 
+// The NaN reachability path itself (T-298, the stage 15 review P2-1):
+// the env value "NaN" is not a parse error — strconv.ParseFloat accepts
+// it — so the rejection must come from Validate, naming the field; this
+// locks the whole chain applyEnv → setFloat → Validate.
+func TestEnvNaNRejected(t *testing.T) {
+	env := validDSN()
+	env["CRAWLER_INGEST_MAX_ERROR_RATIO"] = "NaN"
+	_, err := loadFrom(t, "", env)
+	if err == nil || !strings.Contains(err.Error(), "ingest.max_error_ratio") {
+		t.Fatalf("CRAWLER_INGEST_MAX_ERROR_RATIO=NaN: want a validation error naming the field, got %v", err)
+	}
+}
+
 // The priority: environment variables > YAML > the default value.
 // An empty variable value counts as unset.
 func TestPriorityEnvYAMLDefault(t *testing.T) {
@@ -1150,6 +1187,12 @@ func TestValidate(t *testing.T) {
 		{"max_error_ratio 0", func(c *Config) { c.Ingest.MaxErrorRatio = 0 }, "ingest.max_error_ratio"},
 		{"max_error_ratio negative", func(c *Config) { c.Ingest.MaxErrorRatio = -0.1 }, "ingest.max_error_ratio"},
 		{"max_error_ratio over 1", func(c *Config) { c.Ingest.MaxErrorRatio = 1.5 }, "ingest.max_error_ratio"},
+		// NaN is insensitive to comparisons — the plain x <= 0 || x > 1
+		// form let it through (T-298, the stage 15 review P2-1); the
+		// boundary-mutation form of the share_percent NaN case below.
+		{"max_error_ratio NaN", func(c *Config) { c.Ingest.MaxErrorRatio = math.NaN() }, "ingest.max_error_ratio"},
+		{"max_error_ratio +Inf", func(c *Config) { c.Ingest.MaxErrorRatio = math.Inf(1) }, "ingest.max_error_ratio"},
+		{"max_error_ratio -Inf", func(c *Config) { c.Ingest.MaxErrorRatio = math.Inf(-1) }, "ingest.max_error_ratio"},
 		{"archive_max_uncompressed 0", func(c *Config) { c.Ingest.ArchiveMaxUncompressed = 0 }, "ingest.archive_max_uncompressed"},
 		{"archive_max_uncompressed too large", func(c *Config) { c.Ingest.ArchiveMaxUncompressed = ByteSize(2 << 40) }, "ingest.archive_max_uncompressed"},
 		{"archive_max_files 0", func(c *Config) { c.Ingest.ArchiveMaxFiles = 0 }, "ingest.archive_max_files"},
@@ -1263,6 +1306,7 @@ func TestValidate(t *testing.T) {
 		{"max_store_bytes 0", func(c *Config) { c.Content.MaxStoreBytes = 0 }, "content.max_store_bytes"},
 		{"disk_free_percent 0", func(c *Config) { c.Content.DiskFreePercent = 0 }, "content.disk_free_percent"},
 		{"disk_free_percent >95", func(c *Config) { c.Content.DiskFreePercent = 96 }, "content.disk_free_percent"},
+		{"disk_free_percent NaN", func(c *Config) { c.Content.DiskFreePercent = math.NaN() }, "content.disk_free_percent"},
 		{"negative retention", func(c *Config) { c.Content.Retention = Duration(-time.Hour) }, "content.retention"},
 		{"retention under a minute", func(c *Config) { c.Content.Retention = Duration(10 * time.Second) }, "content.retention"},
 		{"retention over 30 days", func(c *Config) { c.Content.Retention = Duration(721 * time.Hour) }, "content.retention"},
@@ -1279,6 +1323,7 @@ func TestValidate(t *testing.T) {
 		{"rules_dir empty", func(c *Config) { c.Analyzer.RulesDir = "" }, "analyzer.rules_dir"},
 		{"min_score 0", func(c *Config) { c.Analyzer.LaravelMinScore = 0 }, "analyzer.laravel_min_score"},
 		{"min_score >1", func(c *Config) { c.Analyzer.LaravelMinScore = 1.5 }, "analyzer.laravel_min_score"},
+		{"min_score NaN", func(c *Config) { c.Analyzer.LaravelMinScore = math.NaN() }, "analyzer.laravel_min_score"},
 		{"subdomains empty", func(c *Config) { c.Subdomains = nil }, "subdomains"},
 		{"subdomains 64", func(c *Config) {
 			s := make([]string, 64)
@@ -1323,6 +1368,7 @@ func TestValidate(t *testing.T) {
 		}, "monitor.alerts.queue_freeze_window"},
 		{"alerts psi_cpu_percent 0", func(c *Config) { c.Monitor.Alerts.PSICPUPercent = 0 }, "monitor.alerts.psi_cpu_percent"},
 		{"alerts psi_cpu_percent >100", func(c *Config) { c.Monitor.Alerts.PSICPUPercent = 100.1 }, "monitor.alerts.psi_cpu_percent"},
+		{"alerts psi_cpu_percent NaN", func(c *Config) { c.Monitor.Alerts.PSICPUPercent = math.NaN() }, "monitor.alerts.psi_cpu_percent"},
 		{"alerts psi_cpu_window too short", func(c *Config) {
 			c.Monitor.Alerts.PSIWindow = Duration(10 * time.Second)
 		}, "monitor.alerts.psi_cpu_window"},
@@ -1347,6 +1393,7 @@ func TestValidate(t *testing.T) {
 		{"web.live_concurrency 0", func(c *Config) { c.Web.LiveConcurrency = 0 }, "web.live_concurrency"},
 		{"web.live_concurrency too large", func(c *Config) { c.Web.LiveConcurrency = 65 }, "web.live_concurrency"},
 		{"web.timeout 0", func(c *Config) { c.Web.Timeout = 0 }, "web.timeout"},
+		{"web.timeout under a second", func(c *Config) { c.Web.Timeout = Duration(500 * time.Millisecond) }, "web.timeout"},
 		{"web.timeout too large", func(c *Config) { c.Web.Timeout = Duration(11 * time.Minute) }, "web.timeout"},
 		{"web.cors.allowed_origins without a scheme", func(c *Config) {
 			c.Web.CORS.AllowedOrigins = []string{"sites.laravel.city"}
@@ -1422,6 +1469,7 @@ func TestValidate(t *testing.T) {
 	c.HTTP.TaskPerDomain = 126           // the upper bound of the task pool: 2 × 63 subdomains (§5.10)
 	c.HTTP.MemLimit = ByteSize(16 << 30) // the upper bound of the soft heap ceiling (T-163)
 	c.Ingest.MaxErrorRatio = 1
+	c.Web.Timeout = Duration(10 * time.Minute)                                         // the upper bound of the live form check cap (T-298)
 	c.Render.RestartMemoryBytes = 0                                                    // the memory control disabled — allowed
 	c.Render.QueueHighWatermark = 100000000                                            // the upper bound of the q:render capacity threshold (T-174)
 	c.Render.RequeueDeprioritizedZones = []string{"com", "co.uk", "xn--p1ai"}          // the bounds of the zone names (T-184)
@@ -1455,6 +1503,7 @@ func TestValidate(t *testing.T) {
 	c.Render.Fallback.WorkerRate = 1                         // the lower bound of the worker B rate (T-233)
 	c.Render.Fallback.SharePercent = 0                       // the share budget disabled — allowed (T-233)
 	c.Render.Fallback.HealthGateStreak = 1                   // the lower bound of the health gate streak (T-233)
+	c.Web.Timeout = Duration(time.Second)                    // the lower bound of the live form check cap (T-298)
 	if err := c.Validate(); err != nil {
 		t.Errorf("the lower bounds must be valid: %v", err)
 	}

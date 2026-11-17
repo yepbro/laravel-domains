@@ -53,9 +53,13 @@ type ByteSize int64
 // B returns the value in bytes.
 func (b ByteSize) B() int64 { return int64(b) }
 
-// String returns a human-readable form (a multiple binary unit or plain bytes).
+// String returns a human-readable form (a multiple binary unit or plain
+// bytes; 0 — the "disabled" value of the optional caps — is a plain 0,
+// not 0GiB: the unit cascade modulo would catch it, T-298).
 func (b ByteSize) String() string {
 	switch {
+	case b == 0:
+		return "0"
 	case b%(1<<30) == 0:
 		return strconv.FormatInt(int64(b)/(1<<30), 10) + "GiB"
 	case b%(1<<20) == 0:

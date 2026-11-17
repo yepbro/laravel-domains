@@ -1249,7 +1249,7 @@ are forbidden.
 | `alerts.disk_free_min_bytes` | `CRAWLER_MONITOR_ALERTS_DISK_FREE_MIN_BYTES` | size | `15GiB` |
 | `alerts.disk_free_crit_bytes` | `CRAWLER_MONITOR_ALERTS_DISK_FREE_CRIT_BYTES` | size | `10GiB` |
 | `alerts.queue_freeze_window` | `CRAWLER_MONITOR_ALERTS_QUEUE_FREEZE_WINDOW` | duration | `15m` (allowed range 1m..6h) |
-| `alerts.psi_cpu_percent` | `CRAWLER_MONITOR_ALERTS_PSI_CPU_PERCENT` | number 0–100 | `90` |
+| `alerts.psi_cpu_percent` | `CRAWLER_MONITOR_ALERTS_PSI_CPU_PERCENT` | number | `90`, range (0, 100] |
 | `alerts.psi_cpu_window` | `CRAWLER_MONITOR_ALERTS_PSI_CPU_WINDOW` | duration | `30m` (allowed range 1m..6h) |
 | `alerts.mem_high_passes` | `CRAWLER_MONITOR_ALERTS_MEM_HIGH_PASSES` | integer 1..10 | `2` |
 | `alerts.render_debt_domains` | `CRAWLER_MONITOR_ALERTS_RENDER_DEBT_DOMAINS` | integer 1..100000000 | `50000` (T-175) |
@@ -1512,7 +1512,7 @@ semantics — [`services.md`](services.md); delivery setup —
 |---|---|---|---|
 | `listen` | `CRAWLER_WEB_LISTEN` | [host]:port or an absolute path | `127.0.0.1:8080` |
 | `rate_limit` | `CRAWLER_WEB_RATE_LIMIT` | number | `4` |
-| `timeout` | `CRAWLER_WEB_TIMEOUT` | duration | `60s` |
+| `timeout` | `CRAWLER_WEB_TIMEOUT` | duration | `60s`, range 1s..10m |
 | `live_concurrency` | `CRAWLER_WEB_LIVE_CONCURRENCY` | number | `4` |
 | `cors.allowed_origins` | `CRAWLER_WEB_CORS_ALLOWED_ORIGINS` | list (comma-separated in the env) | `[]` (CORS off) |
 
@@ -1560,7 +1560,9 @@ with a Warn
 live form check: the full pipeline
 of one name (DNS → HTTP → SPA render → analysis, T-119/T-123); the
 answer
-reaches the visitor no later than the cap. `live_concurrency` — the
+reaches the visitor no later than the cap; the corridor is 1s..10m —
+below a second the pipeline has no time even for the DNS stage (T-298).
+`live_concurrency` — the
 cap on
 concurrent live checks (T-220): a semaphore before the pipeline
 starts,
@@ -1807,7 +1809,7 @@ Everything is checked at once; the error lists problems of the form
   process's
   RSS is not accessible (T-233, the stage 35 spec FR-3);
   `render.fallback.worker_rate` 1..1000000; `share_percent` 0 (no
-  cap) or (0, 100] (NaN is rejected); `health_gate_streak` 1..100
+  cap) or (0, 100]; `health_gate_streak` 1..100
   — validated at any `fallback.enabled` (T-233),
   `queue_high_watermark` 0 (the shared threshold) or 1..10⁸ (T-174),
   `late_select_timeout` 0 or 1m..24h (T-274),
@@ -1837,7 +1839,19 @@ Everything is checked at once; the error lists problems of the form
   duplicates;
 - the paths (`ingest.dir`, `content.dir`, `analyzer.rules_dir`) are
   non-empty;
-- `log.level` — one of `debug`/`info`/`warn`/`error`.
+- `log.level` — one of `debug`/`info`/`warn`/`error`;
+- the float fields — `ingest.max_error_ratio`,
+  `content.disk_free_percent`, `analyzer.laravel_min_score`,
+  `monitor.alerts.psi_cpu_percent`, `render.fallback.share_percent` —
+  reject non-finite values (NaN, ±Inf) alongside their range corridors:
+  NaN is insensitive to comparisons and would slip through the plain
+  range check, silently disabling the protection behind the threshold
+  (the file-error ratio, the disk pause, the Laravel detection, the PSI
+  alert, the fallback share cap; T-298, earlier share_percent alone —
+  T-233);
+- `web.rate_limit` 1..1000; `web.live_concurrency` 1..64 (T-220);
+  `web.timeout` 1s..10m (T-298: the check was tightened to the
+  documented corridor — sub-second values passed validation before).
 
 ## Deprecated Variables (backward compatibility)
 

@@ -80,6 +80,11 @@ up `/livez`, `/healthz` and `/metrics` on `Options.MetricsAddr` (the
 address of `monitor` — `monitor.listen` from the configuration, spec 5.10,
 takes precedence over `METRICS_ADDR`; addresses of the other services —
 only `METRICS_ADDR`, dev ports `:9101`…`:9108`).
+The endpoint server sets its socket timeouts (T-298): read header 5s
+(the slowloris cap), read 10s / write 30s — the scrape budget (the
+Prometheus defaults the project runs with: interval 15s, timeout 10s),
+idle 2m (keep-alive parking between scrapes; without a limit a parked
+connection holds a descriptor until the shutdown drain).
 Prometheus scrapes each service separately (dev config
 `deploy/docker/prometheus/prometheus.yml`, profile `monitoring`):
 `monitor.listen` is the HTTP endpoint address of the monitor service

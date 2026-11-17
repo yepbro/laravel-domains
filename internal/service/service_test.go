@@ -225,6 +225,33 @@ func (lc *lifecycle) waitDone(t *testing.T) error {
 	}
 }
 
+// TestNewMetricsServerTimeouts — the metrics/probes HTTP server must set
+// all the socket timeouts (T-298, the stage 15 review P3-3): with only
+// ReadHeaderTimeout a parked keep-alive connection is never closed —
+// IdleTimeout defaults to ReadTimeout, and a zero one means no limit, so
+// an idle scraper peer holds a descriptor forever.
+func TestNewMetricsServerTimeouts(t *testing.T) {
+	srv := newMetricsServer("127.0.0.1:0", http.NotFoundHandler(), newLogger(io.Discard, "test", slog.LevelError))
+	// The exact values, not just "> 0" (the review P3-3): the timeouts
+	// are deliberate constants — the scrape budget (the Prometheus
+	// defaults the project runs with) and the keep-alive parking — and a
+	// mutation of any of them must not survive the run.
+	for _, tc := range []struct {
+		name string
+		got  time.Duration
+		want time.Duration
+	}{
+		{"ReadHeaderTimeout", srv.ReadHeaderTimeout, 5 * time.Second},
+		{"ReadTimeout", srv.ReadTimeout, 10 * time.Second},
+		{"WriteTimeout", srv.WriteTimeout, 30 * time.Second},
+		{"IdleTimeout", srv.IdleTimeout, 2 * time.Minute},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%s = %v: want %v", tc.name, tc.got, tc.want)
+		}
+	}
+}
+
 // TestServeShutdownOrder — §3.4: the signal cancels the OnRun context,
 // serve waits for the working logic to finish, the HTTP server waits for
 // the started request, the DB pool is closed last.
