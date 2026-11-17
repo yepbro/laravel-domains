@@ -1687,3 +1687,16 @@ Rules. Задача T-310 на момент указания уже ревьюи
 (третье звено по старой схеме) — раунд засчитан по правилам,
 действовавшим на старт задачи.
 Ссылки: AGENTS.md (Review scheme, Rules); T-310.
+
+### D-056 — процесс: в цепочку ревьюеров добавлен hy4-flash-free (второе звено)
+
+Прямое указание владельца (2026-11-17): после primary deepseek
+добавить модель hy4-flash-free — тот же провайдер opencode-go
+(openrouter), тот же способ запуска (opencode run --auto).
+Доступность проверена живым запуском (opencode run -m
+"opencode-go/hy4-flash-free", exit=0, ответ получен; артефакт
+tmp/hy4-avail-test.md). Цепочка: deepseek → hy4-flash-free → glm#max;
+три звена, один раунд, при отсутствии ревью от всех трёх — фиксация
+факта без ревью. Итоговая цепочка после D-055 (исключение cursor/kimi)
+и этой правки собрана в AGENTS.md (Review scheme + Rules).
+Ссылки: D-055; AGENTS.md (Review scheme, Rules).

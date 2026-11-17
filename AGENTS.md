@@ -134,7 +134,17 @@ creates the directory when writing the prompt.
    shell (there is no nested-subagent spawn tool — do not look for one).
    The prompt carries the read-only rules and the report path; the final
    message remains in the stdout file as a backup.
-2. First fallback — `opencode run` with `zai-coding-plan/glm-5.3#max`
+2. First fallback — `opencode run` with `opencode-go/hy4-flash-free`
+   (same provider as the primary — opencode-go/openrouter; the same
+   command shape, a different model; availability tested 2026-11-17):
+
+   ```bash
+   timeout 3600 opencode run --auto \
+     -m "opencode-go/hy4-flash-free" \
+     --title "review-<slug>" "$(cat tmp/review/prompt-<slug>.md)" \
+     > tmp/review/<slug>-hy4.md 2>&1; echo "exit=$?"
+   ```
+3. Second fallback — `opencode run` with `zai-coding-plan/glm-5.3#max`
    (the same command shape as the primary, a different model):
 
    ```bash
@@ -143,9 +153,9 @@ creates the directory when writing the prompt.
      --title "review-<slug>" "$(cat tmp/review/prompt-<slug>.md)" \
      > tmp/review/<slug>-glm.md 2>&1; echo "exit=$?"
    ```
-The chain is two links (primary + first fallback). If both produced
-no review — no review is performed; the fact is recorded in the report
-and the commit.
+The chain is three links (primary + two fallbacks). If all three
+produced no review — no review is performed; the fact is recorded in
+the report and the commit.
 
 Reviewer rules — per the code-review guide (loaded via the global AGENTS.md
 table); they apply to every reviewer in the chain and must be carried
@@ -322,8 +332,8 @@ from "Review scheme".
   `zai-coding-plan/glm-5.3#max` (see
   "Bulk code review and fixes"). glm models — only via the provider
   `zai-coding-plan`. Review — per the "Review scheme" (chain: `opencode run
-  opencode-go/deepseek-v4.1-flash` → `opencode run zai-coding-plan/glm-5.3#max`;
-  one round).
+  opencode-go/deepseek-v4.1-flash` → `opencode run opencode-go/hy4-flash-free` →
+  `opencode run zai-coding-plan/glm-5.3#max`; one round).
 - Execute tasks from TODO top to bottom; a Stage is a grouping, not an
   execution order.
 - Follow the structure, naming, and style of the existing code.
