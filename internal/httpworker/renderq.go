@@ -980,6 +980,25 @@ func renderSelectPending(ctx context.Context, pool RecordDB, limit int, zoneName
 // lose the SPA task before the T-030 recheck) — the record is skipped with a Warn,
 // the pass continues, the next tick will repeat the domain; a ctx cancellation —
 // a pass error.
+//
+// The alias inheritance (T-293, the review 03#P2-1) has two sources: the
+// original's verdict from THIS pass's selection (rendered = false), and —
+// for the originals not proven SPA by it: absent from the selection
+// entirely (already rendered, marked, without a final URL), or present with
+// only a flat variant read — the selection filters rendered = false and
+// does not see the pair's already rendered variant, so one read variant
+// does not close the question (the T-293 review P2) — the shared verdict
+// function of the late re-publisher (lateOriginsSPA/lateRenderAliasSQL,
+// the T-259 precedent): an
+// already rendered original (rendered = true) proves the class's SPA by the
+// very fact of the render (the q:render publications go only over SPA, such
+// content is already a DOM — DetectSPA over it is wrong), a marked original
+// (render_failed_at, T-210) gives no verdict. The pass's own read verdicts
+// go into the request's cache — a body already read is not read from the
+// store a second time. Without the second source an
+// alias with a lost message received no key at all (len(keys) == 0), and the
+// pass cleared the flag without a publication — the live task was lost until
+// the T-030 recheck (~6 months).
 func renderDomainKeys(ctx context.Context, pool db.DB, contents RenderContent, d *renderPendingDomain, log *slog.Logger) (keys []queue.Result, keep bool, err error) {
 	rows, err := pool.Query(ctx, renderPendingRowsSQL, d.zone, d.id)
 	if err != nil {
@@ -1008,6 +1027,11 @@ func renderDomainKeys(ctx context.Context, pool db.DB, contents RenderContent, d
 	// The own verdicts — by the content; the keys' order is deterministic
 	// (the query's ORDER BY), the aliases — after their own ones.
 	spa := make(map[int16]bool)
+	// verdicts — the bodies read in THIS pass (hash → the SPA/flat verdict):
+	// a variant pair sharing one body is verdicted once, and the map is
+	// handed to lateOriginsSPA below, so the origins' request does not read
+	// from the store what this pass has already read (the T-293 review P2).
+	verdicts := make(map[content.Hash]bool)
 	keys = make([]queue.Result, 0, len(recs))
 	var aliases []renderPendingRow
 	for _, r := range recs {
@@ -1022,6 +1046,18 @@ func renderDomainKeys(ctx context.Context, pool db.DB, contents RenderContent, d
 		}
 		var h content.Hash
 		copy(h[:], r.hash)
+		if v, ok := verdicts[h]; ok {
+			// The body is already verdicted in this pass (a variant pair
+			// with one content) — the store is not read again.
+			if v {
+				spa[r.subdomain] = true
+				keys = append(keys, queue.Result{
+					ZoneID: d.zone, DomainID: d.id,
+					SubdomainID: r.subdomain, Variant: r.variant, Name: d.name,
+				})
+			}
+			continue
+		}
 		body, err := contents.Get(ctx, h)
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -1034,12 +1070,62 @@ func renderDomainKeys(ctx context.Context, pool db.DB, contents RenderContent, d
 			keep = true
 			continue
 		}
-		if httpfetch.DetectSPA(body).SPA {
+		v := httpfetch.DetectSPA(body).SPA
+		verdicts[h] = v
+		if v {
 			spa[r.subdomain] = true
 			keys = append(keys, queue.Result{
 				ZoneID: d.zone, DomainID: d.id,
 				SubdomainID: r.subdomain, Variant: r.variant, Name: d.name,
 			})
+		}
+	}
+	// The aliases' originals not proven SPA by this pass's own reads — one
+	// request per domain through the late re-publisher's verdict function
+	// (lateOriginsSPA, T-259) — one implementation of the inheritance for both
+	// passes. A subdomain resolved flat by one read variant is still asked:
+	// the selection sees only rendered = false, the pair's other variant may
+	// be the already rendered original — the render fact proves the class's
+	// SPA without a store read at all (the T-293 review P2: skipping such
+	// subdomains used to leave the alias without a key — the D4 flag clear
+	// without a publication); the verdicts cache keeps the bodies already
+	// read in this pass from a second store read, so the extra price of the
+	// request is one SQL roundtrip, not re-reads. The candidates are the
+	// selection's unreadable rows — a repeated
+	// read failure does not lose the flag (keep is already set); the two
+	// queries are not one transaction, so a row rewritten between them
+	// (a T-058 DELETE+INSERT episode) may surface here unseen — its
+	// unreadability resolves without a verdict and the flag may clear
+	// without a publication (a milliseconds window per episode rewrite; the
+	// same order the late pass lives with — the episode guards are the
+	// outer defense).
+	if len(aliases) > 0 {
+		var unknown []int16
+		for _, a := range aliases {
+			sub := *a.aliasSub
+			if spa[sub] {
+				continue // already SPA by this pass's own read — nothing to ask
+			}
+			dup := false
+			for _, u := range unknown {
+				if u == sub {
+					dup = true
+					break
+				}
+			}
+			if !dup {
+				unknown = append(unknown, sub)
+			}
+		}
+		if len(unknown) > 0 {
+			origSPA, err := lateOriginsSPA(ctx, pool, contents, verdicts,
+				lateKey{zone: d.zone, domain: d.id}, unknown, d.name, log)
+			if err != nil {
+				return nil, false, fmt.Errorf("httpworker: render rework pass: domain %s: alias originals: %w", d.name, err)
+			}
+			for sub := range origSPA {
+				spa[sub] = true
+			}
 		}
 	}
 	for _, a := range aliases {

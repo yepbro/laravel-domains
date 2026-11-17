@@ -918,7 +918,13 @@ inherit the original's verdict (T-055) — from the candidate by body OR
 from the already rendered original (the fact of rendering proves SPA
 class: q:render publications happen only for SPAs; the content of such an
 original — the DOM — does not match the body-based verdict — the T-259
-review P2-1); rows without content and without an alias are skipped
+review P2-1); since T-293 the rework pass (`RequeueRenderPending`)
+inherits the same way — through the shared `lateOriginsSPA` query, one
+implementation for both passes (before it the rework pass built the
+verdicts only over its own selection `rendered = false`: an alias with
+a rendered original received no key at all and the flag was cleared
+without a publication — the live task was lost up to the recheck); rows
+without content and without an alias are skipped
 (nowhere to take the verdict from — the next recheck episode will rework
 them; older than the retention window there is no content — going there
 is pointless). The cursor moves only past a batch processed in full:

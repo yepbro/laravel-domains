@@ -65,6 +65,63 @@ type workerPageScript struct {
 	blockCtx  bool          // wait for the ctx cancellation (the cancellation test)
 	setCookie []string      // the Set-Cookie values, if header is not set
 	elapsed   time.Duration // the final Fetch's Elapsed (the check's ResponseMS)
+	bodySpy   *workerBodySpy
+}
+
+// workerBodySpy — the scenario's body as a spying reader (the T-293
+// double-download tests): remembers the reads and the Close — a page taken
+// from the task's cache or a flight must not be read. The coordination gates
+// are optional (nil — off): started is closed at the first Read, and the first
+// Read blocks until release is closed; err — a read failure returned instead
+// of the data.
+type workerBodySpy struct {
+	body    string
+	err     error
+	started chan struct{}
+	release chan struct{}
+
+	off    int
+	mu     sync.Mutex
+	reads  int
+	closed bool
+	began  bool
+}
+
+func (s *workerBodySpy) Read(p []byte) (int, error) {
+	s.mu.Lock()
+	s.reads++
+	if !s.began && s.started != nil {
+		s.began = true
+		close(s.started)
+	}
+	s.mu.Unlock()
+	if s.release != nil {
+		<-s.release
+	}
+	if s.err != nil {
+		return 0, s.err
+	}
+	if s.off >= len(s.body) {
+		return 0, io.EOF
+	}
+	n := copy(p, s.body[s.off:])
+	s.off += n
+	return n, nil
+}
+
+func (s *workerBodySpy) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closed = true
+	return nil
+}
+
+// snapshot — the reads/Close counters for the assertions (after ProcessDomain
+// returned: the checks' goroutines have joined, no concurrent access remains).
+func (s *workerBodySpy) snapshot() (reads int, closed bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.reads, s.closed
 }
 
 // workerFetchLog — the fake's call journal: which URLs actually went "to the network".
@@ -131,11 +188,15 @@ func workerFakeFetch(script map[string]*workerPageScript) (FetchFunc, *workerFet
 				h.Add("Set-Cookie", c)
 			}
 		}
+		body := io.NopCloser(strings.NewReader(p.body))
+		if p.bodySpy != nil {
+			body = p.bodySpy
+		}
 		res := &httpfetch.FetchResult{
 			StatusCode: p.status,
 			Status:     fmt.Sprintf("%d status", p.status),
 			Header:     h,
-			Body:       io.NopCloser(strings.NewReader(p.body)),
+			Body:       body,
 			FinalURL:   fu,
 			Elapsed:    p.elapsed,
 		}
@@ -233,8 +294,11 @@ func TestWorkerProcessDomain(t *testing.T) {
 	if !www.HTTPS.Cached {
 		t.Error("the www https check was not taken from the final URL cache")
 	}
-	if bare.HTTP.Cached {
-		t.Error("the bare http check starts at its own URL — the cache does not apply")
+	// T-293: the bare http check's chain leads to the same URL as its https
+	// sibling (the http→https redirect) — the second cache point (after the
+	// chain) takes the already downloaded page instead of reading the body.
+	if !bare.HTTP.Cached {
+		t.Error("the bare http check re-downloaded the page its https sibling already cached (spec 5.5 item 6)")
 	}
 	if bare.HTTPS.FinalURL == nil || bare.HTTPS.FinalURL.String() != "https://www.example.com/" {
 		t.Errorf("the bare https final URL: %v", bare.HTTPS.FinalURL)
@@ -495,6 +559,257 @@ func TestWorkerCacheHitResponseMS(t *testing.T) {
 	}
 }
 
+// --- the double-download race (T-293, the review 03#P2-2) ---------------------------
+//
+// The cache was consulted only at the check's START; a parallel check walking
+// its chain to the same URL cached nothing yet — both bodies were read
+// (spec 5.5 item 6 violated). The fix: a second cache point AFTER the chain,
+// before the body read — workerURLCache.pageFor joins the final-URL flight.
+
+// workerFlightFetch — the bare→www scenario of the race: the bare's https
+// check walks its chain to https://www.flight.test/ (the leader's body is the
+// spy lead), the www https check starts exactly at that URL (its own body is
+// the spy own). The www fetch waits until the leader's first body Read —
+// the flight is registered by then, the join is deterministic. The http twins
+// refuse. fetched closes when the www chain has completed.
+func workerFlightFetch(domain string, lead, own *workerBodySpy, fetched chan struct{}) FetchFunc {
+	return func(ctx context.Context, req httpfetch.FetchRequest, _ httpfetch.ChainOptions) (*httpfetch.ChainResult, error) {
+		apex := "https://" + domain + "/"
+		www := "https://www." + domain + "/"
+		switch req.URL.String() {
+		case apex:
+			fu, _ := url.Parse(www)
+			return &httpfetch.ChainResult{
+				Chain: []httpfetch.RedirectStep{{URL: apex, Status: 301}, {URL: www, Status: 200}},
+				Result: &httpfetch.FetchResult{
+					StatusCode: 200, Status: "200 status", Header: http.Header{},
+					Body: lead, FinalURL: fu,
+				},
+			}, nil
+		case www:
+			<-lead.started
+			if fetched != nil {
+				close(fetched)
+			}
+			fu, _ := url.Parse(www)
+			return &httpfetch.ChainResult{
+				Chain: []httpfetch.RedirectStep{{URL: www, Status: 200}},
+				Result: &httpfetch.FetchResult{
+					StatusCode: 200, Status: "200 status", Header: http.Header{},
+					Body: own, FinalURL: fu,
+				},
+			}, nil
+		default: // the http twins — a refusal, they do not participate
+			return &httpfetch.ChainResult{}, errors.New("connection refused")
+		}
+	}
+}
+
+// TestWorkerCacheFlightJoin — the joiner takes the leader's page: its own body
+// stream is closed UNREAD, the outcome is a cache hit with the leader's hash.
+// Whether the joiner caught the flight in progress or the already completed
+// page (both are the fix) — the assertions hold; the gates bias to the flight.
+func TestWorkerCacheFlightJoin(t *testing.T) {
+	const page = "<html>the flight join page of the double-download test</html>"
+	lead := &workerBodySpy{body: page, started: make(chan struct{}), release: make(chan struct{})}
+	own := &workerBodySpy{body: page}
+	fetched := make(chan struct{})
+	w := workerWorker(t, workerFlightFetch("flight.test", lead, own, fetched), nil) // PerDomain default: parallel
+
+	type outcome struct {
+		res *DomainResult
+		err error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		res, err := w.ProcessDomain(context.Background(), queue.HTTPTask{
+			ZoneID: 3, DomainID: 5, Name: "flight.test",
+			Subdomains: []queue.HTTPSubdomain{workerSubMsg(0, ""), workerSubMsg(1, "www")},
+		})
+		done <- outcome{res, err}
+	}()
+	<-fetched           // the www chain completed: its pageFor sees the leader's flight
+	close(lead.release) // the leader reads its body to the end and resolves the flight
+	out := <-done
+	if out.err != nil {
+		t.Fatalf("ProcessDomain: %v", out.err)
+	}
+	bare, www := &out.res.Subdomains[0], &out.res.Subdomains[1]
+	if !bare.HTTPS.Available || bare.HTTPS.Cached {
+		t.Errorf("the leader: available=%v cached=%v — the downloader must not be a hit",
+			bare.HTTPS.Available, bare.HTTPS.Cached)
+	}
+	if !www.HTTPS.Available || !www.HTTPS.Cached {
+		t.Fatalf("the joiner did not take the leader's page: available=%v cached=%v",
+			www.HTTPS.Available, www.HTTPS.Cached)
+	}
+	if www.HTTPS.ContentHash == nil || bare.HTTPS.ContentHash == nil ||
+		*www.HTTPS.ContentHash != *bare.HTTPS.ContentHash {
+		t.Fatalf("the joiner's hash is not the leader's page hash: %v vs %v",
+			www.HTTPS.ContentHash, bare.HTTPS.ContentHash)
+	}
+	if reads, closed := own.snapshot(); reads != 0 || !closed {
+		t.Errorf("the joiner's own body: reads=%d closed=%v — the page was downloaded twice",
+			reads, closed)
+	}
+	if reads, _ := lead.snapshot(); reads == 0 {
+		t.Error("the leader's body was not read")
+	}
+}
+
+// TestWorkerCacheMidChainHit — the completed-page flavor, deterministic
+// (PerDomain=1, www first in the task): the bare check starts at its OWN url
+// (the start cache point does not help), walks its chain to the www's URL —
+// and takes the completed page at the second point: its own body is closed
+// unread, its performed chain (2 hops) stays real, not a synthetic step.
+func TestWorkerCacheMidChainHit(t *testing.T) {
+	const page = "<html>the mid-chain completed page</html>"
+	spy := &workerBodySpy{body: page}
+	fetch, _ := workerFakeFetch(map[string]*workerPageScript{
+		"https://www.mid.test/": {status: 200, body: page},
+		// The bare's own chain ends at the www's URL with the SAME final
+		// answer (200 — a real chain ends with the final response's status;
+		// the take requires the match, the T-293 review P2: divergent
+		// answers are not mixed, see TestWorkerCacheMidChainStatusMismatch).
+		"https://mid.test/": {status: 200, body: page, final: "https://www.mid.test/", bodySpy: spy,
+			steps: []httpfetch.RedirectStep{{URL: "https://mid.test/", Status: 301}}},
+		"http://www.mid.test/": {err: errors.New("connection refused")},
+		"http://mid.test/":     {err: errors.New("connection refused")},
+	})
+	w := workerWorker(t, fetch, func(o *Options) { o.PerDomain = 1 })
+	res, err := w.ProcessDomain(context.Background(), queue.HTTPTask{
+		ZoneID: 6, DomainID: 9, Name: "mid.test",
+		Subdomains: []queue.HTTPSubdomain{workerSubMsg(1, "www"), workerSubMsg(0, "")}, // www first
+	})
+	if err != nil {
+		t.Fatalf("ProcessDomain: %v", err)
+	}
+	www, bare := &res.Subdomains[0], &res.Subdomains[1]
+	if !www.HTTPS.Available || www.HTTPS.Cached {
+		t.Fatalf("the www downloader: available=%v cached=%v", www.HTTPS.Available, www.HTTPS.Cached)
+	}
+	if !bare.HTTPS.Available || !bare.HTTPS.Cached {
+		t.Fatalf("the bare mid-chain hit: available=%v cached=%v", bare.HTTPS.Available, bare.HTTPS.Cached)
+	}
+	if len(bare.HTTPS.Redirects) != 2 || bare.HTTPS.Redirects[0].URL != "https://mid.test/" {
+		t.Errorf("the bare's own performed chain is not kept: %+v", bare.HTTPS.Redirects)
+	}
+	if bare.HTTPS.FinalURL.String() != "https://www.mid.test/" {
+		t.Errorf("the bare's FinalURL: %s — its own real final URL expected", bare.HTTPS.FinalURL)
+	}
+	if bare.HTTPS.ContentHash == nil || www.HTTPS.ContentHash == nil ||
+		*bare.HTTPS.ContentHash != *www.HTTPS.ContentHash {
+		t.Fatalf("the mid-chain hit's hash is not the page hash: %v vs %v",
+			bare.HTTPS.ContentHash, www.HTTPS.ContentHash)
+	}
+	if reads, closed := spy.snapshot(); reads != 0 || !closed {
+		t.Errorf("the bare's own body: reads=%d closed=%v — the page was downloaded twice",
+			reads, closed)
+	}
+}
+
+// TestWorkerCacheFlightLeaderFails — the flight's leader fails its body read:
+// the joiner receives nil (there is no page under the key) and honestly reads
+// ITS own body — Available with its own hash, not a cache hit; the failed
+// download is not substituted to the joiner.
+func TestWorkerCacheFlightLeaderFails(t *testing.T) {
+	lead := &workerBodySpy{
+		err:     errors.New("a broken pipe mid-body"),
+		started: make(chan struct{}), release: make(chan struct{}),
+	}
+	own := &workerBodySpy{body: "<html>the joiner's own page</html>"}
+	fetched := make(chan struct{})
+	w := workerWorker(t, workerFlightFetch("fail.test", lead, own, fetched), nil)
+
+	type outcome struct {
+		res *DomainResult
+		err error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		res, err := w.ProcessDomain(context.Background(), queue.HTTPTask{
+			ZoneID: 4, DomainID: 8, Name: "fail.test",
+			Subdomains: []queue.HTTPSubdomain{workerSubMsg(0, ""), workerSubMsg(1, "www")},
+		})
+		done <- outcome{res, err}
+	}()
+	<-fetched
+	close(lead.release) // the leader's read fails, the flight resolves nil
+	out := <-done
+	if out.err != nil {
+		t.Fatalf("ProcessDomain: %v", out.err)
+	}
+	bare, www := &out.res.Subdomains[0], &out.res.Subdomains[1]
+	if bare.HTTPS.Available || bare.HTTPS.Cached || bare.HTTPS.ErrClass != ErrNetwork {
+		t.Errorf("the failed leader: available=%v cached=%v class=%v (unavailable, ErrNetwork)",
+			bare.HTTPS.Available, bare.HTTPS.Cached, bare.HTTPS.ErrClass)
+	}
+	if !www.HTTPS.Available || www.HTTPS.Cached || www.HTTPS.ContentHash == nil {
+		t.Fatalf("the joiner after the leader's failure: available=%v cached=%v hash=%v — its own read expected",
+			www.HTTPS.Available, www.HTTPS.Cached, www.HTTPS.ContentHash != nil)
+	}
+	if reads, _ := own.snapshot(); reads == 0 {
+		t.Error("the joiner's own body was not read after the leader failed")
+	}
+}
+
+// TestWorkerCacheMidChainStatusMismatch — the T-293 review P2: the mid-chain
+// take requires the page's final status to match this check's own final
+// answer. Two answers to the same URL within one task may diverge (a deploy,
+// an A/B or cookie-dependent answer mid-task): taking the page would mix
+// this check's exchange part (its real status) with a FOREIGN content part
+// (the hash of a differently-answered body) — the record would carry a
+// status not matching its content up to the recheck. The guard sends the
+// divergent check to read its own body: no cache hit, its own hash.
+func TestWorkerCacheMidChainStatusMismatch(t *testing.T) {
+	const stale = "<html>the stale error page of the divergent answer</html>"
+	const fresh = "<html>the fresh page this check really got</html>"
+	spy := &workerBodySpy{body: fresh}
+	fetch, _ := workerFakeFetch(map[string]*workerPageScript{
+		// The www check ran first (PerDomain=1, the slice order): its final
+		// answer is 404 — the page under the key carries status 404.
+		"https://www.stat.test/": {status: 404, body: stale},
+		// The bare check's own chain ends at the same URL with a DIFFERENT
+		// final answer (200) — the answers diverged mid-task.
+		"https://stat.test/": {status: 200, body: fresh, final: "https://www.stat.test/", bodySpy: spy,
+			steps: []httpfetch.RedirectStep{{URL: "https://stat.test/", Status: 301}}},
+		"http://www.stat.test/": {err: errors.New("connection refused")},
+		"http://stat.test/":     {err: errors.New("connection refused")},
+	})
+	w := workerWorker(t, fetch, func(o *Options) { o.PerDomain = 1 })
+	res, err := w.ProcessDomain(context.Background(), queue.HTTPTask{
+		ZoneID: 7, DomainID: 21, Name: "stat.test",
+		Subdomains: []queue.HTTPSubdomain{workerSubMsg(1, "www"), workerSubMsg(0, "")}, // www first
+	})
+	if err != nil {
+		t.Fatalf("ProcessDomain: %v", err)
+	}
+	www, bare := &res.Subdomains[0], &res.Subdomains[1]
+	if !www.HTTPS.Available || www.HTTPS.Cached || www.HTTPS.Status != 404 {
+		t.Fatalf("the www downloader: available=%v cached=%v status=%d (its own 404 answer)",
+			www.HTTPS.Available, www.HTTPS.Cached, www.HTTPS.Status)
+	}
+	if !bare.HTTPS.Available || bare.HTTPS.Cached {
+		t.Fatalf("the divergent bare check: available=%v cached=%v — the foreign page must not be taken",
+			bare.HTTPS.Available, bare.HTTPS.Cached)
+	}
+	if bare.HTTPS.Status != 200 {
+		t.Errorf("the bare's own status: %d, 200 expected (its exchange part stays real)", bare.HTTPS.Status)
+	}
+	if bare.HTTPS.ContentHash == nil || www.HTTPS.ContentHash == nil ||
+		*bare.HTTPS.ContentHash == *www.HTTPS.ContentHash {
+		t.Fatalf("the divergent check inherited the foreign content: bare=%v www=%v — its own hash expected",
+			bare.HTTPS.ContentHash, www.HTTPS.ContentHash)
+	}
+	if want := content.HashOf([]byte(fresh)); *bare.HTTPS.ContentHash != want {
+		t.Errorf("the bare's hash is not its own body's: %v, want %v", *bare.HTTPS.ContentHash, want)
+	}
+	if reads, closed := spy.snapshot(); reads == 0 || !closed {
+		t.Errorf("the divergent check's own body: reads=%d closed=%v — it must read its own body",
+			reads, closed)
+	}
+}
+
 // --- errors and special cases ----------------------------------------------------
 
 // TestWorkerErrorsClassified — the subdomains' errors (a redirect loop, a network
@@ -658,6 +973,14 @@ func TestWorkerReadBody(t *testing.T) {
 		{"without Content-Length", "", "", "a chunked response", "a chunked response", 0},
 		{"a compressed response", "4", "gzip", "the uncompressed bytes", "the uncompressed bytes", 0},
 		{"a broken Content-Length", "many", "", "a body", "a body", 0},
+		// T-293 (the review 03#P3-1): a lying Content-Length within the guard cap
+		// must not reserve the declared volume — the preallocation is limited to
+		// 64 KiB (workerPreallocMax), the rest grows by the ordinary read.
+		// The bound is a literal: the check must stay red if the cap grows back.
+		{"a lying 2 MiB Content-Length, an empty body", "2097152", "", "", "", 64<<10 + 512},
+		{"a lying 2 MiB Content-Length, a short body", "2097152", "", "tail", "tail", 64<<10 + 512},
+		{"a 128 KiB body — the growth beyond the prealloc cap", "131072", "",
+			strings.Repeat("q", 131072), strings.Repeat("q", 131072), 262144 + 512},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

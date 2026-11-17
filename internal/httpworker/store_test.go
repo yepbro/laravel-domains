@@ -36,8 +36,12 @@ import (
 // newErr failure affects only NEW blocks (as in PackStore.Put: the dedup UPDATE
 // runs before the disk threshold, T-046 — the references to live content keep
 // working on overflow). badHash — a violation of the HashOf contract (T-041)
-// for checking the worker's guard; delErr — a Delete failure (the T-147 reconciliation);
-// delMissing — a Delete of a non-existent reference (ErrNotFound).
+// for checking the worker's guard: like the real PackStore.Put, the block and
+// its reference are committed under the STORE's hash (the one returned), only
+// the returned value diverges from the worker's local one — the T-293
+// (03#P3-2) cleanup must remove exactly that reference; delErr — a Delete
+// failure (the T-147 reconciliation); delMissing — a Delete of a non-existent
+// reference (ErrNotFound).
 type storeFake struct {
 	mu         sync.Mutex
 	blocks     map[content.Hash][]byte
@@ -76,7 +80,15 @@ func (f *storeFake) Put(ctx context.Context, data []byte) (content.PutResult, er
 	f.refs[h] = 1
 	f.writes++
 	if f.badHash {
-		return content.PutResult{Hash: content.HashOf([]byte("a foreign hash"))}, nil
+		// The real store commits the block under ITS hash and adds the
+		// reference there (pack.go Put: h := HashOf(data) is the store's own);
+		// only the returned value "diverges" from the worker's expectation.
+		foreign := content.HashOf([]byte("a foreign hash"))
+		f.blocks[foreign] = f.blocks[h]
+		f.refs[foreign] = 1
+		delete(f.blocks, h)
+		delete(f.refs, h)
+		return content.PutResult{Hash: foreign}, nil
 	}
 	return content.PutResult{Hash: h, Created: true}, nil
 }
@@ -166,13 +178,16 @@ func storeRun(t *testing.T, w *Worker, name string, labels ...string) *DomainRes
 
 // --- distributing the early Put references (spec 5.5 item 6 "the content is stored once") --
 
-// TestStoreOriginalsClaimEarlyPuts — the TestWorkerProcessDomain scenario: both
-// bare checks download the home page (two downloads of one content —
-// different starting URLs), www-https takes it from the final URLs' cache; the class
-// bare+www is stored by ONE block: the www v0 original inherits its early
-// Put reference, the extra reference of the second download is removed by Delete;
-// the independent records (the www v1 variant, api) own their own. The alias
-// deduplication goes by the hashes — the bodies are not needed by the records (T-147).
+// TestStoreOriginalsClaimEarlyPuts — the TestWorkerProcessDomain scenario: the
+// bare https check downloads the home page, its http sibling and the www-https
+// take it from the task's cache (the final URL convergence, T-293: the second
+// cache point — the mid-chain hit — made the old "two downloads of one
+// content" impossible here); the class bare+www is stored by ONE block: the
+// www v0 original inherits its early Put reference. The same bytes at
+// DIFFERENT final URLs (the true double Put, reconciled by Delete) —
+// TestStoreDedupAcrossDomains. The independent records (the www v1 variant,
+// api) own their own. The alias deduplication goes by the hashes — the bodies
+// are not needed by the records (T-147).
 func TestStoreOriginalsClaimEarlyPuts(t *testing.T) {
 	home, old := storePageBody("home"), storePageBody("old")
 	api := storePageBody("api")
@@ -201,22 +216,23 @@ func TestStoreOriginalsClaimEarlyPuts(t *testing.T) {
 		t.Fatalf("Save: %v", err)
 	}
 
-	//	// Early Puts (T-147): home was downloaded twice (the https and http checks of bare),
-	//	// old and api — once each; three new blocks.
+	//	// Early Puts (T-147): home — once (the bare https check; its http sibling
+	//	// takes the page at the second cache point, T-293), old and api — once
+	//	// each; three new blocks, nothing extra to reconcile.
 	puts, writes, deletes, refs := st.snapshot()
-	if puts != 4 || writes != 3 {
-		t.Fatalf("Put: %d calls, %d new blocks — expected 4 and 3 (home was fetched twice)", puts, writes)
+	if puts != 3 || writes != 3 {
+		t.Fatalf("Put: %d calls, %d new blocks — expected 3 and 3 (home is fetched once, T-293)", puts, writes)
 	}
-	//	// The reconciliation removed the extra home reference: one reference per record.
+	//	// One reference per record's content — no extra home fetch happened.
 	homeHash := content.HashOf([]byte(home))
 	if refs[homeHash] != 1 {
-		t.Errorf("the home refcount: %d, one reference expected (the extra fetch was released by Delete)", refs[homeHash])
+		t.Errorf("the home refcount: %d, one reference expected", refs[homeHash])
 	}
 	if refs[content.HashOf([]byte(old))] != 1 || refs[content.HashOf([]byte(api))] != 1 {
 		t.Error("the independent records do not own their references")
 	}
-	if deletes != 1 {
-		t.Errorf("Delete: %d calls, 1 expected (the second home fetch)", deletes)
+	if deletes != 0 {
+		t.Errorf("Delete: %d calls, 0 expected (the convergence does not double-fetch since T-293)", deletes)
 	}
 
 	//	// The alias: content_hash removed (NULL in the DB), the "not stored" sign is NOT
@@ -479,6 +495,24 @@ func TestStoreWorkerPutErrors(t *testing.T) {
 		_, err := storeRunErr(t, storeWorker(t, script("hash.test"), st, nil), "hash.test")
 		if err == nil || !strings.Contains(err.Error(), "HashOf") {
 			t.Fatalf("ProcessDomain at a foreign hash: %v", err)
+		}
+		// T-293 (the review 03#P3-2): the mismatched reference (added by the
+		// Put under the STORE's hash) must not stay ownerless — the worker
+		// removes it before failing the episode. Both checks of the subdomain
+		// walk the mismatch path (PerDomain=1, in order) — two cleanups, and
+		// no live reference remains.
+		_, _, deletes, refs := st.snapshot()
+		if deletes != 2 {
+			t.Errorf("Delete calls: %d, 2 expected (the cleanup of every mismatched reference)", deletes)
+		}
+		live := 0
+		for _, n := range refs {
+			if n > 0 {
+				live++
+			}
+		}
+		if live != 0 {
+			t.Errorf("live references after the mismatch: %v — the ownerless leak", refs)
 		}
 	})
 	t.Run("the ctx cancellation", func(t *testing.T) {
@@ -816,17 +850,18 @@ func TestStoreEmptyBodyCachePath(t *testing.T) {
 		t.Errorf("the fuse tripped on the empty body of the cache-hit record:\n%s", logBuf.String())
 	}
 
-	//	// Early Puts: the empty page was downloaded twice (both bare checks), old
-	//	// — once; the reconciliation removed the extra empty reference. Two blocks — the empty
-	//	// page (the bare+www class's original) and the old site; the empty body's hash
-	//	// is live at the original, the alias references through alias_subdomain_id.
+	//	// Early Puts: the empty page — once (the bare https check; its http
+	//	// sibling takes the page at the second cache point, T-293), old — once;
+	//	// nothing extra to reconcile. Two blocks — the empty page (the bare+www
+	//	// class's original) and the old site; the empty body's hash is live at
+	//	// the original, the alias references through alias_subdomain_id.
 	puts, writes, deletes, refs := st.snapshot()
 	emptyHash, oldHash := content.HashOf(nil), content.HashOf([]byte(old))
-	if puts != 3 || writes != 2 {
-		t.Fatalf("Put: %d calls, %d new blocks — expected 3 and 2", puts, writes)
+	if puts != 2 || writes != 2 {
+		t.Fatalf("Put: %d calls, %d new blocks — expected 2 and 2 (the empty page is fetched once, T-293)", puts, writes)
 	}
-	if deletes != 1 {
-		t.Fatalf("Delete: %d calls, 1 expected (the second empty-page fetch)", deletes)
+	if deletes != 0 {
+		t.Fatalf("Delete: %d calls, 0 expected (the convergence does not double-fetch since T-293)", deletes)
 	}
 	if refs[emptyHash] != 1 || refs[oldHash] != 1 {
 		t.Errorf("the refcount: empty %d, old %d — 1 and 1 expected", refs[emptyHash], refs[oldHash])

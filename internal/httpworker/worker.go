@@ -183,6 +183,13 @@ func workerClassifyError(err error) ErrorClass {
 }
 
 // --- the "final URL → result" cache (spec 5.5 item 6) --------------------------
+//
+// Two consultation points (T-293): by the check's STARTING URL before the chain
+// (a page completed by an earlier check), and by the FINAL URL once the chain
+// has reached it — the completed pages and the downloads in flight (the
+// singleflight of workerURLCache.pageFor): a check whose URL is being
+// downloaded by a parallel check of the task waits and takes the ready page
+// instead of reading its own body stream.
 
 // workerCacheKey — the final URLs' cache key: scheme + host (lower
 // case — the punycode is guaranteed by the T-048 chain) + path (empty — the root
@@ -260,15 +267,24 @@ type workerPut struct {
 // pair of subdomains of one domain, between the domains the final URLs do not intersect
 // (foreign parkings do not count — reusing a foreign body
 // would substitute the TLS/headers of a foreign connection). Concurrency-safe:
-// the subdomain checks run in parallel.
+// the subdomain checks run in parallel — over the completed pages (get/put) AND
+// over the downloads in flight (pageFor's singleflight, T-293).
 type workerURLCache struct {
 	mu    sync.Mutex
 	pages map[string]*workerPage
 	puts  []workerPut // the task's early Puts in the download order (T-147)
+	// inflight — the keys whose page is being downloaded right now by one of
+	// the task's checks (T-293, the review 03#P2-2): the channel is closed by
+	// the leader's done — before the close the page (if any) is already in
+	// pages, so a woken waiter reads it by the plain get.
+	inflight map[string]chan struct{}
 }
 
 func workerNewURLCache() *workerURLCache {
-	return &workerURLCache{pages: make(map[string]*workerPage, 8)}
+	return &workerURLCache{
+		pages:    make(map[string]*workerPage, 8),
+		inflight: make(map[string]chan struct{}),
+	}
 }
 
 // get returns the page by the key or nil.
@@ -286,6 +302,60 @@ func (c *workerURLCache) put(key string, p *workerPage) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.pages[key] = p
+}
+
+// pageFor — the page for the final-URL key at the moment THIS check's chain has
+// reached that URL (T-293, the review 03#P2-2: the cache was consulted only at
+// the check's start, so a parallel check starting at the URL another check was
+// still walking its chain to (the bare→www classic) downloaded the same page
+// twice — a direct violation of spec 5.5 item 6). Three outcomes:
+//   - a completed page exists — it is returned (lead=false): a hit;
+//   - the key is being downloaded by another check of the task — pageFor waits
+//     for the leader's outcome (a ctx cancellation — (nil, false, nil), the
+//     episode is not finished anyway) and returns the leader's page; nil — the
+//     leader's attempt failed after the registration: there is no page under
+//     the key, the caller reads its own body;
+//   - no page, no flight — the caller becomes the flight's leader (lead=true)
+//     and MUST resolve it by done: with its page (done caches it for the key
+//     and wakes the waiters) or nil (any failure after the registration — the
+//     waiters fall back to reading their own bodies).
+//
+// The wait is bounded by the leader's own progress: the leader never waits on
+// the waiters (the flight is resolved on every path via the caller's defer),
+// its body read is bounded by the transport timeouts — the PerDomain
+// semaphore slots held by the waiters do not deadlock.
+func (c *workerURLCache) pageFor(ctx context.Context, key string) (page *workerPage, lead bool, done func(*workerPage)) {
+	if key == "" {
+		return nil, false, nil
+	}
+	c.mu.Lock()
+	if p := c.pages[key]; p != nil {
+		c.mu.Unlock()
+		return p, false, nil
+	}
+	if wait, ok := c.inflight[key]; ok {
+		c.mu.Unlock()
+		select {
+		case <-wait:
+		case <-ctx.Done():
+			return nil, false, nil
+		}
+		return c.get(key), false, nil // nil — the leader failed, read your own body
+	}
+	wait := make(chan struct{})
+	c.inflight[key] = wait
+	c.mu.Unlock()
+	return nil, true, func(p *workerPage) {
+		// The page lands in pages BEFORE the close: a waiter woken by the
+		// close reliably observes it (the close is the happens-before edge).
+		c.mu.Lock()
+		delete(c.inflight, key)
+		if p != nil {
+			c.pages[key] = p
+		}
+		c.mu.Unlock()
+		close(wait)
+	}
 }
 
 // addPut appends a successful early Put into the task's registry (T-147).
@@ -317,23 +387,29 @@ type SchemeCheck struct {
 	// Available — the check reached the final answer: the server answered with any
 	// status, including 4xx/5xx ("the protocol works", the T-054 criterion).
 	Available bool
-	// Cached — the outcome is taken from the final URLs' cache without the network (spec 5.5 item 6):
-	// this check's starting URL matched another task check's final
-	// URL (the bare→www classic). The network was not touched, but the primary
-	// source's response time (up to its headers) is carried into ResponseMS —
-	// the alias class's original record carries the page's real response time;
-	// the response time metrics still do not observe the cache hits.
+	// Cached — the page body is taken from the task's final-URL cache, not
+	// re-downloaded (spec 5.5 item 6). The start hit (another task check's
+	// FINAL URL matched this check's STARTING URL — the bare→www classic)
+	// touched no network at all. The mid-chain hit (T-293: this check's own
+	// chain reached a URL another check has already downloaded or is
+	// downloading) performed its own chain — the exchange part (Redirects,
+	// Status/Header/TLS, ResponseMS, FinalURL) stays real — but did not read
+	// its body stream: the bytes were taken from the page. In both flavors
+	// ResponseMS carries a live measurement (the start hit — the primary
+	// source's, the mid-chain hit — this check's own chain); the response
+	// time metrics still do not observe the cache hits.
 	// The cache-hit state — the matrix rows S4–S6 of the FSM (T-266,
 	// schemestate.go).
 	Cached bool
 	// FinalURL — the final URL (the page at the chain's end, spec 5.5 item 4);
-	// nil at a load error. At a cache hit (Cached) the field carries
+	// nil at a load error. At a START cache hit (Cached) the field carries
 	// the check's STARTING URL, not the primary source's final URL:
 	// the final URL with a query (?i=1 — the cache key does not include the query,
 	// workerCacheKey) is written by its query-less form, Redirects —
 	// a synthetic single step. A deliberate distortion, not changed
 	// (T-266, TZ-fsm spec §3 FR-12; the host/path — the T-054/T-055 criteria —
-	// match exactly).
+	// match exactly). The MID-CHAIN hit (T-293) has no distortion: the check
+	// performed its own chain, FinalURL is its real outcome.
 	FinalURL *url.URL
 	// Status — the final answer's status code.
 	Status int
@@ -1070,7 +1146,8 @@ func workerHashBytes(h *content.Hash) []byte {
 const workerBodyHardLimit = httpfetch.DefaultLimitBodyBytes
 
 // checkScheme — one check (subdomain × protocol, spec 5.5 item 1): the final
-// URLs' cache → the redirect chain (the fetch seam) → the body read with a cap →
+// URLs' cache → the redirect chain (the fetch seam) → the second cache point
+// by the final URL (the flight join, T-293) → the body read with a cap →
 // UTF-8 (T-051) → the hash and the SPA verdict (T-057). All the errors — into the
 // check's result; the ctx cancellation is visible to the caller via ctx.Err() after the pool.
 func (w *Worker) checkScheme(
@@ -1083,9 +1160,11 @@ func (w *Worker) checkScheme(
 	check := &SchemeCheck{Scheme: scheme}
 	start := &url.URL{Scheme: scheme.String(), Host: host, Path: "/"}
 
-	// The final URLs' cache (spec 5.5 item 6): this check's starting URL is already
-	// downloaded by another task check (bare→www) — a second load is
-	// not needed. The cache outcome is honestly marked Cached: the network was not touched.
+	// The final URLs' cache (spec 5.5 item 6), the first point — by the
+	// starting URL: this check's starting URL is already downloaded by another
+	// task check (bare→www) — a second load is not needed, the network was not
+	// touched at all. The cache outcome is honestly marked Cached. (The second
+	// point — by the final URL after the chain, see below, T-293.)
 	if page := cache.get(workerCacheKey(start)); page != nil {
 		check.Available = true
 		check.Cached = true
@@ -1148,6 +1227,57 @@ func (w *Worker) checkScheme(
 			check.Cookies = append(check.Cookies, c)
 		}
 	}
+
+	// The final URL is known, the body is not read yet — the second cache
+	// point (T-293, the review 03#P2-2): the page at this URL may already be
+	// downloaded by a parallel check of the task or be downloading right now.
+	// The first point (above, by the starting URL) sees only the COMPLETED
+	// pages: with the checks of one domain running concurrently (the PerDomain
+	// pool, spec 5.5 item 1) the bare check's chain walks to
+	// https://www.example.com/ while the www check has already started at that
+	// URL — both read the same page (spec 5.5 item 6 "do not download one page
+	// twice" was violated exactly here). pageFor joins the key's flight:
+	// the leader reads the body below and resolves the waiters with its page.
+	finalKey := workerCacheKey(res.FinalURL)
+	page, lead, done := cache.pageFor(ctx, finalKey)
+	var flightDone func(*workerPage) // non-nil — this check leads the key's flight
+	if lead {
+		flightDone = done
+		defer func() {
+			// Any failure after the registration (a body read/store error, a
+			// cancellation) — the waiters receive nil and read their own bodies.
+			if flightDone != nil {
+				flightDone(nil)
+			}
+		}()
+	} else if page != nil && page.status == check.Status {
+		// The page is taken from the task's cache — the own body is not read:
+		// the stream is closed at once, its Close error is irrelevant (the
+		// bytes are not needed). The check's exchange part — the chain, the
+		// final answer's status/headers/cookies/TLS, the response time — stays
+		// REAL (this check really reached the URL); the content part and the
+		// truncation class are the page's: the same content is classified
+		// identically regardless of who downloaded it (see the hit above).
+		// The take requires the page's status to match this check's own final
+		// answer (the T-293 review P2): two answers to one URL may diverge
+		// mid-task (a deploy, an A/B answer) — mixing this check's real status
+		// with a foreign body's hash would write a status/content-mismatched
+		// row; a divergent check reads its own body below.
+		_ = res.Body.Close()
+		check.Cached = true
+		check.ContentHash = page.hash
+		check.Truncated = page.truncated
+		check.Charset = page.charset
+		check.ContentStored = page.stored
+		check.SPA = page.spa
+		check.ErrClass = page.errClass
+		check.ErrText = page.errText
+		return check
+	}
+	// The remaining cases — the flight's leader failed (or the ctx is done),
+	// or the page's status diverged from this check's own final answer (the
+	// guard above: a foreign content part is not mixed into a real exchange
+	// part) — this check reads its own body by the ordinary path below.
 
 	// The body: read entirely, closed always (the request's overall
 	// timeout lives until the Close, T-047), converted to UTF-8 (T-051);
@@ -1226,6 +1356,20 @@ func (w *Worker) checkScheme(
 		switch {
 		case err == nil:
 			if pr.Hash != hash {
+				// The store has already committed the block and added the
+				// reference under ITS hash (pack.go Put) — remove it before
+				// failing the episode, otherwise the reference stays ownerless:
+				// neither ContentSaver.Save nor a repeated delivery cleans it
+				// (the episode dies before the XACK, the next one Puts anew —
+				// a slow refcount leak at a contract break, T-293/03#P3-2).
+				// ErrNotFound — nothing to remove (a compaction race); another
+				// failure — a Warn: the leak remains, but in the safe
+				// direction (the block stays live, like at a crash between
+				// the Put and the row's commit, T-044).
+				if delErr := w.opt.Store.Delete(ctx, pr.Hash); delErr != nil && !errors.Is(delErr, content.ErrNotFound) {
+					w.opt.log().Warn("the mismatched store reference is not removed — the leak remains (the safe direction)",
+						"url", res.FinalURL.String(), "hash", pr.Hash.String(), "err", delErr.Error())
+				}
 				check.storeErr = fmt.Errorf("the store returned hash %s, the worker computed %s (the HashOf contract, T-041)",
 					pr.Hash, hash)
 				return check
@@ -1244,8 +1388,10 @@ func (w *Worker) checkScheme(
 	}
 
 	// The final URL — into the task's cache: the following checks starting at
-	// it (www after the bare's redirect) do not re-download the page.
-	cache.put(workerCacheKey(res.FinalURL), &workerPage{
+	// it (www after the bare's redirect) do not re-download the page. The
+	// flight's leader (T-293) resolves the waiters with the same page — done
+	// caches it for the key itself.
+	wp := &workerPage{
 		final:      res.FinalURL,
 		status:     check.Status,
 		header:     check.Header,
@@ -1259,14 +1405,28 @@ func (w *Worker) checkScheme(
 		spa:        check.SPA,
 		errClass:   check.ErrClass,
 		errText:    check.ErrText,
-	})
+	}
+	if flightDone != nil {
+		flightDone(wp)
+		flightDone = nil // resolved: the deferred nil-resolution does not fire
+	} else {
+		cache.put(finalKey, wp)
+	}
 	return check
 }
 
 // workerPreallocMax — the cap of preallocating the body read buffer by
-// Content-Length (T-147): a server's lie (a gigabyte Content-Length) does not
-// reserve a gigabyte — such bodies are read by the ordinary buffer growth.
-const workerPreallocMax = workerBodyHardLimit
+// Content-Length (T-147; the T-293 review 03#P3-1 cut): the preallocation is
+// SPECULATIVE — the header is controlled by the remote site, and at the task
+// defaults (192 concurrency × 8 per domain) lying 2 MiB declarations with
+// empty bodies reserved up to ~3 GiB of transient buffers, trading into
+// permanent GC trash (the T-157/T-163 regime). The cap of 64 KiB covers the
+// real pages' majority in one allocation; an honest larger body grows by the
+// ordinary read (two-three copy generations — the T-147 price accepted: a
+// lie costs 64 KiB, not 2 MiB, per check). The 2 MiB outer gate
+// (workerBodyHardLimit) stays: a giant declaration skips the exact-fill path
+// entirely.
+const workerPreallocMax = 64 << 10
 
 // workerReadBody reads the response body by one buffer with a preallocation by
 // Content-Length (T-147): io.ReadAll grows the buffer from 512 bytes by doubling
@@ -1275,7 +1435,7 @@ const workerPreallocMax = workerBodyHardLimit
 // garbage that entered the slot memory's peak). Content-Length is honest only
 // without Content-Encoding (the T-048/spec 5.5 transport serves an already unpacked
 // stream, the header describes the compressed bytes): in that case the buffer
-// is allocated exactly by the declared size and filled by io.ReadFull;
+// is allocated by min(n, workerPreallocMax) and filled by io.ReadFull;
 // the under-delivered and over-delivered by the server, the compressed answers and a broken/absent
 // header — the ordinary read with growth. Without a BodyLimiter the read is bounded by
 // the worker's guard cap (workerBodyHardLimit) — the preallocation
@@ -1286,8 +1446,8 @@ func workerReadBody(res *httpfetch.FetchResult) ([]byte, error) {
 		rc = io.LimitReader(res.Body, workerBodyHardLimit+1)
 	}
 	if res.Header.Get("Content-Encoding") == "" {
-		if n, err := strconv.ParseInt(res.Header.Get("Content-Length"), 10, 64); err == nil && n > 0 && n <= workerPreallocMax {
-			buf := make([]byte, n)
+		if n, err := strconv.ParseInt(res.Header.Get("Content-Length"), 10, 64); err == nil && n > 0 && n <= workerBodyHardLimit {
+			buf := make([]byte, min(n, workerPreallocMax))
 			r, err := io.ReadFull(rc, buf)
 			if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
 				return nil, err

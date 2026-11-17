@@ -128,6 +128,20 @@
 // path — the criteria of the variants (T-054) and aliases (T-055) — match
 // the primary source exactly (they enter the key), the divergence — only the query
 // of the starting form; the cache does not store the chain of another's check.
+//
+// The MID-CHAIN hit (T-293, the review 03#P2-2) — the same states S4–S6 by
+// the field combination, but a different writer: the check performed its own
+// chain to the URL whose page was already completed or in flight
+// (workerURLCache.pageFor — the second cache point, after the chain, before
+// the body read). FinalURL and Redirects — its own real outcome (no
+// distortion: its chain really ended at that URL), Status/Header/Cookies/TLS/
+// ResponseMS — its own final answer; the page gives the content part only
+// (the hash, Truncated, Charset, ContentStored, SPA) and the truncation class —
+// the same content is classified identically (I3/I4 hold: the page of a
+// completed check carries the hash and SPA, its ErrBody ⟺ Truncated). The
+// take requires the page's status to match the check's own final answer
+// (the T-293 review P2): divergent answers to one URL mid-task (a deploy,
+// an A/B answer) are not mixed — the divergent check reads its own body.
 
 package httpworker
 

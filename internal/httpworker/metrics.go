@@ -155,8 +155,12 @@ func NewMetrics(reg *metrics.Registry) *Metrics {
 // duration; the domain's final status (recordStatus, §7); the check
 // errors by class (§8), the response time of the available non-cached
 // checks; the result records — into the rendered=false counter (the render share,
-// spec 5.9). Cache hits (Cached) are not observed by the response time — the network
-// was not touched (the cache's ResponseMS — the primary source's measurement carried over);
+// spec 5.9). Cache hits (Cached) are not observed by the response time —
+// each flavor still carries a live measurement (the start hit did not
+// touch the network: the primary source's ResponseMS is carried over; the
+// mid-chain hit (T-293) performed its own chain and keeps its own
+// measurement — see SchemeCheck.Cached), but a body taken from the task
+// cache is not a fresh page download;
 // sub-millisecond responses honestly land in the lowest bucket.
 // Dead-host cutoff (T-164): a task with the Cutoff sign — into a separate
 // counter, the skipped checks (the ErrCutoff class) — into the

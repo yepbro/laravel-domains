@@ -184,6 +184,7 @@ type renderqContent struct {
 	mu     sync.Mutex
 	bodies map[content.Hash][]byte
 	errOn  map[content.Hash]error
+	reads  map[content.Hash]int // the store reads by hash (the verdicts cache checks, the T-293 review P2)
 }
 
 func (c *renderqContent) Get(ctx context.Context, hash content.Hash) ([]byte, error) {
@@ -192,6 +193,10 @@ func (c *renderqContent) Get(ctx context.Context, hash content.Hash) ([]byte, er
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.reads == nil {
+		c.reads = make(map[content.Hash]int)
+	}
+	c.reads[hash]++
 	if err := c.errOn[hash]; err != nil {
 		return nil, err
 	}
@@ -200,6 +205,14 @@ func (c *renderqContent) Get(ctx context.Context, hash content.Hash) ([]byte, er
 		return nil, fmt.Errorf("renderqContent: the block %s is missing", hash)
 	}
 	return body, nil
+}
+
+// gets — how many times the store was read for the hash (the verdicts cache
+// economy: a body read in the pass is not re-read by the origins' request).
+func (c *renderqContent) gets(hash content.Hash) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.reads[hash]
 }
 
 // --- the pass's fake pool (RecordDB): domains/zones/subdomain_results --------
@@ -254,6 +267,7 @@ type renderqPool struct {
 
 	mu           sync.Mutex
 	queries      int
+	aliasSQL     int // the lateRenderAliasSQL executions (the T-293 origins pass)
 	clears       int
 	stage1Select int   // the T-184 first stage's selections (the zones NOT from the list)
 	stage2Select int   // the T-184 second stage's selections (the list's zones)
@@ -529,6 +543,51 @@ func (p *renderqPool) Query(ctx context.Context, sql string, args ...any) (pgx.R
 		}
 		// ORDER BY subdomain_id, variant (src is already in the insertion order —
 		// the sort does not depend on it).
+		for i := 0; i < len(rows); i++ {
+			for j := i + 1; j < len(rows); j++ {
+				a, b := rows[i], rows[j]
+				if a[0].(int16) > b[0].(int16) || (a[0].(int16) == b[0].(int16) && a[1].(int16) > b[1].(int16)) {
+					rows[i], rows[j] = rows[j], rows[i]
+				}
+			}
+		}
+		return renderqRowsOf(rows...), nil
+	case lateRenderAliasSQL:
+		// T-293 (03#P2-1): the alias originals' request of the rework pass
+		// (renderDomainKeys) — the late re-publisher's shared query. The live
+		// predicate: subdomain_id = ANY($3) AND (rendered OR (final_url IS
+		// NOT NULL AND render_failed_at IS NULL)).
+		if len(args) != 3 {
+			return nil, fmt.Errorf("renderqPool: alias originals: %d parameters, 3 needed", len(args))
+		}
+		zone, okZ := args[0].(int16)
+		id, okI := args[1].(int64)
+		subs, okS := args[2].([]int16)
+		if !okZ || !okI || !okS {
+			return nil, fmt.Errorf("renderqPool: alias originals: the parameters %T/%T/%T, int16/int64/[]int16 needed",
+				args[0], args[1], args[2])
+		}
+		p.aliasSQL++
+		want := make(map[int16]bool, len(subs))
+		for _, s := range subs {
+			want[s] = true
+		}
+		var rows [][]any
+		for _, r := range p.rows[renderqDomKey{zone: zone, id: id}] {
+			if !want[r.subdomain] {
+				continue
+			}
+			live := r.finalURL != "" && !r.marked
+			if !r.rendered && !live {
+				continue // rendered OR (final_url IS NOT NULL AND render_failed_at IS NULL)
+			}
+			var hash any
+			if r.hash != nil {
+				hash = r.hash
+			}
+			rows = append(rows, []any{r.subdomain, int16(r.variant), hash, r.rendered})
+		}
+		// ORDER BY subdomain_id, variant.
 		for i := 0; i < len(rows); i++ {
 			for j := i + 1; j < len(rows); j++ {
 				a, b := rows[i], rows[j]
@@ -1560,6 +1619,155 @@ func TestRequeueOncePublishes(t *testing.T) {
 	}
 	if !dom.flags.Test(model.FlagIDN) {
 		t.Fatalf("flags=%s — is_idn lost at the clearing", dom.flags)
+	}
+}
+
+// TestRequeueOnceAliasRenderedOrigin — T-293 (the review 03#P2-1): an alias,
+// whose original is ALREADY rendered (rendered = true), inherits the SPA
+// verdict from the very fact of the render — exactly like the late
+// re-publisher (the T-259 P2-1 precedent): the q:render publications go only
+// over SPA, the original's content is already a DOM and DetectSPA over it is
+// wrong. Before the fix the original was not taken by the selection
+// (rendered = false), the alias's key was not built at all, and the pass
+// cleared the flag without a publication (a draft flag, D4) — the live task
+// of the alias was lost until the T-030 recheck (~6 months).
+func TestRequeueOnceAliasRenderedOrigin(t *testing.T) {
+	pool, body, q, _, rq := renderqPassKit(t, 0)
+
+	pool.seedDomain(5, 11, "spa", model.FlagRenderPending, model.StatusAlive)
+	aliasTo := int16(0)
+	// The rendered original: absent from the selection (rendered = false),
+	// the verdict — from the render fact; the store body is deliberately NOT
+	// seeded — nothing must be read.
+	hSPA := content.HashOf(renderqSPABody)
+	pool.seedRow(5, 11, 0, model.VariantMain, hSPA[:], nil, true, "https://spa.example/")
+	pool.seedRow(5, 11, 1, model.VariantMain, nil, &aliasTo, false, "https://spa.example/")
+
+	res, err := RequeueOnce(context.Background(), pool, body, rq, RequeueOptions{})
+	if err != nil {
+		t.Fatalf("RequeueOnce: %v", err)
+	}
+	if res.Full || res.Cleared != 1 || res.Published != 1 {
+		t.Fatalf("the outcome %+v, cleared=1 published=1 full=false expected (the alias inherits the render fact)", res)
+	}
+	pub := q.snapshot()
+	if len(pub) != 1 {
+		t.Fatalf("%d publications, exactly 1 expected (the alias's key)", len(pub))
+	}
+	if pub[0].msg.SubdomainID != 1 || pub[0].msg.Variant != model.VariantMain ||
+		pub[0].msg.ZoneID != 5 || pub[0].msg.DomainID != 11 || pub[0].msg.Name != "spa.example" {
+		t.Fatalf("the publication %+v — the alias key (1, main) of the domain expected", pub[0].msg)
+	}
+	if pool.domains[renderqDomKey{zone: 5, id: 11}].flags.Test(model.FlagRenderPending) {
+		t.Fatal("the flag is not cleared")
+	}
+}
+
+// TestRequeueOnceAliasRenderedVariantPair — the T-293 review P2: a variant
+// pair of ONE subdomain — the https variant is already rendered (rendered =
+// true, absent from the selection), the http variant is in the selection with
+// a flat body. The flat read must not exclude the subdomain from the origins'
+// request: the selection does not see the rendered variant, and the render
+// fact proves the class's SPA. Before the fix the flat variant "resolved" the
+// subdomain, lateOriginsSPA was not called, the alias got no key and the pass
+// cleared the flag without a publication (a draft flag, D4) — the task waited
+// for the late pass's 6-hour window instead of being published at once.
+// After: the alias's key is published; the flat body is read from the store
+// exactly once (the pass's own read — the origins request takes the verdicts
+// cache), the rendered variant — no read at all.
+func TestRequeueOnceAliasRenderedVariantPair(t *testing.T) {
+	hFlat := content.HashOf(renderqFlatBody)
+	pool, body, q, _, rq := renderqPassKit(t, 0)
+	body.bodies[hFlat] = renderqFlatBody
+
+	pool.seedDomain(5, 11, "pair", model.FlagRenderPending, model.StatusAlive)
+	aliasTo := int16(0)
+	// The pair's https variant: rendered = true — absent from the selection,
+	// the verdict — from the render fact; the hash points to a block
+	// deliberately NOT seeded — nothing must be read for it.
+	hSPA := content.HashOf(renderqSPABody)
+	pool.seedRow(5, 11, 0, model.VariantMain, hSPA[:], nil, true, "https://pair.example/")
+	// The pair's http variant (another site of the same subdomain): in the
+	// selection, the body is flat.
+	pool.seedRow(5, 11, 0, model.VariantHTTP, hFlat[:], nil, false, "http://pair.example/")
+	pool.seedRow(5, 11, 1, model.VariantMain, nil, &aliasTo, false, "https://pair.example/")
+
+	res, err := RequeueOnce(context.Background(), pool, body, rq, RequeueOptions{})
+	if err != nil {
+		t.Fatalf("RequeueOnce: %v", err)
+	}
+	if res.Full || res.Cleared != 1 || res.Published != 1 {
+		t.Fatalf("the outcome %+v, cleared=1 published=1 full=false expected (the alias inherits the rendered variant)", res)
+	}
+	pub := q.snapshot()
+	if len(pub) != 1 {
+		t.Fatalf("%d publications, exactly 1 expected (the alias's key)", len(pub))
+	}
+	if pub[0].msg.SubdomainID != 1 || pub[0].msg.Variant != model.VariantMain ||
+		pub[0].msg.ZoneID != 5 || pub[0].msg.DomainID != 11 || pub[0].msg.Name != "pair.example" {
+		t.Fatalf("the publication %+v — the alias key (1, main) of the domain expected", pub[0].msg)
+	}
+	if pool.aliasSQL != 1 {
+		t.Errorf("the alias originals' queries: %d, 1 expected", pool.aliasSQL)
+	}
+	if n := body.gets(hFlat); n != 1 {
+		t.Errorf("the flat body's store reads: %d, 1 expected (the pass's own read of the http variant; the origins request takes the verdicts cache, the rendered variant is not read at all)", n)
+	}
+	if pool.domains[renderqDomKey{zone: 5, id: 11}].flags.Test(model.FlagRenderPending) {
+		t.Fatal("the flag is not cleared")
+	}
+}
+
+// TestRequeueOnceAliasOriginsGuard — the origins' request economy and the T-210
+// semantics of the T-293 inheritance (03#P2-1, hardened by the T-293 review
+// P2): a flat verdict of the selection does NOT exclude the original from the
+// request — the selection sees only rendered = false, the same subdomain's
+// other variant may be the rendered original; the economy is the verdicts
+// cache: a body read by the pass is not read from the store a second time
+// (exactly one Get of the flat body). A marked original
+// (render_failed_at, T-210) gives no verdict: the alias is not published, the
+// flag is cleared as a draft (the marked records are not re-published — the
+// same semantics as at the late pass).
+func TestRequeueOnceAliasOriginsGuard(t *testing.T) {
+	hFlat := content.HashOf(renderqFlatBody)
+	pool, body, q, _, rq := renderqPassKit(t, 0)
+	body.bodies[hFlat] = renderqFlatBody
+
+	// A flat original read by the selection — the origins query still runs
+	// (the other variant may be rendered), but the flat body is read from
+	// the store exactly once (the pass's own read).
+	pool.seedDomain(5, 11, "flat", model.FlagRenderPending, model.StatusAlive)
+	aliasTo := int16(0)
+	pool.seedRow(5, 11, 0, model.VariantMain, hFlat[:], nil, false, "https://flat.example/")
+	pool.seedRow(5, 11, 1, model.VariantMain, nil, &aliasTo, false, "https://flat.example/")
+
+	// A marked original (T-210): not a candidate, no render fact — no verdict.
+	pool.seedDomain(5, 12, "marked", model.FlagRenderPending, model.StatusAlive)
+	hSPA := content.HashOf(renderqSPABody)
+	pool.seedRow(5, 12, 0, model.VariantMain, hSPA[:], nil, false, "https://marked.example/")
+	pool.rows[renderqDomKey{zone: 5, id: 12}][0].marked = true
+	pool.seedRow(5, 12, 1, model.VariantMain, nil, &aliasTo, false, "https://marked.example/")
+
+	res, err := RequeueOnce(context.Background(), pool, body, rq, RequeueOptions{})
+	if err != nil {
+		t.Fatalf("RequeueOnce: %v", err)
+	}
+	if res.Full || res.Cleared != 2 || res.Published != 0 {
+		t.Fatalf("the outcome %+v, cleared=2 published=0 full=false expected", res)
+	}
+	if n := len(q.snapshot()); n != 0 {
+		t.Fatalf("%d publications — nothing to publish (flat and marked originals)", n)
+	}
+	if pool.aliasSQL != 2 {
+		t.Errorf("the alias originals' queries: %d, 2 expected (the flat original is asked too — its other variant may be rendered)",
+			pool.aliasSQL)
+	}
+	if n := body.gets(hFlat); n != 1 {
+		t.Errorf("the flat body's store reads: %d, 1 expected (the pass's own read; the origins request takes the verdicts cache)", n)
+	}
+	if pool.domains[renderqDomKey{zone: 5, id: 11}].flags.Test(model.FlagRenderPending) ||
+		pool.domains[renderqDomKey{zone: 5, id: 12}].flags.Test(model.FlagRenderPending) {
+		t.Fatal("the flags are not cleared (the draft flag path)")
 	}
 }
 

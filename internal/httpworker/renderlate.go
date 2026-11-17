@@ -414,6 +414,7 @@ func LateOnce(ctx context.Context, pool RecordDB, contents RenderContent, render
 		orig int16
 	}
 	origSubs := make(map[lateKey][]int16) // key (zone, domain) → the original subdomains
+	origName := make(map[lateKey]string)  // …and the domain's name (the origins' Warn identity, the T-293 review)
 	var aliases []aliasRef
 	for i := range rows {
 		r := &rows[i]
@@ -429,6 +430,7 @@ func LateOnce(ctx context.Context, pool RecordDB, contents RenderContent, render
 			dom := r.key
 			dom.sub, dom.variant = 0, 0
 			origSubs[dom] = append(origSubs[dom], *r.aliasSub)
+			origName[dom] = r.name
 			continue
 		}
 		if len(r.hash) != content.HashLen {
@@ -455,7 +457,7 @@ func LateOnce(ctx context.Context, pool RecordDB, contents RenderContent, render
 	// alias's content is NULL, the original's body is read).
 	origSPA := make(map[lateKey]bool) // (zone, domain, orig sub) → SPA
 	for dom, subs := range origSubs {
-		spa, err := lateOriginsSPA(ctx, pool, contents, verdict, dom, subs, o.Log)
+		spa, err := lateOriginsSPA(ctx, pool, contents, verdict, dom, subs, origName[dom], o.Log)
 		if err != nil {
 			return out, err
 		}
@@ -545,9 +547,11 @@ func lateBodySPA(ctx context.Context, contents RenderContent, cache map[content.
 // an SPA verdict makes the equivalence class SPA (the rework pass
 // has the same semantics: both variants of different sites are inherited).
 // Returns a subdomain → verdict map; an empty one — nothing to inherit.
-// The body read errors — as at lateBodySPA (an original skip).
+// The body read errors — as at lateBodySPA (an original skip; the Warn
+// carries the real identity — the domain name and the original's
+// subdomain_id, the T-293 review: "origin"/0 hid the row).
 func lateOriginsSPA(ctx context.Context, pool db.DB, contents RenderContent, cache map[content.Hash]bool,
-	dom lateKey, subs []int16, log *slog.Logger) (map[int16]bool, error) {
+	dom lateKey, subs []int16, name string, log *slog.Logger) (map[int16]bool, error) {
 	rows, err := pool.Query(ctx, lateRenderAliasSQL, dom.zone, dom.domain, subs)
 	if err != nil {
 		return nil, fmt.Errorf("httpworker: late re-publisher: alias originals: %w", err)
@@ -573,7 +577,7 @@ func lateOriginsSPA(ctx context.Context, pool db.DB, contents RenderContent, cac
 		}
 		var h content.Hash
 		copy(h[:], hash)
-		row := lateRow{name: "origin"} // for the Warn in lateBodySPA
+		row := lateRow{name: name, key: lateKey{zone: dom.zone, domain: dom.domain, sub: sub}} // the Warn identity in lateBodySPA
 		spa, err := lateBodySPA(ctx, contents, cache, h, &row, log)
 		if err != nil {
 			return nil, err

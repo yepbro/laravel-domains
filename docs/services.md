@@ -625,10 +625,24 @@ writers of the column — the scheduler, workers, ingest, crawlerctl) —
   check of cutoff domains, the < 1 % criterion) is taken by them; the
   flag off — one pool wave, the previous behaviour;
 - the shared "final URL → result" cache within a domain task
-  (spec 5.5 item 6): the final URL of every completed check goes into
-  the cache, the start URL of every next one is compared against it —
-  after a redirect to the same URL bare→www does not re-download the
-  page; the key is
+  (spec 5.5 item 6), two consultation points (T-293): the final URL
+  of every completed check goes into the cache and the start URL of
+  every next one is compared against it — after a redirect to the same
+  URL bare→www does not re-download the page; the second point — by
+  the check's own FINAL URL after its chain, before the body read: the
+  page there may already be completed by a parallel check of the task
+  (the checks of one domain run concurrently, and the bare's chain
+  walks to `https://www.…/` exactly while the www check has started
+  there) or be downloading right now — `workerURLCache.pageFor` is a
+  singleflight over the key: the first check (the leader) reads the
+  body, the rest wait for its outcome and take the ready page
+  (a mid-chain hit: the exchange part — the chain, the final answer's
+  status/headers/cookies/TLS, the response time — stays the check's
+  own real outcome, only the content part is inherited, and only when
+  the page's status matches the check's own final answer — divergent
+  answers to one URL mid-task are not mixed, the check reads its own
+  body; a leader
+  failure sends the waiters to read their own bodies); the key is
   scheme+host+path without query/port (consistent with the variant
   criterion of
   T-054: counter-style `?i=N` variants do not break the dedup; the
@@ -723,7 +737,18 @@ writers of the column — the scheduler, workers, ingest, crawlerctl) —
   batches of 100): a repeated SPA verdict over the saved content of the
   records
   (`DetectSPA` is deterministic — the same verdict as at write time;
-  aliases inherit the verdict of the original); with `q:render` free —
+  aliases inherit the verdict of the original — from the selection's own
+  bodies or, for the originals not proven SPA by them (absent from the
+  selection — already rendered: the render fact itself proves the SPA
+  class; unreadable this pass; or read flat: the selection does not see
+  the pair's already rendered variant), through
+  the late republisher's shared origins query `lateOriginsSPA`, T-293:
+  one implementation of the alias inheritance for both passes — the
+  pass's read verdicts seed the request's cache, a body already read is
+  not read from the store a second time; a marked
+  `render_failed_at` original gives no verdict — the alias is not
+  published, the flag is cleared as a draft, the T-210 semantics of the
+  late pass); with `q:render` free —
   publishing the `Result` keys and clearing the flag with a decrement of
   the debt counter
   in one transaction (T-175; the "publish → clear" order —
