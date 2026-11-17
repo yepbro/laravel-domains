@@ -127,7 +127,12 @@ limit (1024 bytes) is the same — dump lines are short.
 its size and mtime stay stable for `ingest.stable_seconds` seconds
 (10 by default), plus a periodic full folder walk every
 `ingest.scan_interval` (a safety net for fsnotify; it picks up files
-that existed before the start). The right way to deliver is to write
+that existed before the start). When the fsnotify event buffer
+overflows, the watcher does not wait for the next scheduled walk: it
+drops its watch bookkeeping and reinstalls the watches with an
+immediate pass (T-310) — a lost directory-removal event would
+otherwise pin a dead watch and degrade that subtree's detection to the
+scheduled walks alone. The right way to deliver is to write
 under a temporary name (`*.tmp`, `*.part` — the watcher ignores them)
 and rename to `*.txt`.
 

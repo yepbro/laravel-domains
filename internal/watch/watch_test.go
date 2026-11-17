@@ -1,11 +1,17 @@
 package watch
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/fsnotify/fsnotify"
 )
 
 // The watcher parameters in the tests: millisecond intervals so the
@@ -364,5 +370,134 @@ func TestDir_HiddenRootWatched(t *testing.T) {
 func TestDir_RequiresDir(t *testing.T) {
 	if _, err := Dir(context.Background(), Options{}); err == nil {
 		t.Error("want an error with an empty Options.Dir")
+	}
+}
+
+// newTestWatcher is a watcher with a real fsnotify instance, assembled
+// manually (Dir creates it inside itself): the tests of the overflow
+// recovery drive the loop state directly, sending to fw.Errors.
+func newTestWatcher(t *testing.T, dir string, scan time.Duration, log *slog.Logger) *watcher {
+	t.Helper()
+	fw, err := fsnotify.NewWatcher()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = fw.Close() })
+	if log == nil {
+		log = slog.New(slog.DiscardHandler)
+	}
+	return &watcher{
+		opts: Options{
+			Dir:          dir,
+			StableAfter:  testStable,
+			ScanInterval: scan,
+		},
+		log:     log,
+		now:     time.Now,
+		fw:      fw,
+		tracker: newTracker(testStable, time.Now),
+		watched: make(map[string]struct{}),
+	}
+}
+
+// TestWatcher_OverflowResetsWatched — on ErrEventOverflow the watched map
+// (a soft cache of the kernel watches) is dropped and rebuilt by an
+// immediate pass: a dead record of a directory whose removal event was
+// lost in the overflow must not survive — addWatch trusts the map and
+// would never reinstall the watch (the hy4 bulk review, H-5).
+func TestWatcher_OverflowResetsWatched(t *testing.T) {
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "zone.test", "add")
+	writeFile(t, filepath.Join(sub, "seed.txt"), "x")
+
+	var buf bytes.Buffer
+	w := newTestWatcher(t, dir, testScan,
+		slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+
+	// The state after the initial pass: the whole tree is watched.
+	w.scan()
+	for _, d := range []string{dir, filepath.Join(dir, "zone.test"), sub} {
+		if _, ok := w.watched[d]; !ok {
+			t.Fatalf("after the pass the directory %s is not watched", d)
+		}
+	}
+
+	// A dead record: the kernel watch is gone (the Remove event was lost),
+	// the map still has the entry. A path absent on disk models it.
+	stale := filepath.Join(dir, "vanished.test", "add")
+	w.watched[stale] = struct{}{}
+
+	w.handleError(fsnotify.ErrEventOverflow)
+
+	if _, ok := w.watched[stale]; ok {
+		t.Error("the dead watch record survived the overflow recovery")
+	}
+	// The live directories are watched again (the pass reinstalled them).
+	for _, d := range []string{dir, filepath.Join(dir, "zone.test"), sub} {
+		if _, ok := w.watched[d]; !ok {
+			t.Errorf("after the recovery the directory %s is not watched", d)
+		}
+	}
+	// The incident is visible in the log with a distinct message.
+	if msg := buf.String(); !strings.Contains(msg, "overflow") {
+		t.Errorf("the overflow was not logged distinctly, got %q", msg)
+	}
+}
+
+// TestWatcher_NonOverflowErrorNoReset — a foreign fsnotify error does not
+// reset the watch cache: only the overflow implies lost events, everything
+// else keeps the old Warn-and-live behavior.
+func TestWatcher_NonOverflowErrorNoReset(t *testing.T) {
+	dir := t.TempDir()
+	w := newTestWatcher(t, dir, testScan, nil)
+	w.scan()
+
+	stale := filepath.Join(dir, "vanished.test", "add")
+	w.watched[stale] = struct{}{}
+
+	w.handleError(errors.New("boom"))
+
+	if _, ok := w.watched[stale]; !ok {
+		t.Error("a non-overflow error must not reset the watch cache")
+	}
+}
+
+// TestDir_EventOverflowReinstallsWatch — the dead-watch scenario of H-5
+// end to end, through the live run loop. The state the overflow leaves is
+// modeled exactly: watched claims the tree is watched, the kernel watch is
+// dead (no fw.Add was ever made — the entry was seeded before the start),
+// so the initial pass's addWatch skips it, as in the bug. The tree starts
+// EMPTY: the only file of the test is created after the overflow report —
+// with the bug there is no delivery source left at all (the initial pass
+// saw an empty tree, the safety net is an hour away, the kernel watch is
+// dead), so any delivery proves the recovery ran; determinism needs no
+// competing candidates.
+func TestDir_EventOverflowReinstallsWatch(t *testing.T) {
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "zone.test", "add")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	w := newTestWatcher(t, dir, time.Hour, nil)
+	w.watched = map[string]struct{}{ // the lie left by the lost Remove
+		dir:                             {},
+		filepath.Join(dir, "zone.test"): {},
+		sub:                             {},
+	}
+	files := make(chan File, 8)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go w.run(ctx, files)
+
+	// The overflow report: the kernel dropped events (the directory
+	// removal among them) — the recovery must reinstall the watches.
+	w.fw.Errors <- fsnotify.ErrEventOverflow
+
+	// A new file in the dead tree: delivered only by a live watch.
+	name := filepath.Join(sub, "after-overflow.txt")
+	writeFile(t, name, "example.com\n")
+	if f := waitFor(t, files); f.Path != name {
+		t.Errorf("delivered %q, want %q (the watch was not reinstalled after the overflow)", f.Path, name)
 	}
 }

@@ -241,7 +241,11 @@ for processing (files still being appended and temporary
 `*.tmp`/`*.part` files are not taken). `scan_interval` — the period of
 a full folder walk as a safety net for fsnotify (T-013): it picks up
 files that existed before the service started and compensates for lost
-watch events.
+watch events. On an fsnotify event buffer overflow (`ErrEventOverflow`)
+the watcher does not wait for the scheduled walk: it resets its watch
+cache and reinstalls the watches with an immediate walk (T-310), so a
+lost directory-removal event does not leave a dead watch; the incident
+is logged with a Warn (`fsnotify event buffer overflow`).
 
 `max_error_ratio` — the threshold for the share of rejected lines of a
 file (T-016, spec 5.1): a line must be a full domain name from the

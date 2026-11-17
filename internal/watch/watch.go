@@ -3,7 +3,11 @@
 // Two event sources: fsnotify (creation/writes in the watched directory
 // tree) and a periodic full pass as a safety net — fsnotify may lose events
 // when its internal buffer overflows, and the pass also picks up files that
-// existed before the watcher started. The directory is watched recursively
+// existed before the watcher started. An overflow also resets the watch
+// bookkeeping and reinstalls the watches with an immediate pass (T-310): a
+// lost Remove/Rename would otherwise pin a dead watch in the cache and
+// permanently degrade the subtree's detection to the scheduled pass alone.
+// The directory is watched recursively
 // (<zone>/add|delete/…; the meaning of the path is parsed by the consumer,
 // T-014).
 //
@@ -191,9 +195,7 @@ func (w *watcher) run(ctx context.Context, files chan<- File) {
 			if !ok {
 				return
 			}
-			// Most often this is an event buffer overflow: part of the events
-			// is lost; the next full pass will fix the result.
-			w.log.Warn("fsnotify", "err", err)
+			w.handleError(err)
 		case <-check.C:
 			w.emitReady(ctx, files)
 		case <-scan.C:
@@ -237,6 +239,31 @@ func (w *watcher) handleEvent(ev fsnotify.Event) {
 	default:
 		// Chmod: access rights change neither the size nor the mtime.
 	}
+}
+
+// handleError processes an error from the fsnotify Errors channel — in
+// the run goroutine, like handleEvent, without races over the state.
+//
+// An event buffer overflow means the kernel dropped events on the floor:
+// possibly the Remove/Rename of a watched directory. The kernel watch for
+// it is gone, while the watched map keeps the dead entry — and addWatch
+// trusts the map, so the watch would never be reinstalled: detection in
+// such a subtree would permanently degrade to the scheduled pass (the hy4
+// bulk review, H-5). The watched map is therefore a soft cache of the
+// kernel state: on overflow it is dropped entirely and rebuilt by an
+// immediate full pass (re-adding a still-live watch is harmless — the
+// inotify descriptor for an existing watch is returned unchanged). Other
+// errors do not imply lost events: logged as before and left to the next
+// scheduled pass.
+func (w *watcher) handleError(err error) {
+	if !errors.Is(err, fsnotify.ErrEventOverflow) {
+		w.log.Warn("fsnotify", "err", err)
+		return
+	}
+	w.log.Warn("fsnotify event buffer overflow: events lost, reinstalling the directory watches",
+		"dir", w.opts.Dir, "err", err)
+	clear(w.watched)
+	w.scan()
 }
 
 // emitReady delivers stably ready files. Every candidate is re-checked with
