@@ -847,7 +847,8 @@ P3-3: таблица TestDictDecompressSizeCap переведена с map на 
 internal/content/content.go (maxDecodeSize), dict.go (NewDict),
 pack.go (readPackBlockAt, Get); content_test.go, dict_test.go,
 pack_test.go (TestPackReadBlockLenCap); docs/content.md;
-=======
+klauspost/compress v1.20.3 zstd/ decoder.go, framedec.go.
+
 ### D-039 — T-296: критерий исчерпания дрэнов RecheckDaily/RetryTempErrors — размер выборки, а не число перемещённых строк
 Дата: 2026-11-16.
 Проблема: дрэны решали «множество исчерпано» по числу ПЕРЕМЕЩЁННЫХ строк
@@ -881,4 +882,3 @@ internal/scheduler/{recheck.go,retry.go,lease.go,enqueue.go},
 {recheck_test.go,retry_test.go,triage_test.go}; docs/services.md;
 эталоны internal/scheduler/lease.go (LeaseResult.Selected, T-200),
 stalerequeue.go (res.Selected); ревью фикса tmp/review/29-t296.md.
->>>>>>> 7686be5 (fix: scheduler — RecheckDaily/RetryTempErrors drains decide exhaustion by the batch selection size (Selected), not by moved rows; update stale wiring comments (T-296))
