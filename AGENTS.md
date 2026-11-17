@@ -143,32 +143,9 @@ creates the directory when writing the prompt.
      --title "review-<slug>" "$(cat tmp/review/prompt-<slug>.md)" \
      > tmp/review/<slug>-glm.md 2>&1; echo "exit=$?"
    ```
-3. Second fallback — `cursor-agent` (Cursor CLI, model `grok-4.7-high`):
-
-   ```bash
-   timeout 3600 cursor-agent -p --output-format text --mode ask \
-     --model grok-4.7-high --trust \
-     "$(cat tmp/review/prompt-<slug>.md)" </dev/null \
-     > tmp/review/<slug>-cursor.md 2>&1; echo "exit=$?"
-   ```
-
-   Parameters: `-p` — headless mode with the response printed to stdout
-   (without it a TUI comes up); `--mode ask` — read-only at the CLI level
-   (edits and shell are blocked by the mode itself — stronger than the
-   prompt); `--trust` — removes the interactive directory-trust question,
-   without it a headless run hangs; `--model` — the model for a single
-   run; `</dev/null` keeps it headless. Do not use `-f`/`--yolo` —
-   they force-allow commands and contradict read-only.
-4. Third fallback — `kimi` (Kimi Code CLI, model `kimi-code/k3.1-pro`):
-
-   ```bash
-   timeout 3600 kimi -m kimi-code/k3.1-pro \
-     -p "$(cat tmp/review/prompt-<slug>.md)" --output-format text </dev/null \
-     > tmp/review/<slug>-kimi.md 2>&1; echo "exit=$?"
-   ```
-
-   Never combine `-p` with `-y`/`--auto`; `</dev/null` keeps it
-   headless.
+The chain is two links (primary + first fallback). If both produced
+no review — no review is performed; the fact is recorded in the report
+and the commit.
 
 Reviewer rules — per the code-review guide (loaded via the global AGENTS.md
 table); they apply to every reviewer in the chain and must be carried
@@ -345,8 +322,7 @@ from "Review scheme".
   `zai-coding-plan/glm-5.3#max` (see
   "Bulk code review and fixes"). glm models — only via the provider
   `zai-coding-plan`. Review — per the "Review scheme" (chain: `opencode run
-  opencode-go/deepseek-v4.1-flash` → `cursor-agent grok-4.7-high` →
-  `opencode run zai-coding-plan/glm-5.3#max` → `kimi kimi-code/k3.1-pro`;
+  opencode-go/deepseek-v4.1-flash` → `opencode run zai-coding-plan/glm-5.3#max`;
   one round).
 - Execute tasks from TODO top to bottom; a Stage is a grouping, not an
   execution order.
