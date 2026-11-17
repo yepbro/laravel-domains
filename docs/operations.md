@@ -706,7 +706,11 @@ systemctl stop crawler-scheduler   # the unit stays enabled
   pack grows younger, `du /var/lib/crawler/content` decreases; the
   hourly INFO "pack compaction pass" with freed_bytes > 0 — disk going down;
 - after a catch-up pass completes: `retention_pass_seconds_count` > 0,
-  rows/contents/freed_bytes_total — batched increments. **Zero counters
+  rows/contents/freed_bytes_total — batched increments. Since T-322 the
+  count grows on failed passes too (the pass burned its wall clock) —
+  the success sign is the rows/bytes counters moving with
+  `errors_total` flat (growth of `errors_total` alone = the pass
+  drained nothing). **Zero counters
   during a long live pass are normal**: the increment lands at the end
   of the pass (T-273); watch progress via contents/packs/compaction;
 - after the render-late gate frees up: `crawler_render_late_errors_total`
@@ -718,7 +722,9 @@ systemctl stop crawler-scheduler   # the unit stays enabled
 systemctl start crawler-scheduler
 ```
 
-Preferably after `pass_seconds_count` > 0 (a pass has completed) and/or
+Preferably after `pass_seconds_count` > 0 (a pass has completed —
+since T-322 failed passes count too; check `errors_total` is flat
+before relying on it) and/or
 at a normal disk and steady progress (since T-274 the drain cursor is
 persistent in the DB — an http-worker restart continues from the saved
 position, a single-batch timeout does not reset the drain; before that

@@ -2,11 +2,13 @@
 // outcomes in counters (rows/refs/contents/bytes), interlock skips via the
 // passes{result} label, queue-guard read errors (passes{skipped_pending}
 // + pending_errors), records excluded by the guard per stream
-// (deferred{stream}), bookkeeping anomalies, no-op without a registry,
+// (deferred{stream}), bookkeeping anomalies, the failed-pass duration in
+// the pass_seconds histogram (T-322), no-op without a registry,
 // constructor idempotency (T-076).
 package content
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -72,6 +74,29 @@ func retentionCounterByLabels(t *testing.T, g prometheus.Gatherer, name string, 
 		}
 	}
 	return -1
+}
+
+// retentionHistogramSamples — the sample count and sum of the histogram
+// name (the first series of the family; the backlogHistogramSamples
+// style in scheduler): the material for "which passes landed in the
+// pass_seconds histogram".
+func retentionHistogramSamples(t *testing.T, g prometheus.Gatherer, name string) (count uint64, sum float64) {
+	t.Helper()
+	families, err := g.Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	for _, mf := range families {
+		if mf.GetName() != name {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			if h := m.GetHistogram(); h != nil {
+				return h.GetSampleCount(), h.GetSampleSum()
+			}
+		}
+	}
+	return 0, 0
 }
 
 // TestRetentionMetricsObserve — pass outcomes accumulate in counters,
@@ -226,8 +251,8 @@ func TestRetentionMetricsErrorsCounter(t *testing.T) {
 	if got := retentionCounterValue(t, reg, name); got != 0 {
 		t.Fatalf("%s before the errors = %v, want 0 (success/skips do not count)", name, got)
 	}
-	m.ObserveError(nil, RetentionStats{})
-	m.ObserveError(nil, RetentionStats{Rows: 4, Refs: 4, Contents: 2, FreedBytes: 5000})
+	m.ObserveError(nil, RetentionStats{}, time.Second)
+	m.ObserveError(nil, RetentionStats{Rows: 4, Refs: 4, Contents: 2, FreedBytes: 5000}, 30*time.Second)
 	if got := retentionCounterValue(t, reg, name); got != 2 {
 		t.Fatalf("%s after two failed passes = %v, want 2", name, got)
 	}
@@ -250,5 +275,38 @@ func TestRetentionMetricsErrorsCounter(t *testing.T) {
 	}
 
 	// A nil receiver (a service without a registry) — a no-op, no panic.
-	NewRetentionMetrics(nil).ObserveError(nil, RetentionStats{Rows: 1})
+	NewRetentionMetrics(nil).ObserveError(nil, RetentionStats{Rows: 1}, time.Second)
+}
+
+// TestRetentionMetricsErrorPassSeconds — the failed pass duration lands
+// in the crawler_content_retention_pass_seconds histogram (T-322, review
+// 09#P3-4 — the D-041 remainder): the same observation as a successful
+// pass — a failed pass burned the same wall clock (often the whole
+// selection cap; the scheduler.backlog / monitor.zonestats precedent —
+// the duration is observed after the outcome switch); skips (the
+// interlock, the guard) are not observed — the boundary is the outcome
+// taxonomy, not the amount of work (a mid-drain skip's partial work is
+// credited in the counters, its duration is not). Without this
+// pass_seconds_count understates the pass tempo exactly while
+// errors_total grows (the 2026-11-10/11 incident picture).
+func TestRetentionMetricsErrorPassSeconds(t *testing.T) {
+	reg := metrics.New("http-worker")
+	m := NewRetentionMetrics(reg)
+	const name = "crawler_content_retention_pass_seconds"
+
+	if count, sum := retentionHistogramSamples(t, reg, name); count != 0 || sum != 0 {
+		t.Fatalf("%s before = (%d samples, %v sum), want (0, 0)", name, count, sum)
+	}
+
+	m.Observe(RetentionStats{}, 2*time.Second)                                         // ok pass — observed
+	m.Observe(RetentionStats{Skipped: true}, 500*time.Millisecond)                     // interlock skip — not observed
+	m.Observe(RetentionStats{SkippedPending: true}, 300*time.Millisecond)              // guard skip — not observed
+	m.ObserveError(errors.New("selection: timeout"), RetentionStats{}, 30*time.Second) // failed pass — observed
+	if count, sum := retentionHistogramSamples(t, reg, name); count != 2 || sum != 32 {
+		t.Fatalf("%s after = (%d samples, %v sum), want (2, 32): ok + error passes observed, skips not",
+			name, count, sum)
+	}
+
+	// A nil receiver (a service without a registry) — a no-op, no panic.
+	NewRetentionMetrics(nil).ObserveError(nil, RetentionStats{}, time.Second)
 }

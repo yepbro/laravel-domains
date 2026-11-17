@@ -2072,3 +2072,69 @@ busy_skipped; P3-4 (VerifyCounters — второй полный скан domain
 прохода монитора»). Проверки ревьюера: make test / make lint /
 make test-race зелёные (воспроизведены), ключ/форма/порядок лока и
 семантика занятости подтверждены по коду.
+
+### D-063 — T-322: длительность ошибочного прохода retention — в гистограмму pass_seconds (OnError получил третий аргумент)
+Дата: 2026-11-17.
+Проблема: остаток находки 09#P3-4 ревью T-295 (D-041). Ошибочные
+проходы RetentionLoop не попадали в гистограмму
+crawler_content_retention_pass_seconds: Observe наблюдал seconds только
+в ветке ok, ObserveError — только errors_total + счётчики работы.
+Сигнатура OnError(err, stats) не несла длительности. Последствия:
+pass_seconds_count занижает темп проходов именно тогда, когда
+errors_total растёт (картина инцидента 09–11.11.2026: селекционные
+таймауты по 3600 с — самая интересная длительность — не видна в
+гистограмме); drain-guard.sh (prod-report) детектит активность прохода
+по pass_seconds_count и в серии ошибок видел «тишину».
+Решение: (1) сигнатура OnError расширена до func(error,
+RetentionStats, time.Duration) — вызов в RetentionLoop передаёт
+time.Since(start) (старт прохода уже измерялся в том же замыкании
+pass); (2) ObserveError наблюдает m.seconds.Observe(d.Seconds()) —
+той же гистограммой, что и успешный проход. Семантика — по прецеденту
+соседей: scheduler/backlog.go (crawler_backlog_pass_seconds) и
+monitor/zonestats.go (crawler_counters_recount_seconds) измеряют took
+ПОСЛЕ outcome-switch и наблюдают безусловно — ошибочный проход сжёг
+то же стеновое время (у retention — часто весь SelectTimeout-кап),
+различие живёт в errors_total и Warn, а не в гистограмме (в T-314
+ревью-находка P3-2 отклонена с той же логикой: несостоявшийся проход —
+тоже расход времени). Отличия от соседей — два, оба осознанные:
+(а) скипы (interlock, skipped_pending) НЕ наблюдаются, в том числе скип,
+завершивший mid-drain проход (ревью P2-1: интерлок проверяется на каждом
+батче, retentiondrain.go — такой проход успел закоммитить батчи; работа
+зачтена счётчиками с T-295, длительность не наблюдается): граница —
+таксономия исходов (ok/error против скип), а не объём сделанной работы;
+типичный скип — один depth/guard-запрос до старта дрейна (суб-секунда,
+оседал бы в первом бакете, размывая распределение), сигнал скипов —
+passes{result="skipped"}/skipped_total/pending_errors; условное
+наблюдение «скип с Batches>0» отклонено — правило
+«pass_seconds = ok + error» проще reasoning'а и не меняет семантику
+скипов, заведённую до T-322; (б) отменённый по ctx проход не
+наблюдается (хук не вызывается — нормальная остановка, как и до T-322),
+тогда как backlog/zonestats наблюдают и отмену (ревью P3-1).
+Регрессии: TestRetentionMetricsErrorPassSeconds (ok + error → 2
+наблюдения, скипы не наблюдаются, сумма 32 с), хелпер
+retentionHistogramSamples (стиль backlogHistogramSamples);
+TestRetentionLoop_OnErrorPartialStats проверяет d > 0 в хуке.
+Контракт OnError — внешних реализаций кроме retentionMet.ObserveError
+(http-worker) и тестов нет. Проверки: make test / make lint зелёные;
+make test-race — первый прогон упал во internal/monitor (флак цикла
+реконсиляции, «history: empty aggregate response», известное семейство
+флаков ZoneStatsLoop с T-178; дифф задачи monitor не трогает), повторный
+полный прогон зелёный + отдельный повтор monitor с -race зелёный.
+Ревью-раунд (deepseek-v4.1-flash, первое звено цепочки; отчёт
+tmp/review/41-t322.md): VERDICT FINDINGS, 0×P0/P1, 1×P2, 3×P3; ядро
+подтверждено (ровно одно наблюдение на ошибочный проход, OnPass при
+ошибке недостижим, killing-тесты, единственная проводка http-worker,
+номер D-063 корректен). Приняты все четыре: P2-1 — формулировка
+«скипы не наблюдаются — дрейна не было» неточна для mid-drain скипа —
+переформулировано в Help/docs/D-063 (вариант 1 ревьюера; поведенческий
+вариант отклонён — см. выше); P3-1 — D-063 не называл второе отличие
+от соседей (ctx-отмена не наблюдается) — добавлено в D-063/Help/docs;
+P3-2 — docs/operations.md §4.6: pass_seconds_count > 0 больше не
+однозначен («проход завершился», в т.ч. аварийно) — оба места шлюза
+возврата фронта дополнены указанием смотреть errors_total/rows;
+P3-3 — пакетный комментарий retentionmetrics.go описывал шов только
+через OnPass — дописан OnError (частичная работа T-295, длительность
+T-322).
+Ссылки: T-322; D-041 (09#P3-4); internal/content/retention.go,
+retentionmetrics.go (+тесты); cmd/http-worker/main.go (комментарий
+проводки); docs/services.md, docs/content.md, docs/operations.md.

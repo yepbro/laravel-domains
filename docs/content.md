@@ -861,7 +861,19 @@ are already in the DB — the work counters (`rows`, `refs`, `contents`,
 `freed_bytes`) credit them through the same observation instead of
 undercounting against the disk reality; the errored pass is counted
 only in `errors_total`, not in `passes_total` (the error is its
-result label).
+result label). Since T-322 (09#P3-4) the hook also receives the pass
+duration, and the failed pass is observed in the
+`crawler_content_retention_pass_seconds` histogram identically to a
+successful one (the `scheduler.backlog` / `monitor.zonestats` loop
+precedent — the duration is observed after the outcome switch): a
+failed pass burned the same wall clock, often the whole selection cap
+(the 10–11.11 incident passes), and without it `pass_seconds_count`
+understates the pass tempo exactly while `errors_total` grows; skips
+(the interlock, the guard) are not observed — including a mid-drain
+skip: its partial work is credited in the work counters (T-295), its
+duration is not; a ctx-cancelled pass is not observed either (the hook
+is not called — unlike the backlog/zonestats neighbors, a documented
+difference).
 The heavy selection — under the shared scan gate of the http-worker
 `db.ScanGate`: retention and the late render republisher do not
 collide in PostgreSQL (the insurance against "1+1 GiB").

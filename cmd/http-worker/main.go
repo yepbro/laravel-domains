@@ -437,7 +437,10 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, pool *pgx
 	// (OnPass) and the errors (OnError —
 	// crawler_content_retention_errors_total, T-273: before this the pass
 	// errors were visible only in journalctl, the :9104 metrics stood at
-	// zero with live WARNs).
+	// zero with live WARNs; since T-322 the failed pass duration is
+	// observed in crawler_content_retention_pass_seconds too — the same
+	// observation as a successful pass, the backlog/zonestats loop
+	// style).
 	retentionMet := content.NewRetentionMetrics(reg)
 	bg.Add(1)
 	go func() {

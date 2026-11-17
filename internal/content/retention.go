@@ -467,15 +467,23 @@ type RetentionOptions struct {
 	// panic.
 	OnPass func(RetentionStats, time.Duration)
 	// OnError — the pass error hook (T-273; the stats argument — T-295,
-	// review 09#P3-1): called after the Warn on every failed pass with
-	// the PARTIAL statistics of the batches committed before the error
-	// point (the work is already in the DB — the counters must credit
-	// it; a ctx cancellation is a normal stop — the hook is not called).
-	// The cycle error counter crawler_content_retention_errors_total —
-	// before T-273 pass errors were visible only in journalctl (the
-	// :9104 metrics were zeros at 70+ WARNs per day, the 2026-11-09/10
-	// incident). Must be fast and not panic.
-	OnError func(error, RetentionStats)
+	// review 09#P3-1; the duration — T-322, review 09#P3-4): called after
+	// the Warn on every failed pass with the PARTIAL statistics of the
+	// batches committed before the error point (the work is already in
+	// the DB — the counters must credit it; a ctx cancellation is a
+	// normal stop — the hook is not called) and the DURATION of the
+	// failed pass: it burned the same wall clock as a successful one
+	// (often the whole selection cap — the 2026-11-10/11 incident), so
+	// the histogram crawler_content_retention_pass_seconds observes it
+	// identically to a successful pass; the difference lives in
+	// errors_total and the journal Warn (the scheduler.backlog /
+	// monitor.zonestats loop style — took is observed after the outcome
+	// switch). The cycle error counter
+	// crawler_content_retention_errors_total — before T-273 pass errors
+	// were visible only in journalctl (the :9104 metrics were zeros at
+	// 70+ WARNs per day, the 2026-11-09/10 incident). Must be fast and
+	// not panic.
+	OnError func(error, RetentionStats, time.Duration)
 }
 
 // withDefaults replaces invalid zeros with the defaults; Retention is not
@@ -1030,7 +1038,7 @@ func RetentionLoop(ctx context.Context, pool RetentionDB, opts RetentionOptions)
 			if ctx.Err() == nil {
 				log.Warn("content retention pass", "err", err, "rows_done", stats.Rows)
 				if o.OnError != nil {
-					o.OnError(err, stats)
+					o.OnError(err, stats, time.Since(start))
 				}
 			}
 			return err

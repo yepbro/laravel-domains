@@ -1233,7 +1233,7 @@ func TestRetentionLoop_OnError(t *testing.T) {
 		Interval:     20 * time.Millisecond,
 		ErrorBackoff: 60 * time.Millisecond,
 		BatchSize:    100,
-		OnError:      func(err error, _ RetentionStats) { errs <- err },
+		OnError:      func(err error, _ RetentionStats, _ time.Duration) { errs <- err },
 	}
 	count := func() int {
 		pool.mu.Lock()
@@ -1288,8 +1288,10 @@ func TestRetentionLoop_OnError(t *testing.T) {
 // T-295, P3-2): a pass that dies MID-DRAIN has its already committed
 // batches in force — the error hook must receive their PARTIAL statistics
 // (Rows/Batches > 0), not zeros: the work counters credit the committed
-// work via ObserveError. The first batch commits, the second dies on its
-// purge Commit.
+// work via ObserveError. Since T-322 (09#P3-4) the hook also receives the
+// pass DURATION (> 0 — the histogram observation material: a failed pass
+// burned the same wall clock as a successful one). The first batch
+// commits, the second dies on its purge Commit.
 func TestRetentionLoop_OnErrorPartialStats(t *testing.T) {
 	pool := drainPool(retentionTestNow()) // two purgeable rows
 	pool.mu.Lock()
@@ -1308,6 +1310,7 @@ func TestRetentionLoop_OnErrorPartialStats(t *testing.T) {
 	type failedPass struct {
 		err   error
 		stats RetentionStats
+		d     time.Duration // the failed pass duration (T-322): the histogram material
 	}
 	fails := make(chan failedPass, 16)
 	opts := RetentionOptions{
@@ -1315,7 +1318,7 @@ func TestRetentionLoop_OnErrorPartialStats(t *testing.T) {
 		Interval:     20 * time.Millisecond,
 		ErrorBackoff: 60 * time.Millisecond,
 		BatchSize:    1,
-		OnError:      func(err error, stats RetentionStats) { fails <- failedPass{err, stats} },
+		OnError:      func(err error, stats RetentionStats, d time.Duration) { fails <- failedPass{err, stats, d} },
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1339,6 +1342,10 @@ func TestRetentionLoop_OnErrorPartialStats(t *testing.T) {
 	if first.stats.Rows != 1 || first.stats.Batches != 1 {
 		t.Fatalf("OnError stats = %+v, want the partial work of the committed batch (Rows=1, Batches=1)",
 			first.stats)
+	}
+	if first.d <= 0 {
+		t.Errorf("OnError duration = %v, want > 0 (the failed pass duration — the pass_seconds histogram material, T-322)",
+			first.d)
 	}
 	if first.err == nil || !strings.Contains(first.err.Error(), "commit loss") {
 		t.Errorf("OnError received %v, want the pass error", first.err)

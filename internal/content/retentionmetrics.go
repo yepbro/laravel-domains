@@ -5,8 +5,10 @@
 //
 // Architecturally it is push, not poll: pass outcomes are the return values
 // of RetentionOnce; there is no long-lived state. The RetentionLoop cycle
-// hands the outcome over via the RetentionOptions.OnPass hook, and the
-// collector turns it into instruments — the same seam as
+// hands the outcome over via the RetentionOptions hooks — OnPass (a
+// successful/skipped pass) and OnError (a failed pass: the partial work
+// since T-295, the duration since T-322) — and the collector turns it into
+// instruments — the same seam as
 // CleanupOptions.OnPass (T-020/T-099); the retention.go package picks up no
 // dependency on metrics.
 package content
@@ -26,7 +28,9 @@ import (
 var retentionSecondsBuckets = []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 300}
 
 // RetentionMetrics — the instruments of the retention cycle: counters grow
-// monotonically with pass outcomes; the histogram is observed on every pass.
+// monotonically with pass outcomes; the histogram is observed on every
+// drain pass — ok and error alike (T-322: a failed pass burned the same
+// wall clock); skips and ctx-cancelled passes are not observed.
 type RetentionMetrics struct {
 	rows          prometheus.Counter     // crawler_content_retention_rows_total
 	refs          prometheus.Counter     // crawler_content_retention_refs_total
@@ -84,11 +88,11 @@ func NewRetentionMetrics(reg *metrics.Registry) *RetentionMetrics {
 		}).WithLabelValues(),
 		errors: reg.MustCounter(prometheus.CounterOpts{
 			Name: "crawler_content_retention_errors_total",
-			Help: "Failed retention passes (T-273): the pass aborted on an error — batches committed before it stay in force (the cursor advanced partially; their rows/refs/bytes are credited in the work counters via the same observation, T-295), the rest of the set repeats after a backoff. Before T-273 errors were visible only in the journal (the 2026-11-09–10 incident: a day of WARNs with zero pass metrics); a growing series = the drain stands still, watch the content disk and the Warn heading in journalctl.",
+			Help: "Failed retention passes (T-273): the pass aborted on an error — batches committed before it stay in force (the cursor advanced partially; their rows/refs/bytes are credited in the work counters via the same observation, T-295; the pass duration is observed in crawler_content_retention_pass_seconds, T-322), the rest of the set repeats after a backoff. Before T-273 errors were visible only in the journal (the 2026-11-09–10 incident: a day of WARNs with zero pass metrics); a growing series = the drain stands still, watch the content disk and the Warn heading in journalctl.",
 		}).WithLabelValues(),
 		seconds: reg.MustHistogram(prometheus.HistogramOpts{
 			Name:    "crawler_content_retention_pass_seconds",
-			Help:    "Duration of one retention pass (drain in batches, T-166).",
+			Help:    "Duration of one retention pass (drain in batches, T-166). Failed passes are observed with their duration too (T-322): the error burned the same wall clock — often the whole selection cap — so pass_seconds_count keeps growing while the drain is being attempted, next to a growing errors_total (not metric silence). Skips (the interlock, the guard) are not observed — including a mid-drain skip: its partial work is credited in the work counters, its duration is not (the outcome taxonomy, not the amount of work); a ctx-cancelled pass is not observed either (the hook is not called).",
 			Buckets: retentionSecondsBuckets,
 		}).WithLabelValues(),
 		passes: reg.MustCounter(prometheus.CounterOpts{
@@ -112,7 +116,8 @@ func NewRetentionMetrics(reg *metrics.Registry) *RetentionMetrics {
 // batches) do not lose the work already done — Rows/Refs/Contents/Freed/
 // Deferred are credited in them too, since the batches are committed in the
 // DB; a FAILED pass credits its partial work the same way — via
-// ObserveError (T-295, review 09#P3-1).
+// ObserveError (T-295, review 09#P3-1) — and its duration lands in the
+// histogram like a successful one (T-322, review 09#P3-4).
 func (m *RetentionMetrics) Observe(res RetentionStats, d time.Duration) {
 	if m == nil {
 		return
@@ -135,18 +140,26 @@ func (m *RetentionMetrics) Observe(res RetentionStats, d time.Duration) {
 }
 
 // ObserveError — a failed pass (T-273; the partial statistics — T-295,
-// review 09#P3-1): +1 to crawler_content_retention_errors_total and the
-// work counters of the batches committed before the error point — they are
-// already in the DB (the cursor advanced partially), losing them
-// undercounted rows/refs/bytes against the disk reality; wired in via the
+// review 09#P3-1; the duration — T-322, review 09#P3-4): +1 to
+// crawler_content_retention_errors_total, the work counters of the
+// batches committed before the error point — they are already in the DB
+// (the cursor advanced partially), losing them undercounted rows/refs/
+// bytes against the disk reality — and the pass duration in the
+// crawler_content_retention_pass_seconds histogram, the same observation
+// as a successful pass (the scheduler.backlog / monitor.zonestats
+// precedent — took is measured after the outcome switch): a failed pass
+// burned real wall clock, often the whole selection timeout cap (the
+// 2026-11-10/11 incident), and without it pass_seconds_count understates
+// the pass tempo exactly while errors grow. Wired in via the
 // RetentionOptions.OnError hook (the error value is not classified — the
 // text is visible in the journal Warn). The pass is not counted in
 // passes_total: errors_total is its label. A nil receiver is a no-op.
-func (m *RetentionMetrics) ObserveError(_ error, partial RetentionStats) {
+func (m *RetentionMetrics) ObserveError(_ error, partial RetentionStats, d time.Duration) {
 	if m == nil {
 		return
 	}
 	m.errors.Inc()
+	m.seconds.Observe(d.Seconds())
 	m.observeWork(partial)
 }
 
