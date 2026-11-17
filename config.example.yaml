@@ -529,8 +529,11 @@ monitor:
     disk_free_min_bytes: "15GiB"
     disk_free_crit_bytes: "10GiB"
     # A frozen queue: the stream group's last-delivered-id does not move at
-    # a depth > 0 (the poison task signature of T-159 — the consumer does
-    # not read); a live group moves the ID every few seconds.
+    # a depth > 0 (deliveries are not advancing; the T-313 detail splits by
+    # the unacknowledged share: pending 0 — the consumer is not reading,
+    # pending > 0 — an issued batch may be held by a live worker — check
+    # the pending trend before a restart); a live group moves the ID every
+    # few seconds.
     queue_freeze_window: "15m"
     # CPU starvation by PSI some (avg300): above the threshold for a
     # sustained window — one-off spikes (a deploy, retro chunks) do not

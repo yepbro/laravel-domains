@@ -731,9 +731,17 @@ type freezeEntry struct {
 // queueFreezeTrack — the group immobility window (queue_frozen, T-162):
 // the last-delivered-id of a working stream group does not move ≥ the window at
 // depth > 0. A live consumer moves the ID with every XREADGROUP (batches in
-// seconds); a standing ID at a non-empty backlog — entries are not
-// delivered at all: the consumer is dead or crashes on the first entry (the T-159 poison),
-// lease recovery does not raise it. The first observation of a group — the base from
+// seconds); a standing ID at a non-empty backlog — the queue is not
+// advancing, and the diagnosis splits by the unacknowledged share of the
+// depth (T-313): pending 0 — the whole backlog is undelivered, no entry
+// is being fetched at all: the consumer is dead or hung before its
+// XREADGROUP (new deliveries would move the ID); pending > 0 — the batch
+// is issued but not acknowledged: a live worker may be slowly processing
+// it (the ID moves only with new deliveries, per-entry XACKs drain the
+// pending without moving it — check the pending trend before a restart),
+// or the consumer crashed on an entry — the T-159 poison (the crashed
+// entry stays in the PEL, lease recovery reclaims it without moving the
+// ID). The first observation of a group — the base from
 // the current moment (after a monitor restart the alert fires no earlier than
 // the window, not retrospectively); an ID movement updates the moment; depth 0 —
 // the entry is cleaned out; a group vanished from the answer (the stream deleted) — does not accumulate.
@@ -749,6 +757,9 @@ func (t *queueFreezeTrack) decide(_ string, now time.Time, groups []StreamGroupS
 	seen := make(map[string]bool, len(groups))
 	var frozen []string
 	var moving int
+	// outstanding — a frozen group holds an issued batch (pending > 0):
+	// the "not reading" diagnosis would be wrong for it (T-313).
+	var outstanding bool
 	for _, g := range groups {
 		key := g.Stream + "/" + g.Group
 		seen[key] = true
@@ -765,8 +776,17 @@ func (t *queueFreezeTrack) decide(_ string, now time.Time, groups []StreamGroupS
 		}
 		idle := now.Sub(tr.since)
 		if idle >= t.window {
-			frozen = append(frozen, fmt.Sprintf("%s/%s: no deliveries for %s at depth %d (the last ID %s)",
-				g.Stream, g.Group, idle.Round(time.Second), g.Depth, g.LastDeliveredID))
+			// The unacknowledged share of the depth (T-313): pending 0 —
+			// the backlog is undelivered; pending > 0 — an issued batch is
+			// held, new deliveries would move the ID, per-entry XACKs would
+			// only drain the pending.
+			line := fmt.Sprintf("%s/%s: no deliveries for %s at depth %d",
+				g.Stream, g.Group, idle.Round(time.Second), g.Depth)
+			if g.Pending > 0 {
+				outstanding = true
+				line += fmt.Sprintf(", %d unacknowledged", g.Pending)
+			}
+			frozen = append(frozen, line+fmt.Sprintf(" (the last ID %s)", g.LastDeliveredID))
 		}
 	}
 	for key := range t.groups { // the group vanished (the stream deleted) — do not accumulate
@@ -775,9 +795,19 @@ func (t *queueFreezeTrack) decide(_ string, now time.Time, groups []StreamGroupS
 		}
 	}
 	if len(frozen) > 0 {
+		// The triage suffix (T-313): without unacknowledged entries the
+		// classic "not reading" holds verbatim; with them — a live worker
+		// may be processing the issued batch: a restart returns only its
+		// un-acked remainder (via XAUTOCLAIM after redis.claim_min_idle —
+		// the already acked entries stay done, an un-acked one may be
+		// repeated).
+		note := " — the consumer is not reading: the worker unit log and q:dead (the T-159 poison), a worker restart"
+		if outstanding {
+			note = " — deliveries are not advancing: the backlog is not read and/or an issued batch is not acknowledged (a live worker may be processing it — check the pending trend/XPENDING idle before a restart; a crashed consumer — the worker unit log and q:dead, the T-159 poison, a restart)"
+		}
 		return decision{
 			AlertStatusFiring,
-			strings.Join(frozen, "; ") + " — the consumer is not reading: the worker unit log and q:dead (the T-159 poison), a worker restart",
+			strings.Join(frozen, "; ") + note,
 		}
 	}
 	return decision{

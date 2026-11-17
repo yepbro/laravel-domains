@@ -6,7 +6,10 @@
 // is queue.GroupDepth: the same arithmetic as the backpressure gate
 // (min(lag, XLEN) + pending, the clamp of the phantom lag after the
 // undelivered trim — T-168) — the source must agree with the queue
-// overflow alert on whether there is work to do.
+// overflow alert on whether there is work to do. Besides the depth, the
+// snapshot carries its unacknowledged share (pending, T-313): the freeze
+// diagnosis splits by it — a batch issued to a live worker is not "the
+// consumer is not reading".
 //
 // The data is XINFO GROUPS for each worker stream (group name, lag,
 // pending, last-delivered-id) and XLEN for the clamp: the same window
@@ -39,6 +42,15 @@ type StreamGroupState struct {
 	// (pending). The formula is queue.GroupDepth (shared with
 	// BackpressureGate.Len).
 	Depth int64
+	// Pending is the unacknowledged-deliveries part of Depth (the group's
+	// PEL from XINFO GROUPS — the counter is always exact); Depth−Pending
+	// is the undelivered part. The queue_frozen diagnosis splits by it
+	// (T-313): a standing last-delivered-id with Pending 0 — the backlog
+	// is not read at all (the consumer is not reading); with Pending > 0 —
+	// an issued batch is held without acknowledgements (a live worker
+	// processing it slowly, or a consumer crashed on it — the T-159
+	// poison).
+	Pending int64
 	// LastDeliveredID is the group's last-delivered-id from XINFO GROUPS:
 	// the ID of the last entry delivered to consumers (XREADGROUP ">").
 	// It moves only with new deliveries: a standing ID at Depth > 0 —
@@ -118,6 +130,7 @@ func (s RedisStreamGroups) StreamGroups(ctx context.Context) ([]StreamGroupState
 				// −1 — the lag is undefined (the undelivered trim, Redis < 7.0):
 				// GroupDepth counts only the exact pending.
 				Depth:           queue.GroupDepth(g, xlen),
+				Pending:         g.Pending,
 				LastDeliveredID: g.LastDeliveredID,
 			})
 		}

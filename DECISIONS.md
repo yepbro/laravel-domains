@@ -2138,3 +2138,90 @@ T-322).
 Ссылки: T-322; D-041 (09#P3-4); internal/content/retention.go,
 retentionmetrics.go (+тесты); cmd/http-worker/main.go (комментарий
 проводки); docs/services.md, docs/content.md, docs/operations.md.
+
+### D-064 — T-313: freeze-алерт очередей — триггер оставлен по общей глубине GroupDepth, диагноз разделён по доле pending (выданный batch ≠ «consumer is not reading»)
+
+Дата: 2026-11-17.
+
+Проблема (находка bulk-ревью hy4-flash-free 2026-11-16, вне стадии):
+queueFreezeTrack (alertstate.go) считает «замерзание» по last-delivered-id
+при Depth > 0, где Depth = queue.GroupDepth = min(lag, XLEN) + Pending.
+Живой воркер с выданным batch'ем: XREADGROUP выдал пачку (Pending > 0),
+ID движется только новыми выдачами — до следующего XREADGROUP он неподвижен,
+а побитые XACK (ProcessingAttempt — Ack на каждую запись) уменьшают pending,
+не двигая ID. Batch дольше окна (15 мин) → firing с диагнозом «the consumer
+is not reading» и шагом триажа «a worker restart» — диагноз неверен, а
+слепой рестарт выкинул бы in-flight работу обратно в redelivery.
+
+Оценка вариантов ТЗ:
+
+(а) считать freeze по depth без Pending (только undelivered-часть,
+min(lag, XLEN)) — отклонён. (i) False positive не устраняется там, где
+важно: при оставшемся недоставленном фоне (lag > 0 — типичное состояние
+рабочей очереди) живой медленный воркер всё равно даёт неподвижный ID —
+firing остаётся; «лечится» только полностью раздатый случай (lag = 0).
+(ii) False negative ровно на сценариях-основателях алерта: финальная
+стадия яда T-159 и мёртвый consumer с полностью раздатой очередью — это
+в точности lag = 0 + pending > 0 + неподвижный ID («XREADGROUP returns
+no entries», шапка streamgroups.go) — исключение pending ослепляет алерт
+именно там (глубину такого состояния пинирует TestGroupDepth — кейс
+«lag 0 — a zero increment», backpressure_test.go; замороженность с
+pending > 0 покрыта новыми тестами T-313). (iii) Ломается
+инвариант единой формулы глубины (gate / crawlerctl status /
+crawler_queue_depth / строка «Queues» отчёта — «an observation has no
+right to diverge from the gate», docs/redis.md): появляется второе
+понятие «есть ли работа».
+
+(б) триггер не менять, уточнить диагноз по доле pending — принято.
+Pending из XINFO GROUPs всегда точен (шапка backpressure.go) и бесплатен
+при том же чтении: StreamGroupState получил поле Pending (Depth−Pending =
+undelivered-часть). Строка firing для группы с pending > 0 добавляет
+«, N unacknowledged», а общий суффикс становится дифференциальным: без
+unacknowledged — классический текст дословно («the consumer is not
+reading … a worker restart»); при наличии — «deliveries are not
+advancing … a live worker may be processing it — check the pending
+trend/XPENDING idle before a restart; a crashed consumer — the worker
+unit log and q:dead, the T-159 poison». Сам firing сохранён: ≥15 мин без
+ни одной новой выдачи в системе, где «batches in seconds» (spec 3.3), —
+сигнал, достойный взгляда, независимо от класса причины; меняется не
+чувствительность, а направление триажа.
+
+Рассмотренное и отклонённое расширение: сброс окна при убывающем pending
+(побитые XACK живого воркера различались бы уже в триггере) — разводит
+понятие «неподвижности» (ID против depth), имеет дыры (полностью
+проваливающийся batch не ack'ает ни одной записи — pending стоит) и
+выходит за два варианта ТЗ; тренд pending оставлен триажу (шаги — в
+docs/operations.md; счётчик unacknowledged — в тексте алерта).
+
+Регрессии: TestAlertsQueueFreezeIssuedBatch — сценарий находки (выданный
+batch: pending = depth, ID неподвижен, между проходами pending убывает) →
+firing с дифференциальным суффиксом и счётчиком unacknowledged, БЕЗ
+«the consumer is not reading»; чистый недоставленный фон — классический
+текст дословно; TestRedisStreamGroups проверяет проводку Pending.
+Существующие тесты alertstate (Pending = 0) не изменены.
+
+Ревью-раунд (deepseek-v4.1-flash, первое звено цепочки; отчёт
+tmp/review/42-t313.md): VERDICT FINDINGS, 0×P0/P1/P2, 5×P3; ядро
+подтверждено (триггер и общая с gate глубина не изменены, классический
+текст при pending = 0 байт-в-байт прежний, сценарий находки покрыт с
+проверкой отрицания, номер D-064 корректен). Приняты четыре: P3-1 —
+комментарий суффикса утверждал «per-entry XACKs already done are lost»,
+хотя XACK необратим и рестарт возвращает через XAUTOCLAIM (после
+redis.claim_min_idle) только не-подтверждённый остаток — переформулирован;
+P3-2 — config.example.yaml нёс снятый диагноз «the consumer does not
+read» — приведён к новой семантике; P3-3 — в ветке pending = 0 остался
+«crashes on the first entry (T-159)»: крэш на записи оставляет её в PEL
+(XACK при ошибке не делается) — такой сценарий попадает в ветку
+pending > 0, ветка pending = 0 переописана как «dead or hung before its
+XREADGROUP» (комментарий трека и docs/services.md); P3-5 — D-064 без
+строки «Дата:» и с неточной фразой о пинировании класса тестами —
+добавлено/сужено. Отклонена одна: P3-4 (суффикс выбирается на проход, а
+не на группу) — в смешанном проходе линия каждой группы несёт свою долю
+«, N unacknowledged», а дифференциальный суффикс покрывает оба класса
+(«the backlog is not read and/or an issued batch is not acknowledged»);
+рабочих стримов четыре, группы по одной — усложнение склейки per-group
+суффиксов не окупается.
+
+Ссылки: T-313; D-029 (bulk-ревью); internal/monitor/streamgroups.go,
+alertstate.go, alerts.go; docs/services.md, docs/operations.md,
+docs/configuration.md; config.example.yaml.

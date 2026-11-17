@@ -1419,9 +1419,17 @@ reconciliation periods (see the alert below):
   for ≥ `monitor.alerts.queue_freeze_window` (15 min) with depth > 0:
   a live consumer moves the ID with every XREADGROUP (batches take
   seconds,
-  spec 3.3); a standing ID with a non-empty backlog — records are not
-  delivered at all: the consumer is dead or crashes on the first record
-  (poison T-159).
+  spec 3.3); a standing ID with a non-empty backlog — deliveries are
+  not advancing, and the firing diagnosis splits by the unacknowledged
+  share of the depth (T-313): pending 0 — records are not delivered at
+  all, the consumer is dead or hung before its XREADGROUP (new deliveries
+  would move the ID); pending > 0 — an issued batch is held without
+  acknowledgements
+  (the ID moves only with new deliveries, per-entry XACKs drain the
+  pending without moving it): a live worker slowly processing its batch
+  is not "the consumer is not reading" — the message tells the triage to
+  check the pending trend before a restart (a restart requeues the
+  in-flight entries), a crashed consumer — the T-159 poison path again.
   Immobility is evaluated only by a loop pass — the latency
   on top of the window is at most the alert loop period: at the default
   5 min

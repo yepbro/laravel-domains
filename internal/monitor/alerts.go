@@ -63,6 +63,9 @@
 //     depth > 0 (StreamGroupsSource, the RedisStreamGroups implementation —
 //     streamgroups.go): the signature of the poisoned task of T-159 — an entry
 //     kills the consumer, XREADGROUP reads nothing, the queue stands still;
+//     the diagnosis splits by the unacknowledged share of the depth
+//     (T-313): a batch issued to a live worker (pending > 0, the ID moves
+//     only with new deliveries) is not "the consumer is not reading";
 //   - PSI CPU (T-162) — some avg300 of /proc/pressure/cpu above
 //     monitor.alerts.psi_cpu_percent sustained for monitor.alerts.
 //     psi_cpu_window (PSISource, the OSPSI implementation — psi.go): scheduler
@@ -234,7 +237,7 @@ var alertDescs = map[string]string{
 	AlertDiskMin:          "free space below the absolute minimum",
 	AlertDiskCrit:         "free space below the escalation threshold",
 	AlertMemHigh:          "unit MemoryHigh throttling (sustained growth of reclaim events)",
-	AlertQueueFreeze:      "frozen queue: the group is not reading the stream",
+	AlertQueueFreeze:      "frozen queue: the group's deliveries are not advancing",
 	AlertPSICPU:           "CPU starvation (PSI some) sustained above the threshold",
 	AlertRenderDebt:       "render debt accumulation: SPA inflow outruns the q:render drain",
 	AlertRenderFbDepth:    "q:render-fallback queue buildup: worker B cannot keep up",
@@ -1704,8 +1707,9 @@ func (a *Alerts) newDeadMachine() *alertMachine[int64] {
 // StreamGroupsSource). Consistent with BackpressureGate.Len on the depth
 // (the T-168 clamp in the source): the stuck phantom lag of the incident
 // of Oct 22–23 is not "depth" by itself, but frozen deliveries were there
-// — the alert catches this downtime class too. The immobility window — the
-// machine track.
+// — the alert catches this downtime class too. The snapshot also carries
+// the unacknowledged share of the depth (pending) — the T-313 diagnosis
+// split. The immobility window — the machine track.
 func (a *Alerts) observeQueueFreeze(ctx context.Context) observation[[]StreamGroupState] {
 	if a.deps.StreamGroups == nil {
 		return observation[[]StreamGroupState]{reason: "source not set"}
@@ -1722,7 +1726,10 @@ func (a *Alerts) observeQueueFreeze(ctx context.Context) observation[[]StreamGro
 // a live consumer moves the ID with every XREADGROUP, batches in seconds —
 // spec 3.3; shorter — false firings on the pauses between batches,
 // longer — half of the step "restart the consumer and look at the
-// logs" is lost). Clearing — the first pass where no group is frozen
+// logs" is lost). The firing diagnosis splits by the unacknowledged
+// share of the depth (T-313): an issued batch held by a live worker is
+// not "the consumer is not reading" — the suffix tells the triage to
+// check the pending trend before a restart. Clearing — the first pass where no group is frozen
 // (the depth went to zero or deliveries resumed): no hysteresis needed; the window
 // is the natural flap filter.
 func (a *Alerts) newQueueFreezeMachine() *alertMachine[[]StreamGroupState] {

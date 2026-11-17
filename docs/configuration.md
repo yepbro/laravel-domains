@@ -1545,7 +1545,9 @@ semantics — [`services.md`](services.md); delivery setup —
 - `queue_freeze_window` — the window of stillness of the stream
   group's last-delivered-id
   at depth > 0 (the `queue_frozen` alert, the poisoned-task signature
-  of T-159);
+  of T-159); the firing diagnosis splits by the unacknowledged share of
+  the depth (T-313): a batch issued to a live worker is not "the
+  consumer is not reading";
 - `psi_cpu_percent` + `psi_cpu_window` — the PSI CPU some avg300
   threshold and
   the persistence window (the `psi_cpu` alert; a kernel without PSI —

@@ -485,11 +485,20 @@ df -h /var/lib/crawler/content /var/lib/postgresql    # volumes
   T-260) — triage: [`runbooks.md`](runbooks.md) §2.
 - **Frozen queue** (the `queue_frozen` alert, T-162: the group's
   last-delivered-id is not moving for ≥ 15 min at depth > 0 —
-  a consumer is not reading the stream, the poison signature of T-159;
+  deliveries are not advancing, the poison signature of T-159;
   the stillness is evaluated by an alert-cycle pass — the latency adds
   up to the period: at the default 5 min, T-206, a freeze is noticed in
-  ≈15–20 min): the log of the stream's worker from the detail
-  (`journalctl -t crawler-http-worker` and so on), a worker restart;
+  ≈15–20 min): read the unacknowledged share in the detail (T-313) —
+  without it ("depth N (the last ID …)") the whole backlog is
+  undelivered, the consumer is not reading: the log of the stream's
+  worker from the detail (`journalctl -t crawler-http-worker` and so
+  on), a worker restart; with it ("depth N, M unacknowledged …") an
+  issued batch is held — first check the worker is alive and the
+  pending is shrinking (`systemctl status` of the unit, the depth of
+  the next passes, `redis-cli XPENDING <stream> <group> - + 10` — the
+  idle of the entries): a live worker slowly processing the batch needs
+  no restart (it would requeue the in-flight entries), a stuck or
+  crash-looping one — the worker log, `q:dead` and a restart;
   entries that crash the consumer end up in `q:dead` after restarts —
   triage per runbooks §2.
 - **Render debt grows** (the `render_debt` alert, T-175: the

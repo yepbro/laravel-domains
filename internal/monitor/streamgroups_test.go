@@ -85,9 +85,15 @@ func TestRedisStreamGroups(t *testing.T) {
 	if rend.Depth != 52 || rend.LastDeliveredID != "1761280800000-0" {
 		t.Errorf("q:render/render-worker = %+v, want depth=52 (the clamp 98→50 + 2) and the ID as is", rend)
 	}
+	if rend.Pending != 2 {
+		t.Errorf("q:render/render-worker pending = %d, want 2 (the unacknowledged share of the depth, T-313)", rend.Pending)
+	}
 	ana := byKey["q:analyze/analyzer"]
 	if ana.Depth != 5 || ana.LastDeliveredID != "0-0" {
 		t.Errorf("q:analyze/analyzer = %+v, want depth=5 (lag −1: pending only) and the ID 0-0", ana)
+	}
+	if ana.Pending != 5 {
+		t.Errorf("q:analyze/analyzer pending = %d, want 5 (the whole depth is unacknowledged)", ana.Pending)
 	}
 
 	// A stream with a key but without groups (the consumers were never

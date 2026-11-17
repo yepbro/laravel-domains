@@ -1710,6 +1710,68 @@ func TestAlertsQueueFreeze(t *testing.T) {
 	}
 }
 
+// TestAlertsQueueFreezeIssuedBatch — the T-313 diagnosis split: a group
+// with an issued batch (pending > 0; the last-delivered-id moves only
+// with new deliveries — a live worker chewing its batch keeps it
+// standing) fires with the differential suffix, not the plain "consumer
+// is not reading"; a pure undelivered backlog (pending 0) keeps the
+// classic message; a shrinking pending (per-entry XACKs of a live
+// worker) does not reset the window — the trigger is the ID immobility,
+// the trend is the triage's business.
+func TestAlertsQueueFreezeIssuedBatch(t *testing.T) {
+	now := time.Date(2026, 11, 17, 9, 0, 0, 0, time.UTC)
+	env := newAlertsTestEnv(t, func(o *AlertsOptions) {
+		o.QueueFreeze = 15 * time.Minute
+		o.Now = func() time.Time { return now }
+	})
+	ctx := context.Background()
+	m := env.newQueueFreezeMachine()
+	issued := []StreamGroupState{
+		{Stream: queue.StreamRender, Group: "render-worker", Depth: 12, Pending: 12, LastDeliveredID: "1761280800000-0"},
+	}
+	if s := m.transition(env.Alerts, ctx, obs(issued)); s.Status != AlertStatusOK {
+		t.Fatalf("the base: %s (%s), want ok", s.Status, s.Detail)
+	}
+	now = now.Add(16 * time.Minute)
+	// A live worker acks entries of the batch between passes (12 → 8):
+	// the ID is immobile, the window accumulates — the firing stands.
+	issued[0].Depth, issued[0].Pending = 8, 8
+	s := m.transition(env.Alerts, ctx, obs(issued))
+	if s.Status != AlertStatusFiring {
+		t.Fatalf("an issued batch over the window: %s (%s), want firing", s.Status, s.Detail)
+	}
+	for _, want := range []string{"q:render/render-worker", "depth 8", "8 unacknowledged", "1761280800000-0", "check the pending trend"} {
+		if !strings.Contains(s.Detail, want) {
+			t.Errorf("detail = %q, want it to contain %q", s.Detail, want)
+		}
+	}
+	if strings.Contains(s.Detail, "the consumer is not reading") {
+		t.Errorf("detail = %q: an issued batch is not \"the consumer is not reading\"", s.Detail)
+	}
+
+	// A pure undelivered backlog (pending 0) — the classic diagnosis.
+	now = now.Add(time.Minute)
+	pure := []StreamGroupState{
+		{Stream: queue.StreamHTTP, Group: "http-worker", Depth: 7, LastDeliveredID: "5-1"},
+	}
+	if s := m.transition(env.Alerts, ctx, obs(pure)); s.Status != AlertStatusOK {
+		t.Fatalf("a fresh group: %s (%s), want ok (the base anew)", s.Status, s.Detail)
+	}
+	now = now.Add(16 * time.Minute)
+	s = m.transition(env.Alerts, ctx, obs(pure))
+	if s.Status != AlertStatusFiring {
+		t.Fatalf("a pure backlog over the window: %s (%s), want firing", s.Status, s.Detail)
+	}
+	for _, want := range []string{"depth 7", "the consumer is not reading: the worker unit log and q:dead (the T-159 poison), a worker restart"} {
+		if !strings.Contains(s.Detail, want) {
+			t.Errorf("detail = %q, want it to contain %q", s.Detail, want)
+		}
+	}
+	if strings.Contains(s.Detail, "unacknowledged") {
+		t.Errorf("detail = %q: without unacknowledged entries the line carries no pending share", s.Detail)
+	}
+}
+
 // TestAlertsQueueFreezeDegradation — the source not set/an error — "not
 // measured", an error with a Warn; a group absent from the answer — no tracking accumulation.
 func TestAlertsQueueFreezeDegradation(t *testing.T) {
