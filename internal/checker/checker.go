@@ -50,6 +50,14 @@ type SubRecord struct {
 	VerMin      string
 	VerMax      string
 	Rendered    bool // the analysis by the render DOM
+	// RenderErr — the class of THIS record's render error
+	// ("task"/"context"/"browser", render.Class.String); "" — the render
+	// succeeded or did not run (including the records after renderDown:
+	// their render was not attempted, there is no error of their own).
+	// The degradation trace of 16#P3-4: Rendered=false alone does not
+	// say WHY — a failed SPA render over the raw HTML shell used to look
+	// like an honest "Laravel not found".
+	RenderErr string
 }
 
 // Result — the outcome of the domain check.
@@ -237,16 +245,23 @@ func (rt *Runtime) Run(ctx context.Context, _ *config.Config, pool Pool, domain 
 				Headers: map[string][]string(rec.Header),
 			}
 			if rec.SPA != nil && rec.SPA.SPA && renderer != nil && !renderDown {
-				if ro, rerr := renderer.Run(ctx, render.RenderTask{URL: rec.FinalURL}); rerr == nil {
+				ro, rendered, down, rerrClass := renderSPA(ctx, renderer, rec.FinalURL, log)
+				if rendered {
 					page.HTML = []byte(ro.DOM)
 					for _, c := range ro.Cookies {
 						page.Cookies = append(page.Cookies, rules.Cookie{Name: c.Name, Value: c.Value})
 					}
 					page.Headers = map[string][]string(ro.ResponseHeaders)
 					sr.Rendered = true
-				} else if render.ClassOf(rerr) == render.ClassBrowser {
-					log.Warn("checker: render unavailable — SPA on the raw HTML for the rest of the check", "err", rerr)
-					renderDown = true
+				} else {
+					// A render error of any class leaves a trace on
+					// the record (16#P3-4); only the browser class
+					// damps the render for the rest of the check
+					// (renderSPA).
+					sr.RenderErr = rerrClass
+					if down {
+						renderDown = true
+					}
 				}
 			}
 			eval := set.EvaluateCtx(ctx, page, rules.Limits{})
@@ -254,7 +269,6 @@ func (rt *Runtime) Run(ctx context.Context, _ *config.Config, pool Pool, domain 
 			sr.Score = eval.Score
 			sr.VerMin, sr.VerMax = eval.VerMin, eval.VerMax
 			if eval.IsLaravel(rt.cfg.Analyzer.LaravelMinScore) {
-				sr.Score = eval.Score
 				if eval.Score > res.Score {
 					res.Score = eval.Score
 					res.VerMin, res.VerMax = eval.VerMin, eval.VerMax
@@ -266,6 +280,42 @@ func (rt *Runtime) Run(ctx context.Context, _ *config.Config, pool Pool, domain 
 	}
 	res.TotalMS = time.Since(start).Milliseconds()
 	return res, nil
+}
+
+// spaRenderer — the render call seam of the records loop: *render.Manager
+// in production; the tests substitute errors of every class without a
+// Chromium (the classification itself — render.ClassOf).
+type spaRenderer interface {
+	Run(ctx context.Context, task render.RenderTask) (render.RenderOutput, error)
+}
+
+// renderSPA — one SPA render with the degradation policy of the live
+// check. An error of ANY class leaves a trace (16#P3-4 of the bulk
+// review): a Warn with the class and the class marker for the record
+// (web carries it into the form response) — before, only the browser
+// class was visible, and a page/task error looked like an honest
+// "Laravel not found" over the raw HTML shell without a single
+// diagnostic sign. Only the browser class damps the render until the
+// end of the check (T-220, P2-3 of its review: the retries on the
+// shared manager would start the generation under its mutex and pay
+// Dial+SessionStart timeouts on every SPA record; the next check tries
+// again); the page/context classes do not — the next SPA record
+// retries, one bad page does not turn off the render for the whole
+// domain.
+func renderSPA(ctx context.Context, r spaRenderer, url string, log Logger) (out render.RenderOutput, ok bool, renderDown bool, errClass string) {
+	out, rerr := r.Run(ctx, render.RenderTask{URL: url})
+	if rerr == nil {
+		return out, true, false, ""
+	}
+	class := render.ClassOf(rerr)
+	errClass = class.String()
+	if class == render.ClassBrowser {
+		log.Warn("checker: render unavailable — SPA on the raw HTML for the rest of the check", "err", rerr, "class", errClass)
+		renderDown = true
+	} else {
+		log.Warn("checker: render failed — SPA falls back to the raw HTML shell of this record", "err", rerr, "class", errClass)
+	}
+	return render.RenderOutput{}, false, renderDown, errClass
 }
 
 // wildSubs — the input of the wildcard marking of T-038 (a copy of

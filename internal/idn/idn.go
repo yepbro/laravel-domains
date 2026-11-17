@@ -276,6 +276,22 @@ func normalizeASCII(name string) (string, error) {
 	if ascii == "" {
 		return "", newErr(ErrInvalid, name, errors.New("empty label"))
 	}
+	// The trailing dot cut of cleanup (item 1) runs BEFORE the UTS-46
+	// mapping and sees only the ASCII dot; the mapping turns the
+	// alternative dot separators (U+FF0E/U+3002/U+FF61) into dots HERE —
+	// a trailing mapped dot is cut too, otherwise the last label comes
+	// out empty and a syntactically correct name ("пример.com。") is
+	// rejected as invalid (16#P3-3 of the bulk review; a separator in
+	// the middle was always fine — corpus_test.go). The cut is safe for
+	// the labels: the loop below now sees no trailing empty label, the
+	// middle/leading ones are rejected as before.
+	ascii = strings.TrimRight(ascii, ".")
+	// A name that consisted of dots only ("。" after the mapping) is
+	// empty — the same outcome as the ASCII "..." in cleanup; before
+	// this check it surfaced as "empty label" of the loop below.
+	if ascii == "" {
+		return "", newErr(ErrEmpty, name, nil)
+	}
 	for _, label := range strings.Split(ascii, ".") {
 		if label == "" {
 			return "", newErr(ErrInvalid, name, errors.New("empty label"))

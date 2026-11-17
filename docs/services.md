@@ -1638,7 +1638,12 @@ with a small UDP pool, a shared Fetcher, a rule cache, one
 render.Manager —
 assembled by the first check, closed on service stop; concurrent checks
 are limited by `web.live_concurrency`; overload —
-a fast 503 with `Retry-After`; each non-overload request with a valid
+a fast 503 with `Retry-After`; the per-record JSON of the response
+carries an optional `render_err` — the class of the record's SPA render
+error ("task"/"context"/"browser", 16#P3-4: `rendered:false` with no
+marker reads as an honest "not found", while the render actually failed
+and the analysis fell back to the raw HTML shell; absent when the render
+succeeded or did not run); each non-overload request with a valid
 client address goes to the `web_checks` journal (an overload and a peer
 without an IP are not written) with the schema contract of
 migrations/000012 (T-297): `domain` — the raw input as entered by the

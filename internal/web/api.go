@@ -98,6 +98,11 @@ type checkSubRecord struct {
 	VerMax    string             `json:"ver_max,omitempty"`
 	Signals   []signalJSON       `json:"signals"`
 	Rendered  bool               `json:"rendered"`
+	// RenderErr — the class of the record's render error
+	// ("task"/"context"/"browser"): absent when the render succeeded or
+	// did not run (checker.SubRecord.RenderErr, 16#P3-4) — the response
+	// contract only grows by an optional field.
+	RenderErr string `json:"render_err,omitempty"`
 }
 
 type redirectStepJSON struct {
@@ -204,6 +209,7 @@ func (s *Server) handleCheckDomainLive(w http.ResponseWriter, r *http.Request) {
 				VerMax:    rec.VerMax,
 				Signals:   make([]signalJSON, 0, len(rec.Signals)),
 				Rendered:  rec.Rendered,
+				RenderErr: rec.RenderErr,
 			}
 			if rec.HasTLS {
 				v := rec.TLSValid

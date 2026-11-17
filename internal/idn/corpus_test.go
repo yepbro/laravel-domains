@@ -70,6 +70,14 @@ func TestNormalizeCaseMapping(t *testing.T) {
 		// (halfwidth ideographic) are mapped to ".".
 		{"пример．рф", Result{"xn--e1afmkfd.xn--p1ai", "пример.рф", "xn--p1ai", "xn--e1afmkfd", true}},
 		{"пример｡рф", Result{"xn--e1afmkfd.xn--p1ai", "пример.рф", "xn--p1ai", "xn--e1afmkfd", true}},
+		// A TRAILING alternative separator (U+3002/U+FF0E/U+FF61) is
+		// mapped to "." by UTS-46 — after the mapping it is cut like the
+		// ASCII trailing dot of item 1 (16#P3-3): the name is valid, not
+		// "an empty last label".
+		{"пример.com。", Result{"xn--e1afmkfd.com", "пример.com", "com", "xn--e1afmkfd", true}},
+		{"пример．рф。", Result{"xn--e1afmkfd.xn--p1ai", "пример.рф", "xn--p1ai", "xn--e1afmkfd", true}},
+		{"example.com．", Result{"example.com", "example.com", "com", "example", false}},
+		{"example.com｡", Result{"example.com", "example.com", "com", "example", false}},
 		// All whitespace characters are removed (spec 5.2 item 1),
 		// including a tab inside the name (CRLF tails of the incoming
 		// rows — T-015).
@@ -351,6 +359,11 @@ func TestNormalizeEdges(t *testing.T) {
 		// A space inside is removed before the pipeline → example..com →
 		// an empty label.
 		{"example. .com", ErrInvalid},
+		// Only dots in the alternative spellings: the UTS-46 mapping
+		// turns the separators into dots, the trailing cut empties the
+		// name — the same "empty" as the ASCII "..." above (16#P3-3).
+		{"。。。", ErrEmpty},
+		{"．", ErrEmpty},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			assertNormalizeError(t, tc.name, tc.kind)
@@ -367,6 +380,7 @@ func TestNormalizeZoneUnicode(t *testing.T) {
 		want string
 	}{
 		{"РФ.", "xn--p1ai"},                // case and a trailing dot
+		{"рф。", "xn--p1ai"},                // a trailing alternative dot — cut after the UTS-46 mapping (16#P3-3)
 		{"москва.", "xn--80adxhks"},        // the TLD москва
 		{" XN--80ADXHKS ", "xn--80adxhks"}, // spaces and uppercase punycode
 		{"日本.jp", "xn--wgv71a.jp"},         // a label + a zone of the directory

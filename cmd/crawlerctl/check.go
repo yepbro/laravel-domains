@@ -128,6 +128,8 @@ func checkPrintResult(w io.Writer, res *checker.Result, minScore float64, rulesD
 		src := "raw HTML"
 		if r.Rendered {
 			src = "DOM after render"
+		} else if r.RenderErr != "" {
+			src = "raw HTML (render error " + r.RenderErr + ")"
 		}
 		out(w, "    laravel: score=%.3f ver=[%s..%s] rules=%d (%s)\n",
 			r.Score, orDash(r.VerMin), orDash(r.VerMax), len(r.Signals), src)

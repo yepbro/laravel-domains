@@ -434,6 +434,62 @@ func TestCheckDomainStoredNoLaravelJournal(t *testing.T) {
 	}
 }
 
+// TestCheckDomainRenderErrField — the optional per-record render_err of
+// the form response (16#P3-4): the class of the record's render error
+// (checker.SubRecord.RenderErr) travels into the JSON when set and is
+// absent (omitempty) when the record rendered cleanly or did not render
+// at all — the landing client contract only grows by an optional field.
+func TestCheckDomainRenderErrField(t *testing.T) {
+	db := &fakeDB{seed: seedLanding()}
+	cfg := config.Default()
+	cfg.Web.RateLimit = 10
+	srv, err := New(db, cfg, Options{})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	srv.liveCheck = func(context.Context, *config.Config, checker.Pool, string, checker.Logger) (*checker.Result, error) {
+		return &checker.Result{
+			Domain: "example.com", Zone: "com", Apex: "delegated",
+			Records: []checker.SubRecord{
+				{Label: "www", Host: "www.example.com", Variant: "main", Scheme: "https", Status: "200"},
+				{Host: "example.com", Variant: "main", Scheme: "https", Status: "200", RenderErr: "task"},
+			},
+		}, nil
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	resp, err := http.Post(ts.URL+"/api/check-domain", "application/json",
+		strings.NewReader(`{"domain":"example.com"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got checkResponse
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("decode the response: %v\n%s", err, body)
+	}
+	if len(got.Subdomains) != 2 {
+		t.Fatalf("subdomains = %d, want 2", len(got.Subdomains))
+	}
+	if got.Subdomains[0].RenderErr != "" || got.Subdomains[1].RenderErr != "task" {
+		t.Errorf("render_err = %q/%q, want %q/%q (empty for a clean record, the class for a failed render)",
+			got.Subdomains[0].RenderErr, got.Subdomains[1].RenderErr, "", "task")
+	}
+	// omitempty: the key occurs exactly once for two records — the clean
+	// record carries no render_err in the JSON.
+	if n := strings.Count(string(body), `"render_err"`); n != 1 {
+		t.Errorf("render_err occurs %d times in the response, want 1 (omitempty)\n%s", n, body)
+	}
+}
+
 // TestCheckDomainInvalid — junk input: a 422 in the landing.js format.
 func TestCheckDomainInvalid(t *testing.T) {
 	srv := newTestServer(t, &fakeDB{seed: seedLanding()})

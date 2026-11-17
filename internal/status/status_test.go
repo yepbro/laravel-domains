@@ -2,9 +2,11 @@
 // spec §4.5) on a fake pool (db.DB) and an XLEN client — without the DB
 // and Redis. Both the exact SQL text of the selections (the contract, the
 // reanalyze_test.go style) and the live semantics of the fake are
-// checked: the domains aggregate by check_state with deleted excluded
-// from pending, the LEFT JOIN of zones without domains, the sort by name;
-// the throughput window and the division-by-zero protection in
+// checked: the zone summary from the ready zones.domains_* counters
+// (T-178: the transition deltas + the monitor reconciliation feed them,
+// the base set is status <> deleted — no pass over domains and no JOIN:
+// a zone without domains stays with its counter values), the sort by
+// name; the throughput window and the division-by-zero protection in
 // ComputeRates (a short window, a zero rate, an empty circle, the minimum
 // ETA); the interval format. The output (table/JSON) and the routing are
 // the CLI tests (cmd/crawlerctl/status_test.go); the behavior against
@@ -149,8 +151,10 @@ type statusGlitch struct {
 }
 
 // statusPool — a db.DB without a DB: the live semantics of zoneStatsSQL
-// (a GROUP BY of zones, pending without deleted, queued/done without a
-// status filter, LEFT JOIN — a zone without domains stays, ORDER BY
+// (the zones reference table with its ready domains_total/pending/
+// queued/checked counters — T-178: the transition deltas + the monitor
+// reconciliation keep them, the base set is status <> deleted, no pass
+// over domains; a zone without domains stays with its counters, ORDER BY
 // name), throughputSQL (ready values) and the dashboard sections
 // (§5.5–5.7): the status distribution, the Laravel counters/window by
 // the fake clock, the sorting of the recent finds and ingest files.

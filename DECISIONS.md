@@ -1344,3 +1344,56 @@ RACE_PKGS).
 aggregate_test.go; internal/rules/{truncate.go,evidence.go,limits.go} +
 {match,engine}_test.go; docs/analyzer.md; tasks/TZ-fsm.md (§4 принципы,
 §6 реестр).
+
+### D-046 — T-302: domain-shared фиксы стадии 16 — мёртвое присваивание score, комментарии status_test под счётчики T-178, хвостовые альтернативные точки IDN режутся после UTS-46, класс render-ошибки в SubRecord/JSON
+Дата: 2026-11-17.
+Проблема: четыре находки стадии 16-domain-shared bulk-ревью.
+(1) 16#P2-1: мёртвое повторное `sr.Score = eval.Score` внутри
+`if eval.IsLaravel(...)` (checker.go) — значение уже установлено до
+условия и не меняется между присваиваниями. (2) 16#P2-2: комментарии
+status_test.go (шапка файла + докстринг statusPool) описывали удалённый
+живой aggregate-запрос («domains aggregate by check_state … LEFT JOIN
+of zones») вместо текущего zoneStatsSQL по готовым счётчикам
+zones.domains_* (T-178). (3) 16#P3-3: завершающие альтернативные
+разделители точки (U+FF0E/U+3002/U+FF61) отсекались только до UTS-46 —
+после маппинга в ASCII-точку последняя метка пустая, синтаксически
+корректное имя («пример.com。») отвергалось как invalid. (4) 16#P3-4:
+не-Browser ошибки рендера в checker.Run проглатывались полностью —
+Rendered=false без Warn и без признака: ложный «Laravel не найден» без
+диагностики.
+Решение: (1) мёртвая строка удалена; BDD невозможен по определению
+(мёртвый оператор не меняет поведения — красного состояния не
+существует), поведение пинится существующим web E2E (`"score":0.723`)
+и правилами EvaluateCtx. (2) комментарии переписаны под текущую
+семантику: зоны-справочник с готовыми счётчиками, дельты +
+реконсиляция T-178, база status <> deleted, без прохода по domains.
+(3) в normalizeASCII ПОСЛЕ idna.Lookup.ToASCII добавлен
+`strings.TrimRight(ascii, ".")` + повторная проверка пустоты; имя из
+одних точек («。。。», «．») теперь ErrEmpty (как ASCII «...» в cleanup;
+раньше — ErrInvalid «empty label») — консистентность kind'ов важна:
+kind пишется в rejected-лог как причина. Порядок проверок: обрезка
+после существующей `if ascii == ""` (xn--/BOM остаются ErrInvalid).
+Корпус: пример.com。, пример．рф。, example.com．, example.com｡, рф。
+(NormalizeZone), 。。。/．→ErrEmpty (красные до фикса — проверено
+stash-прогоном). (4) политика вынесена в renderSPA + seam-интерфейс
+spaRenderer (*render.Manager ему удовлетворяет): Warn для ВСЕХ классов
+(браузерный — прежнее сообщение + атрибут class, остальные — новое
+сообщение), класс ошибки маркером в SubRecord.RenderErr ("task"/
+"context"/"browser"; "" — рендер успешен или не выполнялся, включая
+записи после renderDown — у них своей ошибки нет), renderDown
+по-прежнему только ClassBrowser (решение T-220 P2-3 сохранено).
+Юнит-тест TestRenderSPA (таблица классов + Warn + down + повтор после
+task-ошибки). web: опциональное поле ответа `render_err,omitempty`
+(контракт только расширяется), тест TestCheckDomainRenderErrField
+(декод + ровно одно вхождение ключа на две записи). CLI crawlerctl
+check показывает «raw HTML (render error <class>)». Красный тест для
+#4 — на уровне компиляции (новое поле/seam), для idn — на уровне
+ассертов (см. выше). fsnotify overflow (16#P3-5) — вне задачи, идея
+T-310.
+Проверки: COMPOSE_PROJECT_NAME=crawler make test — зелёный; make lint
+— 0 issues (checker/status/idn/web не в RACE_PKGS).
+Ссылки: T-302; bulk-ревью 16#P2-1/P2-2/P3-3/P3-4
+(tmp/review/stage-report.md); internal/checker/{checker.go,
+render_test.go}; internal/status/status_test.go; internal/idn/{idn.go,
+corpus_test.go}; internal/web/{api.go,api_test.go};
+cmd/crawlerctl/check.go; docs/services.md.
