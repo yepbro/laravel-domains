@@ -1,7 +1,7 @@
 # Moli: the candidate render engine — the full history
 
 Settled 2026-11-16, updated 2026-11-18 (T-331, the upstream confirmation;
-T-332 in progress). The short version:
+T-332, the quality-gap decomposition). The short version:
 **Moli is our second candidate render engine (stage 35). Functionally it
 reached full CDP parity with Chromium in v1.1.25 — the release that
 finally carried all the interception fixes we waited for — but the same
@@ -19,10 +19,11 @@ predates the memory regression; detection 2.38% — both divergences are
 the baseline's own channel losses, in moli's favor). Meanwhile our side
 is fully compensated: page-killer URLs are routed around the engine
 (T-285) and the worker survives engine restarts (T-283).**
-The follow-up: **T-332** — fresh paired runs (chromium → moli
-back-to-back, one channel window) with a per-domain divergence table —
-decides whether the quality gap is engine-attributable before any pin
-raise; the #3047 fix confirmation is posted upstream.
+The follow-up ran as **T-332** (2026-11-18): fresh paired runs
+(chromium → moli back-to-back, one channel window) with the per-domain
+divergence table — the gap is decomposed (see "Current state and
+retrigger" item 2 and the T-332 artifact); the pin decision stands at
+v1.1.21. The #3047 fix confirmation is posted upstream.
 
 ## Why Moli at all
 
@@ -176,6 +177,7 @@ pin reverted to v1.1.21; the artifacts `var/fixtures-l2/moli-v1.1.26-*`.
 | main `f857b6651` ("1.1.24") | slice 6/6; smoke: not ready (quality) | ①#2704 ②#2696 ④#2729+#2883 |
 | **v1.1.25** | **slice 6/6 — full functional parity; smoke: NOT READY (the hh.ru memory burst)** | ①④ in a release; **the regression**: quadratic Inspector mutation buffering (#3047/#3060) |
 | v1.1.26 | slice 6/6; canary hh.ru GREEN (3/3, peak 177.7 MiB); smoke: **NOT READY (quality, not memory)** — memory 312 MiB PASSED, 0 crashes, T-283 battle check clean; success 87/100 vs 92, detection 2.38% (both divergences favor moli — the baseline's own channel losses) | #3060 in a release: **the #3047 memory burst is fixed**; the tarpit/ERR_FAILED quality gap persists |
+| v1.1.26 (T-332, fresh pair) | 85/100 vs fresh chromium 89/100; the gap decomposed per-domain (D-071): the ERR_FAILED quartet is channel-side, the engine core = the cloudflare.com **hang** + the ovh/heroku/sport-express slowness (39–44 s), moli wins forge (12.7 s vs ~21 s) | the quality residue is now a named reproducible domain set — the upstream follow-up material |
 
 ## Our side: tasks and compensations
 
@@ -241,19 +243,24 @@ pin reverted to v1.1.21; the artifacts `var/fixtures-l2/moli-v1.1.26-*`.
    the local cache (a retest is a two-line flip).
 2. The v1.1.26 retest (T-331, 2026-11-18) closed the memory question —
    see the table row above and [`../operations.md`](../operations.md),
-   2026-11-18. The remaining (and only) blocker is the §5.1 quality
-   gap: tarpit finalizations 9 vs the baseline's 4 and 4×
-   `net::ERR_FAILED` (the class persists since the 13.11 run, before
-   the memory regression). The 06.11 baseline's own channel losses
-   produced both detection divergences (laravel-com,
-   forge-laravel-com — moli rendered and detected them, the baseline
-   did not) and 3 of the 8 success-gap domains in the opposite
-   direction — hence the follow-up **T-332** (2026-11-18, in
-   progress): fresh PAIRED runs, chromium first then moli
-   back-to-back in one channel window, plus the per-domain
-   divergence table (every error/detection row: chromium vs moli +
-   the cause hypothesis; the old runs as the reproducibility
-   control). The pin decision is deferred to its outcome.
+   2026-11-18. The remaining (and only) blocker was the §5.1 quality
+   gap — **decomposed per-domain by T-332** (2026-11-18, the fresh
+   paired runs; the full divergence table + the 25 s/60 s driver repros
+   — `var/fixtures-l2/moli-v1.1.26-divergence-analysis.md`, D-071):
+   the ERR_FAILED quartet is **channel-side** (3 dead resolutions + 1
+   HTTP/2-broken origin — both engines fail them, moli just collapses
+   the errors into `ERR_FAILED`); the baseline itself drifts (fresh
+   chromium 89/100 vs the 06.11 92 — the old 2.38% detection headline
+   was the old base's own losses); the engine-attributable core is a
+   named reproducible set: the **cloudflare.com hang** (>60 s on moli
+   vs 15–17 s on chromium — the upstream-report candidate) + the
+   slowness class ovh/heroku/sport-express (39–44 s, would pass at
+   timeout 45 s) ± borderline netlify/rust-lang, partially offset by
+   forge.laravel.com where moli wins (12.7 s vs chromium's ~21 s with
+   no headroom). The pin stays v1.1.21 (success 85<89, pace 0.13<0.14
+   marginal, detection 1.22%>1% on the fresh pair); the upstream
+   follow-up drafts (the hang + the ERR_FAILED mapping) live in the
+   T-332 artifact, not posted.
 3. The canary protocol stands (D-026): every moli retest starts with
    hh.ru through the repro driver; with T-283 in place the engine may
    be killed mid-drain on purpose (note: an explicit `docker kill` is

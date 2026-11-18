@@ -1440,3 +1440,59 @@ why, and how to roll it back. Normal CD deploys are not recorded here
   cache (a retest is a two-line flip). Artifacts:
   `var/fixtures-l2/moli-v1.1.26-*` (canary/slice/import/drain/rss/
   events/worker/snapshot/report/status), DECISIONS D-069.
+
+### 2026-11-18 — T-332: парные свежие прогоны chromium→moli v1.1.26 — причины гэпа качества разложены по доменам (канал/база/движок)
+
+- Метод: обе стороны новые, подряд, одно окно канала (01:27–02:20 PST,
+  internet-режим unbound, VPN-сплит-туннель хоста; канал-проба:
+  laravel.com 5.8 s — медленнее прецедента 15.11 ~3 s, но одинаков для
+  обеих сторон). Run A — chromium (import --force --publish smoke →
+  дрен → снапшот), Run B — moli v1.1.26 сразу после (флип .env на
+  пару b57b1b7a…93bb5 — полный SHA восстановлен из history образа,
+  /json/version: Moli-Version 1.1.26, WebKit @c8061786; спекмен
+  moli + restart_every_pages 50; рестарт воркера между прогонами).
+  rules_version идентичен во всех четырёх прогонах (-214990931);
+  engine_skip_patterns пуст; без убийств движка. Прогонам предшествовал
+  stop bench-не-сервисов (scheduler/monitor/ingest/dns-worker/
+  http-worker/web/dashboard) — изоляция бенча; восстановлены после.
+- Run A (chromium-baseline-fresh): **89/100** (tarpit 7, dns 3, HTTP2
+  1), дрен 24м04с, RSS 919.5 MiB, темп 0.14 rows/s. Сам базовый
+  дрейфнул к 06.11 (92→89): 4 новых tarpit (angular, habr, nginx,
+  python-org), 2 восстановления (github, laravel-com) — заголовок
+  «детекция 2.38%» T-331 мерился против плывущей базы.
+- Run B (moli-v1.1.26-fresh): **85/100** (tarpit 11, ERR_FAILED 4),
+  дрен 25м40с, RSS 333.0 MiB (< ⅓), 0 событий контейнера, темп
+  0.13 rows/s (маргинально хуже). Детекция: 1/82 = 1.22% (grafana-com:
+  оба вердикта False, у moli теряются слабые findings). Laravel-вердикты
+  17 против 18 (+1 = forge, moli отрендерил).
+- Разложение гэпа (полная таблица — артефакт): **ERR_FAILED-четвёрка
+  канальная** — bootcamp/cdn/laravel-forum мертвы в резолве (curl:
+  Could not resolve host; chromium их же называет ERR_NAME_NOT_
+  RESOLVED), gismeteo ломает HTTP/2 на оргине (curl: PROTOCOL_ERROR);
+  moli сворачивает оба класса в ERR_FAILED (~100 мс / ~1 с — репро
+  драйвером) — косметика маппинга, не дефект загрузки. **Ядро
+  движковых потерь** — 60-секундным репро разделено на ханг
+  cloudflare.com (>60 s на moli против 15–17 s на chromium; 2/2+2/2
+  воспроизводим — главный кандидат на апстрим-репорт) и медлительность
+  ovh/heroku/sport-express (LOADED 39–44 s — прошли бы на timeout 45 s)
+  + пограничные netlify/rust-lang. **Выигрыш moli**: forge (12.7 s
+  против ~21 s chromium без запаса — под нагрузкой опрокидывается).
+  Остальное — флейки одного окна (fastly, habr, angular).
+- Итог: пороги §5.1 всё ещё красны (успех 85<89, темп 0.13<0.14,
+  детекция 1.22%>1%) — но остаточное движковое ядро теперь именованный
+  воспроизводимый набор доменов, а не класс-загадка. Пин v1.1.21
+  (D-071). Апстрим-материал (ханг cloudflare.com + маппинг ERR_FAILED)
+  подготовлен в артефакте, не постится.
+- Операционные находки: DEL q:analyze перед каждым прогоном чинит
+  «pace NO DATA» T-331 (трим-шейп q:analyze; теперь 200 записей на
+  прогон); healthcheck unbound в internet-режиме всегда красный —
+  compose не пробрасывает UNBOUND_HEALTH_NAME в контейнер (косметика);
+  сервер-рестарт убивает мониторы-циклы, но не контейнеры — прогон
+  пережил, зазор семплирования RSS ~35 s зафиксирован в журнале.
+- Стенд восстановлен и проверен: chromium-спекмен воркера (байтово
+  идентичен HEAD), .env — пара v1.1.21 + ALLOW_INTERNET=0, unbound
+  testbed (SERVFAIL на example.com), moli остановлен, все сервисы
+  healthy. Артефакты: var/fixtures-l2/{chromium-baseline-fresh-*,
+  moli-v1.1.26-fresh-*, report-chromium-baseline-fresh-vs-0611.txt,
+  report-moli-v1.1.26-fresh.txt, moli-v1.1.26-divergence-analysis.md,
+  t332-*}; DECISIONS D-071.
