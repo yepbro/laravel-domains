@@ -275,6 +275,16 @@ the run's orphaned content is swept out at the same time) + a stream cleanup
 (`DEL q:render q:render-fallback q:analyze q:dead` in the bench's Redis, with the
 workers stopped — otherwise DEL races their XADD/XACK) +
 `--publish` again — the two runs are compared from the same start.
+Two cleanup extensions found by the T-335 hybrid bench (D-074): also DEL the
+stale `render:tarpit:*` keys (a 48 h TTL — without it the next run inherits
+the previous run's tarpit cardinalities and its tarpits exhaust an attempt
+early; symmetric for same-engine pairs, distorting for engine pairs), and
+for an armed-fallback run the dump must carry `rendered: false` on its rows
+(a dump of the ok stratum carries the production `rendered: true`, and the
+`publishFallback` "already rendered" guard then acknowledges the fallback
+candidates with no outcome at all — 20 of 100 tasks vanished in the first
+T-335 run; the production invariant "a q:render task's row is unrendered"
+does not hold for a verbatim-restored dump).
 
 ### The engine comparison report (T-244)
 

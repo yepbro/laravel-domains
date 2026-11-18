@@ -3,7 +3,8 @@
 Settled 2026-11-16, updated 2026-11-18 (T-331, the upstream confirmation;
 T-332, the quality-gap decomposition; T-333, the fresh-window
 reproducibility re-check; T-336, the third window — VPN off, the
-direct RU ISP channel). The short version:
+direct RU ISP channel; T-335, the hybrid moli+fallback topology
+measured — the canary-policy input). The short version:
 **Moli is our second candidate render engine (stage 35). Functionally it
 reached full CDP parity with Chromium in v1.1.25 — the release that
 finally carried all the interception fixes we waited for — but the same
@@ -345,7 +346,33 @@ pin reverted to v1.1.21; the artifacts `var/fixtures-l2/moli-v1.1.26-*`.
     — the upstream slowness-class draft is on **HOLD** (only the
     mapping gap remains postable as a minor item); the pin decision
     is unchanged. The full three-window table: the T-336 section of
-    the divergence-analysis artifact.
+    the divergence-analysis artifact. **T-335** (2026-11-18, later the
+    same day, D-074) measured the TOPOLOGY this doc's item 4 gates:
+    the stage-35 fallback design actually enabled — worker A on moli
+    v1.1.26 at 8 contexts + worker B (chromium, 1 context) reworking
+    the engine-dependent losses — against a fresh pure-chromium
+    control in one VPN-ON window (egress captured: 46.8.113.46). The
+    hybrid is better ONLY on success: 91/100 vs 86 (+3 Laravel
+    verdicts — laravel.com/forge/beyondco rescued via B); the TOTAL
+    memory is 33% WORSE (moli@8 peaks 739.6 MiB ≈ 2.2× the 3-context
+    T-331 specimen — the single-process context scaling eats the
+    light-engine advantage — plus the second chromium stack of B,
+    396.9 MiB; total 1346.6 vs 1009.5), and the drain is 1.8× slower
+    (the serial B tail +19 min). moli@8 ran WITHOUT OOM (72% of the
+    1 GiB memcg; the 6-context step-down unneeded). The fallback flow
+    itself is clean: 18 publications (14 timeouts + 4 ERR_FAILED) →
+    9 reworked + 9 finalized, 0 gate/budget suspends, share 18% <
+    the 30% cap; and B's chromium honestly re-names moli's collapsed
+    ERR_FAILED class (ERR_NAME_NOT_RESOLVED ×3, HTTP2 ×1) — the
+    mapping gap is observability-healed by the fallback path. Also
+    measured: the tarpit budget is per-episode ACROSS engines (B
+    inherits A's render:tarpit cardinality — a twice-tarped-on-moli
+    candidate finalizes on B after ONE chromium timeout). The
+    canary-policy verdict for D-071: the fallback MASKS the moli
+    losses at a memory+wall-time premium — it does not deliver
+    "moli's memory at chromium's quality"; the mask-the-gap vs
+    honest-gate choice stays with the operator. Full table:
+    `var/fixtures-l2/hybrid-analysis.md`.
 3. The canary protocol stands (D-026): every moli retest starts with
    hh.ru through the repro driver; with T-283 in place the engine may
    be killed mid-drain on purpose (note: an explicit `docker kill` is
