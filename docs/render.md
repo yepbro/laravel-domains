@@ -65,6 +65,28 @@ lightpanda), and when bound to 0.0.0.0/127.0.0.1 the advertised address is
 unreachable from outside the container. The worker health-check does not
 change: all three engines support `/json/version`.
 
+#### Production: moli primary with a chromium safety net (T-337)
+
+The switch the stage-35 design reserved for the operator (T-248/T-249 —
+"editing `render.engine`/`remote_url` in the shared config/environment
+when the primary worker is moved to the candidate engine") is realized
+in the native prod as a pure configuration state — the same binaries,
+no code branching ([`deploy.md`](deploy.md) §2.4): worker A reads moli
+from the shared `/etc/crawler/crawler.env`
+(`ws://127.0.0.1:9224` — the `crawler-moli.service` unit, its own user
+and a 1G cgroup), while the second instance `@9109` and the fallback
+worker B stay on the shared chromium (`:9222`), pinned by their
+unit-local env files — the fallback safety net (§4.5 of the render
+engines spec) and a live in-stream comparison share in
+`crawler_render_records_total{engine}`. The operator's explicit
+full-program decision over the red §5.1 bench gates — D-075;
+`engine_skip_patterns` stays empty (the T-335-measured flow: the moli
+tarpits/errors are reworked by B), `engine_wait` (T-283) covers
+`crawler-moli` unit restarts, and the rollback is one environment edit
+plus a restart of A. The dev stack keeps its own shape: chromium
+primary, the `render-engines` profile for the bench windows
+([`dev-environment.md`](dev-environment.md)).
+
 ## Isolated contexts and no state persistence
 
 `Browser.NewSession` — an isolated CDP context

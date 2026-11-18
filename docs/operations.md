@@ -1689,3 +1689,66 @@ why, and how to roll it back. Normal CD deploys are not recorded here
   moli-hybrid-8{,-run1}.snapshot.json,
   hybrid-report-moli-hybrid-8-vs-chromium-control.txt,
   subdomain_results.ndjson.t335-rendered-true-orig}; DECISIONS D-074.
+
+### 2026-11-18 — T-337: the moli PRIMARY rollout prepared in the repo — the operator's full-program decision (D-075): the unit, provision, the @9109 chromium pin, the healthcheck optional units, the runbook
+
+- The decision: the operator chose «проверять по полной программе» —
+  moli as the PRIMARY prod render engine, overriding the conservative
+  §5.1 recommendation (the quality gates red — D-069/D-071/D-074);
+  recorded as D-075. NOT the observation-canary shape the card was
+  drafted with: worker A switches fully via the shared
+  /etc/crawler/crawler.env; the @9110 canary specimen was cancelled
+  before any artifact was written.
+- The repo artifacts (no server actions yet — prod still awaits the
+  stage-35/36 production push; the runbook is the operator's checklist
+  from that push): `deploy/systemd/crawler-moli.service` (CDP
+  127.0.0.1:9224, User crawler-moli, MemoryMax=1G, Restart=on-failure,
+  the chromium-style softened isolation — a JS engine needs executable
+  memory; PartOf=crawler.target); `deploy/provision-moli.sh` (the
+  pinned release asset + sha256 verify, /opt/crawler/moli, the
+  user/group, daemon-reload, enable WITHOUT start, --dry-run
+  rehearsal); `deploy/systemd/render-worker@9109.env.example` (the
+  chromium pin — without it the instance silently follows the shared
+  env to moli and doubles the load on one engine process);
+  `deploy/deploy-healthcheck.sh` — the optional units crawler-moli /
+  @9109 / render-fallback-worker (enabled → must be active, else
+  skipped silently; the auto-rollback gate never fires because of
+  them).
+- The runbook (docs/deploy.md §2.4): the order — the production push →
+  provision-moli (the v1.1.26 pair b57b1b7a…93bb5: the canonical pin
+  v1.1.21 rejects our Fetch.enable pattern set, #2470 — unusable in the
+  primary role) → worker B env + enable/start → the @9109 pin +
+  restart → start crawler-moli → the shared env swap (engine moli,
+  ws://127.0.0.1:9224, contexts 4, restart_every_pages 50,
+  restart_memory_bytes 0, fallback.enabled true; skip patterns stay
+  empty) + restart A. The config checklist adds the T-246 alert probe
+  monitor.render_metrics_url=127.0.0.1:9105 (the prod config predates
+  T-246 — the share-cap breach would stay watch-only). Constraint
+  noted: render.timeout 15s + engine_wait 5m < redis.claim_min_idle
+  10m — do not raise engine_wait without raising the lease first.
+- The risk written into the runbook: prod render.timeout 15s is shorter
+  than the 25s of the dev bench windows → expect a HIGHER
+  tarpit/publication share on moli than the bench's 18%; the guards are
+  the share_percent cap (30%) and the health gate; a sustained
+  `suspended{reason="budget"}` is the rollback criterion (the honest
+  signal of D-071/D-074), not an incident by itself. Rollback —
+  minutes: revert crawler.env to chromium + restart A (B and @9109
+  untouched, crawler-moli may stay up).
+- Docs-only + deploy scripts: no Go changes — make test/lint not
+  required by the task rules; `bash -n` clean on both touched scripts,
+  shellcheck 0.11.0 clean, `systemd-analyze verify` clean on the new
+  unit, provision --dry-run and the error paths exercised. The review
+  chain (deepseek-v4.1-flash, one round): 0×P0, 1×P1, 3×P2, 6×P3 —
+  the substance verified correct (env names, validation binding,
+  EnvironmentFile precedence, unit directives, metric names); fixed in
+  the same commit: the P1 healthcheck auto-rollback trap (an enabled
+  unit in a clean `inactive` — the provision enable-without-start
+  window / a deliberate stop — now skipped; only failed/activating of
+  an enabled unit gates), the `-- --dry-run` ssh invocation, the caps
+  sum (10532M with @9109), provision re-run now try-restarts a running
+  engine, hex-sha validation, dry-run read-only findings, +x mode, the
+  @9109 enable+restart step; P3-4 kept as designed with the rationale
+  documented in the block comment (the exact `= enabled` match is
+  deliberate). The v1.1.26 release identity re-verified online (the
+  tag, the commit c806178, #3060 in the changelog; the asset digest is
+  JS-loaded — the script's sha256sum -c stays the enforcement gate).

@@ -1,0 +1,93 @@
+# Domain Crawler — Moli, the WebKit render engine for the render-worker
+# (CDP on 127.0.0.1:9224; 9222/9223 are the chromium/chromium2 units,
+# docs/deploy.md §2.2). The PRIMARY-engine rollout of stage 35 (T-337,
+# docs/deploy.md §2.4): worker A (crawler-render-worker.service) reads
+# CRAWLER_RENDER_ENGINE=moli + CRAWLER_RENDER_REMOTE_URL=ws://127.0.0.1:9224
+# from the shared /etc/crawler/crawler.env; the second instance
+# crawler-render-worker@9109 and the fallback worker B stay on chromium,
+# pinned by their unit-local env files (render-worker@9109.env,
+# render-fallback-worker.env) — the safety net and the live per-engine
+# comparison share. The operator's full-program decision over the red
+# §5.1 gates — D-075.
+#
+# A separate unit, not a worker process — the engine pattern of
+# crawler-chromium.service: its own user/cgroup with a 1G cap (the
+# stage-35 engine budget, the MEM_MOLI parity of the dev stack; the
+# measured zone at contexts 4 is ≈0.3–0.5 GB — T-331/T-335). An OOM
+# inside the engine is killed by the kernel within this cgroup and the
+# unit restarts it (Restart=on-failure) without touching the workers;
+# the worker waits the restart out within render.engine_wait (T-283: a
+# short restart costs 0 task attempts — the metric
+# crawler_render_browser_restarts_total{engine}).
+#
+# The binary: the pinned release asset (the MOLI_VERSION/MOLI_SHA256
+# pair — the canonical source deploy/docker/.env.example, FR-17),
+# installed by deploy/provision-moli.sh into /opt/crawler/moli/. The
+# invocation repeats the image CMD of deploy/docker/Dockerfile.moli —
+# serve without --layout (the DOM-first crawler needs no geometry) and
+# without --resource/--obey-robots; --block-private-networks is not
+# passed (the SSRF perimeter is held by the worker, T-219/T-230) — only
+# the bind is loopback instead of 0.0.0.0: CDP is not exposed (spec
+# §9). Loopback also makes the webSocketDebuggerUrl advertisement
+# honest; the worker's moli allocator takes the session path from
+# /json/version and the authority from render.remote_url anyway (T-234,
+# docs/render.md "Render engines").
+#
+# Not in the set's enable list (§4.6): enabling and starting are
+# deliberate steps of the rollout order (§2.4 — the safety net comes up
+# FIRST); provision-moli.sh enables the unit without starting it.
+
+[Unit]
+Description=Domain Crawler — Moli render engine (WebKit CDP 127.0.0.1:9224)
+PartOf=crawler.target
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+# A separate user per the "one per service" rule (spec §10.1/§3): the
+# engine renders untrusted pages; created by provision-moli.sh (and the
+# §4.4 list — fresh installs), group crawler like the set.
+User=crawler-moli
+Group=crawler
+SyslogIdentifier=crawler-moli
+ExecStart=/opt/crawler/moli/moli serve --host 127.0.0.1 --port 9224
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15s
+# Spec 3.2 parity — the stage-35 engine budget ≈1 GB (MEM_MOLI of the
+# dev stack). The measured peaks: 3 contexts — 333 MiB (T-331), 8 —
+# 739.6 (T-335; single-process context scaling eats the light-engine
+# win — that is why worker A runs contexts 4, docs/deploy.md §2.4). The
+# cap bounds an engine regression (the hh.ru burst of #3047, v1.1.25 —
+# fixed in v1.1.26): a kill is waited out by render.engine_wait, not
+# propagated to the workers.
+MemoryMax=1G
+LimitNOFILE=65535
+UMask=0007
+# --- Isolation (spec §9/§10.1) ---
+# The set is softer than for the Go services, modeled on
+# crawler-chromium.service: the embedded WebKit needs executable memory
+# for the JIT (MemoryDenyWriteExecute would break JS), and its network
+# stack talks over AF_NETLINK. No ReadWritePaths: without --profile-dir
+# the temporary profile files (IndexedDB/OPFS) go to /tmp — private via
+# PrivateTmp (the same layout as the Dockerfile.moli container); the
+# engine never touches the crawler data directories.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=crawler.target

@@ -43,6 +43,7 @@ its own cgroup, systemd restarts the unit, the other services are unaffected).
 | `unbound.service` + drop-in | **800M** (budget ≈ 0.7 GB + cache growth at ≈47M names: 733.9 MiB at the old 700M cap, §12; +100M taken from MemAvailable 2.6 GiB) | Unbound ≈ 0.7 GB |
 | `crawler-*.service` (9 units) | **2436M total** (a second render-worker@ instance adds its own 256M — §2.2; the fallback worker B adds another +256M, §2.3) | Go services ≈ 1.3 GB (7 pipeline) + web of stage 13 + dashboard of stage 15 |
 | `crawler-chromium.service` | **2048M** | Chromium ≈ 2 GB (the chromium2 second-instance template — another +2048M when enabled, §2.2/T-209) |
+| `crawler-moli.service` | **1G** (the stage-35 engine budget; enabled only in the moli rollout — §2.4; the planned line at contexts 4 is ≈0.4–0.5 GB, the T-331/T-335 measurements) | Moli ≈ 1 GB (the alternative engine of stage 35, a separate line — not the Chromium line) |
 
 Total caps of 8996M with 8192M of RAM — above the physical memory in sum, and that
 is acceptable: a cap is not a reservation, all caps are never touched at the same
@@ -51,7 +52,13 @@ peak — ≈ 6 GiB; the T-160 increase — unbound +100M, dns-worker +128M —
 was taken from the actual MemAvailable headroom of 2.6 GiB of measurement §12;
 PostgreSQL at its 3 GiB cap holds page cache that it yields under pressure;
 per-cgroup OOM isolation — the intro paragraph of this
-section, spec 10.1, — is preserved). The spec line "Go services ≈ 1.3 GB"
+section, spec 10.1, — is preserved). The moli rollout of §2.4 adds two more
+caps — `crawler-moli` 1G + worker B 256M; with the already-running @9109
+instance (its own +256M, §2.2) the sum becomes 8996 + 256 + 1024 + 256 =
+10532M: same reasoning — a cap is not a reservation — and
+the moli line replaces nothing — the chromium budget stays (the @9109 instance
+and worker B keep rendering on it; in the native deploy there is no second
+chromium stack, unlike the T-335 bench). The spec line "Go services ≈ 1.3 GB"
 covered seven pipeline units; the public API service `web` — a product
 extension of stage 13 outside the main spec — adds its own 256M line;
 the operator `dashboard` — an extension of stage 15 (dashboard spec) — 128M. MemoryMax sits above the planned budget line
@@ -452,7 +459,8 @@ is a Chromium rework pass for tasks that failed to render on the main engine
   The second line is not always needed: while the main worker is on chromium,
   the value comes from the shared `crawler.env` anyway; after the main
   worker is switched to the candidate engine (editing `render.engine`/`render.remote_url`
-  in the shared config or `crawler.env`, T-248/T-249) it returns worker B
+  in the shared config or `crawler.env`, T-248/T-249 — realized by the moli
+  rollout, §2.4) it returns worker B
   to the chromium of the main unit (`:9222`; the second Chromium — `:9223`, §2.2).
   Without the pin, worker B would drift to the candidate together with the shared config —
   it would rework the fallback with the same light engine that failed the tasks
@@ -526,6 +534,243 @@ pattern of the `render-fallback` job of the dev config
 metrics" in [`services.md`](services.md)). The `monitor.render_metrics_url` probe
 stays on the main build (9105) — the budget/fallback gate alerts read the
 publishing worker's exposition.
+
+### 2.4. The moli primary engine: the rollout runbook (T-337)
+
+The end state the stage-35 design pointed at (T-248/T-249): **the primary
+render engine of prod is moli** — the operator's explicit decision of
+2026-11-18, «проверять по полной программе», taken over the red §5.1
+quality gates of the bench (D-069/D-071/D-074; recorded as D-075). Not a
+canary share: worker A switches fully, and the safety net is the stage-35
+fallback itself — worker B (chromium, §2.3) reworks the engine-dependent
+losses, while the second instance `crawler-render-worker@9109` is pinned
+to chromium as a live in-stream comparison share and a reserve. The
+engine runs as [`crawler-moli.service`](../deploy/systemd/crawler-moli.service)
+(CDP `127.0.0.1:9224`; its own user `crawler-moli` and a 1G cgroup — the
+budget table above).
+
+**The switch mechanism — one canonical path: the shared
+`/etc/crawler/crawler.env`.** It is the file the per-instance pins hook
+into (the template's `EnvironmentFile` order: `crawler.env` →
+`render-worker@<port>.env`), and the environment beats YAML
+(§4.5, [`configuration.md`](configuration.md)) — so `/etc/crawler/config.yaml`
+keeps its chromium values untouched and remains the rollback default.
+The rollout block (replace the existing `CRAWLER_RENDER_REMOTE_URL` line,
+add the rest; the variable names — the `CRAWLER_RENDER_*` binding of
+internal/config/load.go):
+
+```
+# --- The moli primary engine (T-337, docs/deploy.md §2.4) ---
+CRAWLER_RENDER_ENGINE=moli
+CRAWLER_RENDER_REMOTE_URL=ws://127.0.0.1:9224
+CRAWLER_RENDER_CONTEXTS=4
+CRAWLER_RENDER_RESTART_EVERY_PAGES=50
+CRAWLER_RENDER_RESTART_MEMORY_BYTES=0
+CRAWLER_RENDER_FALLBACK_ENABLED=true
+```
+
+- `engine`/`remote_url` — the switch itself; `:9224` is the crawler-moli
+  unit (`:9222`/`:9223` stay chromium/chromium2). The moli allocator takes
+  the session path from `/json/version` and the authority from
+  `remote_url` (T-234) — the loopback advertisement is enough;
+- `contexts 4` — the prod standard (the Oct 24 measurement: 8 contexts
+  starved the 4 cores — 4 gave the same useful pace at load ≈12.6;
+  `config.example.yaml`) and the moli memory-win zone: 3 contexts peaked
+  at 333 MiB (T-331), 8 — at 739.6 (T-335: single-process context scaling
+  eats the light-engine advantage, D-074) — 4 stays inside ≈⅓ of the
+  chromium budget. The memory is interpolated between those measurements;
+  the PACE at 4 contexts is unmeasured — the first-hour observation point
+  below ("the pace must not degrade") is the measurement;
+- `restart_every_pages 50` — the T-335 specimen value: it bounds the
+  per-context retention floor of the single moli process (a CDP-level
+  context recycle; the engine PROCESS restarts are the unit's
+  `Restart=` job — in remote mode the worker cannot restart a foreign
+  process, §2);
+- `restart_memory_bytes 0` — REQUIRED by the config validation for
+  external engines (the RSS of a foreign process is unavailable,
+  FR-3). The value also lands on the pinned chromium builds (@9109, B)
+  via the shared file — inert there: the threshold at an external
+  chromium never worked and is not forbidden; the cap job belongs to
+  `crawler-chromium.service`'s MemoryMax;
+- `fallback.enabled true` — worker A publishes engine-dependent failures
+  to `q:render-fallback` (the tarpit/task-class candidates of the last
+  delivery); B reworks them on chromium. `engine_skip_patterns` stays
+  EMPTY — the T-335-measured flow (moli tarpits/errors → B rescues); the
+  hh.ru-class page-killers are gone in v1.1.26 (#3047 fixed);
+- `engine_wait` stays at the default `5m` (T-283): a crawler-moli restart
+  (a cgroup kill → `Restart=on-failure`) is waited out per task without
+  burning queue attempts —
+  `crawler_render_browser_restarts_total{engine="moli"}` on `:9105`.
+  **Constraint (the T-283 validation): `render.timeout + engine_wait <
+  redis.claim_min_idle`** — with the prod `timeout 15s` and the default
+  `engine_wait 5m` the sum is 5m15s against the `claim_min_idle` lease of
+  10m. Do NOT raise `engine_wait` blindly during an incident: a delivery
+  held longer than the lease is re-claimed by XAUTOCLAIM and processed
+  twice — raise `redis.claim_min_idle` proportionally first
+  (`CRAWLER_RENDER_ENGINE_WAIT`, `CRAWLER_REDIS_CLAIM_MIN_IDLE`).
+
+The environment map after the rollout: worker A
+(`crawler-render-worker.service`, `:9105`) reads only the shared
+`crawler.env` → moli; `@9109` — the shared file plus the pin
+[`render-worker@9109.env`](../deploy/systemd/render-worker@9109.env.example)
+(`CRAWLER_RENDER_ENGINE=chromium`,
+`CRAWLER_RENDER_REMOTE_URL=ws://127.0.0.1:9222`) → chromium; worker B —
+the shared file plus its §2.3 pin → chromium. All three write the shared
+content store and stay separated in the metrics by the `engine` label.
+
+**The order.** Every step is an operator action on the server (the
+pipeline ships binaries only, §5); the whole sequence is reversible at
+any point — nothing before step 5 changes what worker A renders.
+
+0. **Preconditions.** The stage-35/36 production push is done (`git push
+   origin master:production` — the engine switch, the fallback branch,
+   `engine_wait` are in the binaries; before it this section is
+   impossible). Sync the units the release changed (§5 item 1) — at
+   minimum the NEW `crawler-render-fallback-worker.service`. The memory
+   gate per §12 of [`load-measurements.md`](load-measurements.md): the
+   new planned lines are ≈0.4–0.5 GB (moli at 4 contexts) + the B
+   worker's 256M cap — check `grep MemAvailable /proc/meminfo` against
+   the §12 headroom reference (2.6 GiB at the T-160 measurement; a cap
+   is not a reservation, but the planned lines must fit the headroom).
+   The config checklist for `/etc/crawler/config.yaml` (§5 item 2 —
+   reconcile with the new example): the monitor alert probe
+   `monitor.render_metrics_url: "http://127.0.0.1:9105/metrics"` — the
+   T-246 fallback-share budget alert reads worker A's exposition
+   (`crawler_render_fallback_suspended_total{reason="budget"}`); an
+   empty value (the pre-T-246 default of an old config) leaves the
+   share-cap breach watch-only, not alerted. The prod config predates
+   T-246 — the key is most likely missing there.
+1. **The moli engine** (the unit + the binary + the user; enable WITHOUT
+   start). From a checkout of the deployed commit:
+
+   ```bash
+   ssh larasites 'install -D -m 0644 /dev/stdin /etc/systemd/system/crawler-moli.service' \
+     < deploy/systemd/crawler-moli.service
+   # The version pair for the rollout: the CANONICAL pin v1.1.21 is NOT
+   # runnable in the primary role — it rejects our Fetch.enable pattern
+   # set (upstream #2470, fixed in v1.1.23): every render task would
+   # fail. Pass the tested v1.1.26 pair (T-331/T-332/T-335; the checksum
+   # cross-checked with the release digest, FR-17):
+   ssh larasites 'MOLI_VERSION=v1.1.26 \
+     MOLI_SHA256=b57b1b7aa97548669234908f094a44c93e39d91b4c4246c55720c2eff3f93bb5 \
+     bash -s' -- < deploy/provision-moli.sh
+   # the rehearsal (prints the plan + read-only findings, touches nothing) —
+   # the separator goes INSIDE the remote command (`bash -s -- --dry-run`;
+   # after the host it would reach bash as an invalid option):
+   ssh larasites 'MOLI_VERSION=v1.1.26 \
+     MOLI_SHA256=b57b1b7aa97548669234908f094a44c93e39d91b4c4246c55720c2eff3f93bb5 \
+     bash -s -- --dry-run' -- < deploy/provision-moli.sh
+   # after provisioning — the unit syntax check on the server (the binary
+   # is in place, so ExecStart verifies too):
+   ssh larasites 'systemd-analyze verify /etc/systemd/system/crawler-moli.service'
+   ```
+
+2. **Worker B — the safety net first** (§2.3; the chromium pin file is
+   required from the start — the shared environment flips to moli in
+   step 5):
+
+   ```bash
+   useradd -r -g crawler -d /var/lib/crawler -s /usr/sbin/nologin crawler-render-fallback-worker
+   printf '%s\n' 'CRAWLER_RENDER_ENGINE=chromium' \
+     'CRAWLER_RENDER_REMOTE_URL=ws://127.0.0.1:9222' \
+     > /etc/crawler/render-fallback-worker.env
+   chown root:crawler /etc/crawler/render-fallback-worker.env
+   chmod 0640 /etc/crawler/render-fallback-worker.env
+   systemctl enable --now crawler-render-fallback-worker.service
+   curl -fsS 127.0.0.1:9120/livez
+   ```
+
+   On the shared chromium the engine guard holds the queue empty
+   (chromium does not publish to itself) — an empty `q:render-fallback`
+   here is the wiring check of render spec §4.5 item 3.
+3. **The @9109 chromium pin — BEFORE the shared switch** (without it the
+   instance silently follows `crawler.env` to moli and doubles the load
+   on one engine process):
+
+   ```bash
+   ssh larasites 'install -o root -g crawler -m 0640 /dev/stdin /etc/crawler/render-worker@9109.env' \
+     < deploy/systemd/render-worker@9109.env.example
+   # enable is idempotent (the instance may not be enabled on every host,
+   # §2.2); restart applies the pin to a running instance
+   # (`enable --now` alone would NOT restart an active unit):
+   ssh larasites 'systemctl enable crawler-render-worker@9109 && \
+     systemctl restart crawler-render-worker@9109 && \
+     systemctl show crawler-render-worker@9109 -p ActiveState,NRestarts'
+   ```
+
+4. **Start the engine** (it was enabled, not started, by step 1):
+
+   ```bash
+   systemctl start crawler-moli
+   curl -fsS 127.0.0.1:9224/json/version    # the engine liveness probe all engines support
+   systemctl show crawler-moli -p ActiveState,NRestarts,MemoryCurrent
+   ```
+
+5. **The switch (worker A)**: edit `/etc/crawler/crawler.env` — the
+   rollout block above — and restart:
+
+   ```bash
+   systemctl restart crawler-render-worker
+   curl -fsS 127.0.0.1:9105/healthz
+   curl -s 127.0.0.1:9105/metrics | grep '^crawler_render_records_total'
+   # engine="moli" series appear; the chromium share stays on :9109/:9120
+   ```
+
+**Observation points** (the first hours, then the first day):
+
+- the engine shares: `crawler_render_records_total{engine}` on `:9105`
+  (A, moli) vs `:9109` (the pinned chromium share of the same
+  `q:render` consumer group — XREADGROUP splits the deliveries between
+  the consumers) and `:9120` (B); the tarpit attribution per engine —
+  `crawler_render_tarpit_finalized_total{engine}`;
+- the fallback flow: published `crawler_render_fallback_published_total{reason}`
+  and suspended `crawler_render_fallback_suspended_total{reason}` on
+  `:9105` vs consumed `crawler_render_fallback_consumed_total{result}` on
+  `:9120`; the share of publications per 1000-delivery window against the
+  `render.fallback.share_percent` cap (default 30%);
+- memory: `systemctl show crawler-moli -p MemoryCurrent,NRestarts` against
+  the 1G cap, `memory.events` oom=0; the T-283 metric
+  `crawler_render_browser_restarts_total{engine}` — the engine restarts
+  waited out by A;
+- **the risk to watch first**: prod `render.timeout` is **15s** (since
+  Oct 23) — SHORTER than the 25s of the dev bench windows
+  (T-332/T-333/T-335), and moli is slower on the heavy-tail domains:
+  expect a HIGHER tarpit/publication share than the bench's 18%. The
+  guards are the share cap (`share_percent` 30% — a breach suspends the
+  publications, `reason="budget"`, and finalizes the rows with the
+  marker: no losses, but the engine runs alone) and the health gate
+  (`reason="gate"` — a browser-error streak). A sustained budget
+  suspension is the honest signal that the engines' pace/quality
+  mismatch is grinding against the cap (the mask-the-gap vs honest-gate
+  trade-off measured by T-335, D-071/D-074) — that is the rollback
+  criterion, not an incident by itself;
+- the q:render drain: `lag(q:render) + render_pending` between snapshots,
+  never the lag alone (the T-066 equilibrium at `render.queue_high_watermark`:
+  the rework pass replenishes the queue from the debt — the checklist and
+  the formulas — [`operations.md`](operations.md) §4.4): the pace must not
+  degrade against the pre-rollout window.
+
+**Rollback — minutes, no binaries touched**: revert
+`/etc/crawler/crawler.env` to chromium (drop the rollout block; the file
+returns to `CRAWLER_RENDER_REMOTE_URL=ws://127.0.0.1:9222` — config.yaml
+was never edited) and `systemctl restart crawler-render-worker`. Worker B
+and `@9109` are untouched — they stayed chromium through the whole
+rollout; `crawler-moli` may stay up (an idle engine holds only its base
+RSS; `systemctl stop crawler-moli` frees the line — the stopped state is
+deploy-safe: the healthcheck treats a clean `inactive` of an enabled unit
+as out of scope; `disable --now` only when the experiment is abandoned).
+Worker B then reworks what remains in
+`q:render-fallback` until empty (FR-14) — leave it enabled through the
+drain.
+
+The deploy healthcheck treats `crawler-moli`, `crawler-render-worker@9109`
+and `crawler-render-fallback-worker` as OPTIONAL units
+([`deploy-healthcheck.sh`](../deploy/deploy-healthcheck.sh)): enabled →
+a hard check (active + healthz; a crash loop `failed`/`activating` of a
+unit the deploy started is a deploy failure and gates the auto-rollback),
+while not enabled, and the clean `inactive` of an enabled unit (the
+provision step-1→4 window, a deliberate `systemctl stop`), are skipped
+silently — an optional unit never rolls the binaries back.
 
 ## 3. Users: static, one per service
 
@@ -690,7 +935,7 @@ fc-list | grep -q . && echo "fonts ok" || echo "FONTS MISSING"
 
 ```bash
 groupadd -r crawler
-for s in ingest scheduler dns-worker http-worker render-worker render-fallback-worker analyzer monitor web dashboard chromium; do
+for s in ingest scheduler dns-worker http-worker render-worker render-fallback-worker analyzer monitor web dashboard chromium moli; do
     useradd -r -g crawler -d /var/lib/crawler -s /usr/sbin/nologin "crawler-$s"
 done
 install -d -o root -g crawler -m 0755 /var/lib/crawler
@@ -699,6 +944,10 @@ install -d -o root -g crawler -m 2775 /var/lib/crawler/content
 install -d -o crawler-chromium -g crawler -m 0770 /var/lib/crawler/chromium
 install -d -o root -g crawler -m 0750 /etc/crawler
 ```
+
+`crawler-moli` (the render engine of §2.4) is created here on fresh
+installs and by `deploy/provision-moli.sh` on an already deployed host —
+idempotently, whichever runs first.
 
 ### 4.5. Configuration
 
@@ -747,7 +996,10 @@ Required edits to `config.yaml` relative to the example
   /var/lib/crawler/content`, `content.zstd_dictionary:
   /var/lib/crawler/content/dict.zst`, `analyzer.rules_dir: /etc/crawler/rules`;
 - `render.remote_url: "ws://127.0.0.1:9222"` — an external browser unit
-  (empty in the example = the worker's own process, that is the docker-runtime mode);
+  (empty in the example = the worker's own process, that is the docker-runtime mode).
+  The moli rollout (§2.4) later moves the engine selection into `crawler.env`
+  (env beats YAML): this YAML value stays the chromium default the rollback
+  returns to;
 - `monitor.listen` — the example already has `127.0.0.1:9100`: metrics are not
   exposed on a production-facing interface (spec §9); the monitor unit additionally
   pins loopback with the `CRAWLER_MONITOR_LISTEN` variable (the environment wins over

@@ -2,6 +2,8 @@
 # Post-deploy check of the production set (T-135): all units active, healthz
 # green on all metric ports (9100…9108), crawlerctl responding.
 # Run by CI (.github/workflows/deploy.yml) over SSH; exit 0 — everything green.
+# The OPTIONAL units of the moli rollout (crawler-moli, render-worker@9109,
+# render-fallback-worker — T-337) join the check only when enabled.
 #
 # Retries instead of a single probe (deploy incidents of 23.10, morning and
 # evening: both runs rolled back on "healthz 9104 FAIL" with the worker alive —
@@ -43,6 +45,51 @@ for spec in crawler-chromium:- crawler-monitor:9100 crawler-ingest:9101 \
         echo "unit $u: $enabled — excluded from the check (disabled by the operator)"
         continue
     fi
+    checked+=("$u")
+    if [ "$p" != - ]; then
+        ports+=("$p")
+    fi
+done
+
+# OPTIONAL units (T-337, docs/deploy.md §2.4): enabled — checked hard
+# (must be active and healthz-green), anything else — skipped SILENTLY
+# (unlike the mandatory set above, where a deliberate disable is
+# announced): these are deliberate operator steps outside the base
+# enable list (§4.6), and a not-yet-installed unit file (is-enabled →
+# not-found) must not fail a deploy either. The healthcheck gates the
+# AUTO-ROLLBACK — an optional unit must never be the reason binaries
+# roll back, so TWO states are out of scope: not enabled, and the clean
+# `inactive` of an enabled unit — provision-moli.sh deliberately enables
+# crawler-moli WITHOUT starting it (the runbook's step 1 → step 4
+# window), and `systemctl stop` of a working unit leaves it exactly
+# there; a hard check on it would false-rollback an unrelated deploy.
+# The genuinely broken states of an enabled unit — `failed`, or a crash
+# loop of the new binaries (`activating`/`auto-restart`) — stay IN
+# scope: the deploy's `systemctl start crawler.target` starts every
+# enabled unit, so after a deploy anything but active/inactive is a
+# regression. crawler-moli — the moli engine (no metric port: unit
+# activity only, like chromium); crawler-render-worker@9109 — the second
+# render-worker instance, chromium-pinned by the T-337 rollout (its
+# metrics port 9109); crawler-render-fallback-worker — worker B (:9120,
+# §2.3). The exact `= enabled` match (not "anything but disabled") is
+# deliberate: the canonical instructions (provision-moli.sh, §2.2/§2.3)
+# never create runtime/linked enables, and those transient states stay
+# out of a gate that can roll back a release. The MANDATORY list above
+# stays in sync with deploy-install.sh/deploy-rollback.sh as before;
+# the optional set is healthcheck-only (the install/rollback unit checks
+# cover the base set, and an enabled optional unit rides a
+# `systemctl restart crawler.target` via PartOf/WantedBy anyway).
+for spec in crawler-moli:- crawler-render-worker@9109:9109 \
+            crawler-render-fallback-worker:9120; do
+    u=${spec%%:*}
+    p=${spec#*:}
+    # Not enabled (disabled/masked/not-found/…): out of scope — an
+    # optional unit is not a deploy failure.
+    [ "$(systemctl is-enabled "$u" 2>/dev/null || true)" = enabled ] || continue
+    # The clean deliberate stop of an enabled unit: out of scope for the
+    # same reason (see the block comment) — only a regression of a unit
+    # the deploy just started (failed/activating) must gate the release.
+    [ "$(systemctl is-active "$u" 2>/dev/null || true)" = inactive ] && continue
     checked+=("$u")
     if [ "$p" != - ]; then
         ports+=("$p")

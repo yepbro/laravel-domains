@@ -17,6 +17,13 @@ deliberately overloads the CPU with renders; docs/load-measurements.md).
   chromium}` (render-fallback-worker — worker B, appears after the stage
   35/36 deploy; before the deploy there is no unit — normal), plus
   `redis-server`, `postgresql@16-main`, `unbound`, `nginx`, `fail2ban`.
+- After the T-337 rollout (docs/deploy.md §2.4) the set also includes
+  `crawler-moli` (the moli engine, CDP 127.0.0.1:9224, MemoryMax=1G) and
+  the engine map becomes: **A = moli** (the shared crawler.env switch),
+  **@9109 = chromium, pinned** by `/etc/crawler/render-worker@9109.env`,
+  **B = chromium** (its §2.3 pin). CDP ports: 9222 chromium,
+  9223 chromium2 (not enabled), 9224 moli. The engine shares and the
+  rollback — the "Render metrics dictionary" block below.
 
 ### The crawler.env pitfall
 
@@ -103,9 +110,12 @@ all — the engine guard
 |---|---|
 | 9100 | monitor (aggregates + alerts: frozen queues, redis, PG slow, OOM) |
 | 9104 | http-worker (retention, compaction, HTTP stage) |
-| 9105 / 9109 | render-worker (main + the second instance @9109) |
+| 9105 / 9109 | render-worker: **9105 — A, on moli after the T-337 rollout**; 9109 — the @9109 instance, chromium-pinned by the T-337 rollout |
 | 9106 | analyzer |
 | 9120 | render-fallback-worker, worker B — after the stage 35/36 deploy (the port is fixed: 9109+ is the render-worker@ instance range; 9110 in old notes is outdated, the S-P2-3 fix) |
+
+CDP (not metrics, loopback): 9222 chromium, 9223 chromium2, 9224 moli
+(`curl -s 127.0.0.1:9224/json/version` — the engine liveness after T-337).
 
 ```bash
 curl -s 127.0.0.1:9104/metrics | grep -E '^crawler_queue_depth|^crawler_content_'
@@ -141,6 +151,20 @@ curl -s 127.0.0.1:9100/metrics | grep -E '^crawler_(queue|unit|redis)'
   worker, the material for the engine shares. Tarpit finalizations are
   attributed to the engine —
   `crawler_render_tarpit_finalized_total{engine}`.
+
+The engine shares after the T-337 rollout (A=moli :9105, @9109=chromium
+pinned, B=chromium :9120 — the shares of q:render deliveries between A
+and @9109 are the XREADGROUP split of the shared consumer group):
+
+```bash
+for p in 9105 9109 9120; do
+  echo "== :$p"; curl -s 127.0.0.1:$p/metrics \
+    | grep -E '^crawler_render_(records|tarpit_finalized)_total'
+done
+# the engine unit: memory against the 1G cap, restarts waited out by A
+systemctl show crawler-moli -p MemoryCurrent,NRestarts,MemoryMax
+curl -s 127.0.0.1:9105/metrics | grep browser_restarts_total
+```
 
 ## PostgreSQL (sudo -u postgres psql -d crawler)
 
