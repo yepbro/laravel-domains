@@ -314,6 +314,82 @@ existing and future partitions at once and carries over between servers.
 | `autovacuum_analyze_scale_factor` | `0.01` | The `check_state` distribution keeps drifting (pending→queued→done); the planner's plan for the partial index depends on it (§5.3); ANALYZE is cheap (a sample of ~30 thousand rows) |
 | `autovacuum_vacuum_cost_limit` | `2000` | The default 200 credits (the limit is divided among the workers, a 2 ms tick) throttle vacuum on thousands of partitions — it cannot keep up with the update pace and bloat accumulates. 2000 ≈ 125 thousand pages/s per worker — NVMe digests it |
 
+### Partition health checks: `pg_stat` counters can lie — verify before acting (T-318, D-068)
+
+The 17.11.2026 bloat snapshot read `pg_stat_user_tables` and saw
+`domains_z1`/`domains_z2` — the `com`/`ru` zone partitions, the two
+largest zone partitions (only `domains_default` holds more rows, spread
+across many small zones) — as "0 live rows, ~12.9k/11.2k dead (100%),
+`last_autovacuum` never, 3.8 GB + 1.6 GB total": seemingly empty
+partitions holding ~5.5 GB of dead space, a candidate for
+VACUUM/pg_repack/DROP. The ground truth was the opposite (verified
+read-only on 18.11): `SELECT count(*)` returned **17,867,858 and
+6,354,214 live rows** — exactly `zones.domains_total` of `com`/`ru`
+(id 1/2, both active; `domains_total` counts `status <> deleted` while
+`count(*)` counts every row — the exact match also says no deleted rows
+sat in those zones at that moment). The heap is ~110 B per live row —
+the row norm for `domains` at fillfactor 85 — and the seven child
+indexes are proportional to the row count: there is no gigabyte of
+dead space behind the live data. No operation was performed: there is
+nothing to reclaim, DROP would delete the data of the two largest
+zones, and `pg_repack` is not present on the server (neither in
+`pg_available_extensions` nor as an OS package; `pgstattuple` 1.5 is
+available, not installed).
+
+Why the counters lied: the cumulative statistics of PostgreSQL 15+ are
+written to disk only at a clean shutdown — a start after a crash resets
+the counters (PG16: "all statistics counters are reset" after an
+unclean shutdown) — and with thousands of partition tables the shared
+stats area can also drop individual entries. Production has both risk
+factors live: an external power-cycle of the VM on 11.11 (a hard cut,
+[operations.md](operations.md) §5) and repeated OOM kills of the PG
+unit (the 08–09.11/10–11.11 memory-pressure nights; the unit's restart
+counter reached 18 by 18.11). Which event zeroed which table is not
+reconstructable from NULL timestamps — `pg_stat_database.stats_reset`
+stays NULL, so nothing looks suspicious, and partly-preserved counters
+(a table with a fresh `last_autovacuum` next to ones showing zero)
+only deepen the ambiguity. The operational lesson: `n_live_tup`,
+`n_dead_tup` and the `last_*` columns of a partition are an observation
+to verify, not a fact — a bloat estimate built on `n_live_tup` alone
+reads "empty and 100% dead" precisely in the state where the counters
+were lost and no VACUUM/ANALYZE has run since to reseed them.
+
+Verifying a partition-bloat alarm (read-only, **before** deciding on
+VACUUM/pg_repack/DROP):
+
+1. `SELECT count(*) FROM <partition>` — the live truth (a seq scan of
+   a 2 GB leaf is seconds on NVMe; the cost is one pass, unlike an
+   action taken on false data);
+2. cross-check `zones.domains_total` — the monitor recomputes it from
+   live counts (T-178); remember it counts `status <> deleted` while
+   `count(*)` counts every row ([schema.md](schema.md)) — a divergence
+   of deleted rows is not counter drift;
+3. bytes per live row: `pg_relation_size(oid) / <the count of step 1>`
+   ≈ 100–130 B for `domains` leaves (small rows, fillfactor 85); a
+   size consistent with the live row count means live data — a size
+   many times the norm is the actual bloat signal (do not divide by
+   `reltuples`: it is -1 for a table never analyzed, exactly the
+   lost-stats case);
+4. for a precise dead-tuple ratio — `pgstattuple_approx` (the
+   extension is available on the server; installing it is a write
+   decision for the operator).
+
+The optional statistics-only follow-up (an operator action, not done
+by the task): `VACUUM (ANALYZE) domains_z1, domains_z2;` refreshes
+`n_live_tup`/`reltuples`/`last_vacuum`, so size-based snapshots stop
+misfiring. Note it sets `last_vacuum`, not `last_autovacuum` (only
+autovacuum writes that): an alarm keyed on `last_autovacuum IS NULL`
+keeps firing until autovacuum itself visits the table — check
+`last_vacuum` instead. The lock is `ShareUpdateExclusive` (the
+pipeline does not stop; the mechanics — [runbooks.md](runbooks.md)
+§5.4, whose candidate filter reads `n_dead_tup` and is itself subject
+to this caveat), the command returns no meaningful disk space, and it
+fixes observability, not the data. The routing fact for the "empty
+partition for the future" question: a leaf `FOR VALUES IN
+(<zone_id>)` receives every insert of that zone while the zone exists
+— `domains_z1`/`domains_z2` cannot become unreachable short of
+deleting the `com`/`ru` zones themselves.
+
 ### Monitoring (spec §5.9)
 
 `shared_preload_libraries = 'pg_stat_statements'` (queries for the monitor
