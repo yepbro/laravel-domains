@@ -2225,3 +2225,100 @@ XREADGROUP» (комментарий трека и docs/services.md); P3-5 — D
 Ссылки: T-313; D-029 (bulk-ревью); internal/monitor/streamgroups.go,
 alertstate.go, alerts.go; docs/services.md, docs/operations.md,
 docs/configuration.md; config.example.yaml.
+
+### D-065 — T-323: предупреждение (не запрет) при dns.fallback.escalate_qps > 1% dns.max_qps — метод validateWarnings + slog.Warn в build
+
+Дата: 2026-11-17.
+
+Проблема (идея P3 ревью T-300): диапазон escalate_qps валиден (0 или
+(0..100000]), но бюджет эскалации — лимитер, ОТДЕЛЬНЫЙ от max_qps: проход
+резервов едет на одном трафик-токене цикла «локальный → резервы»
+(LimitResolver над FallbackResolver, internal/dnsclient/fallback.go),
+т.е. нагрузка SERVFAIL-шторма на публичные резолверы ограничена только
+escalate_qps и ложится СВЕРХ запланированной скорости. Значение выше ~1%
+max_qps незаметно для владельца съедает заметную долю DNS-бюджета;
+хочется предупреждение при валидации конфига, не запрет (большая доля —
+легитимный осознанный выбор, например малый dev max_qps).
+
+Решения:
+
+(а) Механизм предупреждения. Валидация (Config.Validate) возвращает
+только error и чиста — механизма warn в пакете нет; прецедент проекта —
+Warn логгера на потребителе (cmd/scheduler о весах зон). Принято: чистый
+метод (c *Config) validateWarnings() []string рядом с Validate (тот же
+стиль сообщений «поле: что не так», вычисление без побочных эффектов —
+тестируется напрямую), а вывод — slog.Warn в build (load.go), после
+успешной Validate: дефолтный логгер пишет в stderr — та же поверхность,
+куда до инициализации сервисного логгера идут фатальные ошибки конфига
+(log.Fatalf в cmd/*). Сигнатура Load/Validate не меняется (20+ callers),
+конфиг остаётся валидным, предупреждение видно в каждом сервисе и
+crawlerctl при загрузке.
+
+(б) Порог — ровно 1%, строгое >. Обоснование: документированная пара
+дефолтов «100 ≈ 1% от 10000» (комментарии config.go и
+dnsclient.DefaultEscalateQPS) — порог делает заявленный интент
+проверяемым: дефолты (и любая пара ровно 1%, напр. 20/2000) молчат,
+выше — Warn. Форма вычисления limit = max_qps × escalateQPSWarnPercent
+(/100, одна корректно-округлённая операция): граница точна и для целых,
+и для «однодесятичных» пар (100 из 10000, 0.03 из 3 — покрыто тестом);
+формы 0.01×max_qps чураемся из-за drift на не-round значениях.
+
+(в) Эффективные значения: escalate_qps = 0 → дефолт 100 (как
+NewFallbackResolver заменяет его в рантайме — «guard cannot be disabled
+by a zero»; константа defaultEscalateQPS = 100 в config — зеркало
+dnsclient.DefaultEscalateQPS, прямой импорт невозможен: цикл
+config→dnsclient→config; пара закреплена пин-тестом
+TestDefaultEscalateQPSSyncedWithConfig в dnsclient (там импорт config
+возможен) и литералом 100 в TestDefault пакета config). max_qps всегда
+> 0 у валидного конфига; guard maxQPS > 0 защищает прямые вызовы метода
+с невалидным конфигом (NaN также молчит — его раньше отклоняет
+Validate). Предупреждение считается независимо от escalate_rcodes
+(стиль monitor.alerts: потолок осмыслен до включения), но при
+выключенной эскалации сообщение несёт хвост «escalate_rcodes is off —
+the budget is idle until it is enabled»: бюджет в рантайме создаётся
+только с включённой эскалацией (NewFallbackResolver), сообщение не
+должно утверждать нагрузку, которой ещё нет (находка ревью P3).
+
+Тесты: TestValidateWarningsEscalateQPSBudget — таблица (дефолты 100/10000
+молчат; ровно 1% явно, 20/2000 и 0.03/3 — молчат; 100.5/10000, 25.5/2000
+и 100.5 с включённой эскалацией — ровно одно предупреждение, называющее
+оба поля, с корректным idle-хвостом, конфиг остаётся валидным; 0/5000 —
+эффективный дефолт 100 предупреждает; max_qps = 0 и NaN — метод молчит,
+это территория Validate);
+TestLoadWarnsEscalateQPSBudget — подмена slog-дефолта на буфер: loadFrom
+с 25.5/2000 грузится без ошибки и пишет WARN; дефолты грузятся молча;
+TestDefaultEscalateQPSSyncedWithConfig (dnsclient) — пин пары
+config-дефолт ↔ dnsclient.DefaultEscalateQPS.
+
+Ревью-раунд (deepseek-v4.1-flash, первое звено цепочки; отчёт
+tmp/review/43-t323.md): VERDICT FINDINGS, 0×P0/P1, 1×P2, 3×P3; ядро
+подтверждено (порог и арифметика границы без drift, эффективные
+значения, «не ошибка», отсутствие шума в тестах, суть бюджета по
+проводке LimitResolver(FallbackResolver(…)), доки и D-065). Приняты
+все четыре: P2-1 — комментарий обещал «пара закреплена тестами обоих
+пакетов», но сторона dnsclient сравнивалась с символом
+DefaultEscalateQPS, а не литералом (смена 100→200 прошла бы все тесты,
+предупреждение стало бы тихо неверным) — добавлен пин-тест
+TestDefaultEscalateQPSSyncedWithConfig в dnsclient; P3-2 — сообщение
+безусловно говорило о нагрузке на резервы при выключенной эскалации
+(бюджет тогда не создаётся) — добавлен дифференциальный хвост «off —
+the budget is idle», условие не тронуто; P3-3 — «ceiling of
+RCODE-escalated exchanges» противоречил механике (токен на каждый
+запрос к резерву, обход N резервов = N токенов) — переформулировано в
+«reserve QUERIES» в комментарии поля и config.example.yaml; P3-4 —
+«1%» и «10000» захардкожены в тексте при наличии констант — процент
+интерполируется из escalateQPSWarnPercent, арифметическое пояснение
+про 10000 убрано из сообщения.
+
+Затронутое: internal/config/config.go (константы defaultEscalateQPS,
+escalateQPSWarnPercent; Default(); сообщение Validate от константы;
+комментарий поля; validateWarnings), internal/config/load.go (slog.Warn
+в build), internal/config/config_test.go,
+internal/dnsclient/fallback_test.go (пин-тест пары), config.example.yaml,
+docs/configuration.md (таблица env, подраздел dns.fallback, список
+валидации).
+
+Ссылки: T-323; источник — ревью T-300 (P3-идея,
+tmp/review/hy4bulk/task-review-t300.md основного дерева);
+internal/config/config.go, load.go; internal/dnsclient/fallback.go
+(контекст); docs/configuration.md; config.example.yaml.

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/netip"
 	"os"
 	"strconv"
@@ -74,6 +75,13 @@ func build(cfg *Config, getenv func(string) string, src string) (*Config, error)
 	cfg.normalize()
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("config: %s: %w", src, err)
+	}
+	// The advisories of a valid configuration (T-323): a Warn, not a
+	// rejection. The default logger speaks here — the service logger
+	// does not exist yet, exactly the stderr surface the fatal
+	// configuration errors above use.
+	for _, w := range cfg.validateWarnings() {
+		slog.Warn("config: " + src + ": " + w)
 	}
 	return cfg, nil
 }

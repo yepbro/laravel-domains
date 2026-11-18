@@ -412,7 +412,7 @@ separated by commas: `CRAWLER_SCHEDULER_ZONE_WEIGHTS="com=5, xn--p1ai=2"`.
 | `retry_delay` | `CRAWLER_DNS_RETRY_DELAY` | duration | `200ms` |
 | `udp_pool_size` | `CRAWLER_DNS_UDP_POOL_SIZE` | integer | `2000` |
 | `fallback.escalate_rcodes` | `CRAWLER_DNS_FALLBACK_ESCALATE_RCODES` | boolean | `false` (T-300) |
-| `fallback.escalate_qps` | `CRAWLER_DNS_FALLBACK_ESCALATE_QPS` | number | `100` (T-300; `0` — the default) |
+| `fallback.escalate_qps` | `CRAWLER_DNS_FALLBACK_ESCALATE_QPS` | number | `100` (T-300; `0` — the default; above 1% of `max_qps` — a load warning, T-323) |
 | `fallback.fast_switch` | `CRAWLER_DNS_FALLBACK_FAST_SWITCH` | boolean | `false` (T-300) |
 
 `timeout`/`tcp_timeout`/`retries`/`retry_delay`/`udp_pool_size` —
@@ -499,7 +499,15 @@ keep the previous behavior byte for byte:
   queries, N tokens; without a token the walk stops and the primary's
   answer stays the result — no waiting, the exchange holds the limiter
   slot), so a SERVFAIL storm cannot unload the whole `max_qps` onto the
-  public DNS; `0` means the default 100 ≈ 1% of the planned rate. An
+  public DNS; `0` means the default 100 ≈ 1% of the planned rate. The
+  budget is a limiter separate from `max_qps` — an escalation walks the
+  reserves on top of the planned rate (one traffic token covers the
+  whole "local → backups" cycle), so a value above 1% of `max_qps`
+  (strictly; the defaults sit exactly on the boundary and are silent)
+  is warned about at config load time — a Warn in the service log, the
+  configuration stays valid (T-323, the T-300 review P3); with
+  `escalate_rcodes` off the warning notes that the budget is idle
+  until the escalation is enabled. An
   abandoned escalation (no reserve gave a useful answer) returns the
   primary's own answer — its SERVFAIL → `temp_error` stays the
   consumer's decision. NXDOMAIN/NOERROR of the primary are never
@@ -1878,7 +1886,8 @@ Everything is checked at once; the error lists problems of the form
   `dns.retries` 1..10 (spec 5.4: retries are mandatory);
   `dns.udp_pool_size`
   1..100000; `dns.fallback.escalate_qps` 0 (the default) or (0..100000]
-  (NaN is rejected, T-300); `dns.fallback.escalate_rcodes`/`fast_switch`
+  (NaN is rejected, T-300) — above 1% of `dns.max_qps` a load-time
+  warning (the config stays valid, T-323); `dns.fallback.escalate_rcodes`/`fast_switch`
   require a non-empty `dns.fallback_resolvers`;
 - `http.user_agent` non-empty, up to 512 bytes, no line breaks or
   control characters;

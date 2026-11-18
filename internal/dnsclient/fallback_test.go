@@ -497,6 +497,19 @@ func TestFallbackEscalateDefaultBudget(t *testing.T) {
 	}
 }
 
+// TestDefaultEscalateQPSSyncedWithConfig — the config mirror
+// defaultEscalateQPS (internal/config, the T-323 warning threshold and the
+// default of the field) cannot import this package (the cycle
+// config → dnsclient → config): the pin of the pair lives here. A change
+// of DefaultEscalateQPS without the config side would silently shift the
+// effective budget the warning computes with.
+func TestDefaultEscalateQPSSyncedWithConfig(t *testing.T) {
+	if got := config.Default().DNS.Fallback.EscalateQPS; got != DefaultEscalateQPS {
+		t.Fatalf("config.Default().DNS.Fallback.EscalateQPS = %v, want DefaultEscalateQPS = %v (the mirror pair, T-323)",
+			got, DefaultEscalateQPS)
+	}
+}
+
 // TestFallbackEscalateWithoutReservesForcedOff — escalation with an empty
 // reserve list is forced off in the constructor (T-300 review P3-2): the
 // walk of an empty chain would burn budget tokens and grow Escalated

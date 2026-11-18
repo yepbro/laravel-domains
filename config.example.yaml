@@ -104,7 +104,7 @@ dns:
   # extreme — hence opt-in with a budget, not a flip of the default.
   fallback:
     escalate_rcodes: false           # true — a SERVFAIL/REFUSED ANSWER of the primary is re-asked along the reserves (the manual-check policy); without a budget a SERVFAIL storm would unload the whole max_qps onto the public DNS
-    escalate_qps: 100                # the escalation budget, exchanges/s (0 — this default): above it the primary's answer stays the result; ≈1% of max_qps
+    escalate_qps: 100                # the escalation budget, reserve queries/s — a walk of N reserves is N tokens (0 — this default): above it the primary's answer stays the result; ≈1% of max_qps — above 1% the load warns (the config stays valid, T-323)
     fast_switch: false               # true — the first transport error moves the question to the next resolver (one attempt each, the chain order is the retry budget); requires fallback_resolvers
   concurrency: 2000                  # the cap on concurrent exchanges (the T-035 limiter)
   max_qps: 10000                     # the average rate; bursts up to concurrency in a row

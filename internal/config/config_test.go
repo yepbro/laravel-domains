@@ -1,7 +1,9 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
+	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
@@ -1544,6 +1546,117 @@ func TestValidate(t *testing.T) {
 	c.Render.QueueHighWatermark = 0 // 0 — the shared scheduler.queue_high_watermark, the fallback (T-174)
 	if err := c.Validate(); err != nil {
 		t.Errorf("threshold 0 (shared) must be valid: %v", err)
+	}
+}
+
+// TestValidateWarningsEscalateQPSBudget — the advisory of the escalation
+// budget share (T-323): above 1% of dns.max_qps validateWarnings fires, at
+// exactly 1% — not (the defaults' pair 100 of 10000 sits on the boundary,
+// strict >); the effective value of a zero escalate_qps is the default;
+// with escalate_rcodes off the warning carries the idle tail (the budget
+// exists only with the escalation on); the advisory never turns into a
+// validation error.
+func TestValidateWarningsEscalateQPSBudget(t *testing.T) {
+	tests := []struct {
+		name     string
+		mutate   func(*Config)
+		wantWarn bool
+	}{
+		{"the defaults: 100 of 10000 — exactly 1%", func(c *Config) {}, false},
+		{"explicitly at 1%", func(c *Config) { c.DNS.Fallback.EscalateQPS = 100 }, false},
+		{"at 1% of a smaller max_qps", func(c *Config) {
+			c.DNS.MaxQPS = 2000
+			c.DNS.Fallback.EscalateQPS = 20
+		}, false},
+		{"a non-round boundary: exactly 1% of max_qps 3", func(c *Config) {
+			c.DNS.MaxQPS = 3
+			c.DNS.Fallback.EscalateQPS = 0.03
+		}, false},
+		{"just above 1%", func(c *Config) { c.DNS.Fallback.EscalateQPS = 100.5 }, true},
+		{"above 1% with the escalation on — no idle tail", func(c *Config) {
+			c.DNS.Fallback.EscalateQPS = 100.5
+			c.DNS.Fallback.EscalateRCodes = true
+		}, true},
+		{"above 1% of a smaller max_qps", func(c *Config) {
+			c.DNS.MaxQPS = 2000
+			c.DNS.Fallback.EscalateQPS = 25.5
+		}, true},
+		{"a zero budget — the effective default, still 1%", func(c *Config) {
+			c.DNS.Fallback.EscalateQPS = 0
+		}, false},
+		{"a zero budget above 1% of a smaller max_qps", func(c *Config) {
+			c.DNS.MaxQPS = 5000
+		}, true},
+		{"an invalid max_qps — no advisory (Validate owns it)", func(c *Config) { c.DNS.MaxQPS = 0 }, false},
+		{"NaN — no advisory (Validate rejects it)", func(c *Config) { c.DNS.Fallback.EscalateQPS = math.NaN() }, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := Default()
+			c.Postgres.DSN = "postgres://u:p@127.0.0.1:5432/crawler"
+			tt.mutate(c)
+			warnings := c.validateWarnings()
+			if tt.wantWarn && len(warnings) != 1 {
+				t.Fatalf("want exactly 1 warning, got %v", warnings)
+			}
+			if !tt.wantWarn && len(warnings) != 0 {
+				t.Fatalf("want no warnings, got %v", warnings)
+			}
+			if !tt.wantWarn {
+				return
+			}
+			w := warnings[0]
+			if !strings.Contains(w, "dns.fallback.escalate_qps") || !strings.Contains(w, "dns.max_qps") {
+				t.Errorf("the warning %q must name both fields", w)
+			}
+			// The escalation state is part of the message (the T-323
+			// review P3): with escalate_rcodes off the budget is idle —
+			// the warning must say so, not claim a load that is not
+			// there yet.
+			if idle := strings.Contains(w, "escalate_rcodes is off"); idle != !c.DNS.Fallback.EscalateRCodes {
+				t.Errorf("the warning %q: the idle tail must be present iff escalate_rcodes is off", w)
+			}
+			// The advisory is not an error: the warned config stays valid.
+			if err := c.Validate(); err != nil {
+				t.Errorf("the warned configuration must stay valid: %v", err)
+			}
+		})
+	}
+}
+
+// TestLoadWarnsEscalateQPSBudget — the advisory is emitted at load time
+// (T-323): build warns via the default logger — the same stderr surface
+// the fatal configuration errors use before the service logger exists;
+// the defaults load silently.
+func TestLoadWarnsEscalateQPSBudget(t *testing.T) {
+	prev := slog.Default()
+	defer slog.SetDefault(prev)
+	var buf bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+
+	cfg, err := loadFrom(t, `
+dns:
+  max_qps: 2000
+  fallback:
+    escalate_qps: 25.5
+`, validDSN())
+	if err != nil {
+		t.Fatalf("the warned configuration must load: %v", err)
+	}
+	if got := len(cfg.validateWarnings()); got != 1 {
+		t.Errorf("want 1 advisory for the loaded config, got %d", got)
+	}
+	log := buf.String()
+	if !strings.Contains(log, "WARN") || !strings.Contains(log, "dns.fallback.escalate_qps") {
+		t.Errorf("want a WARN of the escalation budget in the load log, got %q", log)
+	}
+
+	buf.Reset()
+	if _, err := loadFrom(t, "", validDSN()); err != nil {
+		t.Fatalf("the defaults must load: %v", err)
+	}
+	if log := buf.String(); strings.Contains(log, "WARN") {
+		t.Errorf("the defaults must load without warnings, got %q", log)
 	}
 }
 

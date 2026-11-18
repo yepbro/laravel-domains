@@ -49,6 +49,20 @@ const (
 	maxSchedulerBatchSize = 10000
 )
 
+// The escalation budget advisory (T-323). defaultEscalateQPS mirrors
+// dnsclient.DefaultEscalateQPS — the runtime value a zero
+// dns.fallback.escalate_qps turns into (internal/dnsclient cannot be
+// imported here: it imports config); the pair is pinned by the tests of
+// both packages and the docs. escalateQPSWarnPercent is the advisory
+// share of the budget in the planned dns.max_qps (T-300: the default
+// 100 ≈ 1% of the default 10000) — above it the escalation traffic
+// stops being noise on top of the crawl rate; the defaults sit exactly
+// on it and do not warn (the comparison is strict).
+const (
+	defaultEscalateQPS     = 100
+	escalateQPSWarnPercent = 1
+)
+
 // DefaultUserAgent — the honest default User-Agent of the HTTP stage
 // (spec 5.5, §9). The contacts are placeholders on a reserved domain and
 // address (RFC 2606, the .example zone): they cannot represent the real
@@ -283,14 +297,19 @@ type DNSFallback struct {
 	// do not change. false (the default) — an RCODE answer is the final
 	// result, as before.
 	EscalateRCodes bool `yaml:"escalate_rcodes"`
-	// EscalateQPS — the ceiling of RCODE-escalated exchanges per second
-	// (the avalanche guard): a token bucket, non-blocking — an exchange
-	// without a token is NOT escalated (the primary's answer is returned).
-	// The value is validated regardless of EscalateRCodes (the
+	// EscalateQPS — the ceiling of reserve QUERIES per second during RCODE
+	// escalations (the avalanche guard; one token per request to a
+	// fallback resolver — a walk of N reserves is N tokens): a token
+	// bucket, non-blocking — a query without a token is NOT made (the
+	// primary's answer is returned). The value is validated regardless of
+	// EscalateRCodes (the
 	// monitor.alerts style: the ceiling is meaningful before the enabling).
 	// The default 100 ≈ 1% of the planned dns.max_qps: the reserve drains
 	// the backlog slowly but surely, without knocking on the public DNS
-	// with the whole crawl. 0 — the default.
+	// with the whole crawl. Above 1% of dns.max_qps the load warns —
+	// validateWarnings (T-323): the budget is a limiter separate from
+	// max_qps, its traffic adds on top of the planned rate. 0 — the
+	// default.
 	EscalateQPS float64 `yaml:"escalate_qps"`
 	// FastSwitch — the first transport error of a resolver moves the
 	// question to the next one in the chain instead of the internal retry
@@ -1092,7 +1111,7 @@ func Default() *Config {
 			// switches off (valid regardless of the enabling).
 			Fallback: DNSFallback{
 				EscalateRCodes: false,
-				EscalateQPS:    100,
+				EscalateQPS:    defaultEscalateQPS,
 				FastSwitch:     false,
 			},
 		},
@@ -1814,7 +1833,7 @@ func (c *Config) Validate() error {
 	// avalanche guard (the T-298 lesson, render.fallback.share_percent).
 	if v := c.DNS.Fallback.EscalateQPS; v != 0 && !(v > 0 && v <= 100000) {
 		problems = append(problems, fmt.Sprintf(
-			"dns.fallback.escalate_qps: expected 0 (the default 100) or (0..100000], got %v", v))
+			"dns.fallback.escalate_qps: expected 0 (the default %v) or (0..100000], got %v", defaultEscalateQPS, v))
 	}
 	if c.DNS.Fallback.EscalateRCodes && len(c.DNS.FallbackResolvers) == 0 {
 		problems = append(problems,
@@ -2448,6 +2467,51 @@ func (c *Config) Validate() error {
 		return nil
 	}
 	return fmt.Errorf("invalid values (%d): %s", len(problems), strings.Join(problems, "; "))
+}
+
+// validateWarnings returns the advisories of a valid configuration —
+// suspicious but working combinations the owner should see at load time
+// (T-323). Unlike Validate, these never reject the config: build logs
+// them with a Warn after a successful Validate, and only then hands the
+// configuration to the caller.
+func (c *Config) validateWarnings() []string {
+	var warnings []string
+	// dns.fallback.escalate_qps vs dns.max_qps (T-323, the T-300 review
+	// P3): the escalation budget is a limiter SEPARATE from max_qps — a
+	// walk of the reserves rides the one traffic token of the whole
+	// "local → backups" cycle (LimitResolver), so the public-resolver
+	// load of a SERVFAIL storm is bounded by escalate_qps alone, on top
+	// of the planned rate. Above ~1% of max_qps that stops being noise
+	// in the DNS budget — warn, do not forbid: a large share is a
+	// legitimate deliberate choice (e.g. a small dev max_qps). The
+	// effective value: 0 is the default, exactly as
+	// dnsclient.NewFallbackResolver replaces it at runtime (the guard
+	// cannot be disabled by a zero). The threshold is computed as
+	// max_qps × escalateQPSWarnPercent / 100 — one correctly rounded
+	// division; the defaults' pair (100 of 10000) lands exactly on the
+	// boundary and does not warn (strict >). max_qps > 0 is a validity
+	// precondition (Validate owns the rejected configs); NaN fails the
+	// comparison silently — Validate rejects it first.
+	if maxQPS := c.DNS.MaxQPS; maxQPS > 0 {
+		qps := c.DNS.Fallback.EscalateQPS
+		if qps <= 0 {
+			qps = defaultEscalateQPS
+		}
+		if limit := float64(maxQPS) * escalateQPSWarnPercent / 100; qps > limit {
+			w := fmt.Sprintf(
+				"dns.fallback.escalate_qps: %v is above %d%% of dns.max_qps (%d) — the escalation budget is a limiter separate from max_qps and adds reserve load on top of the planned rate (the default %d); the configuration is valid, check the intent",
+				qps, escalateQPSWarnPercent, maxQPS, defaultEscalateQPS)
+			// The budget exists only with the escalation on (the
+			// NewFallbackResolver build); the ceiling is still checked
+			// before the enabling (the monitor.alerts style) — but the
+			// message must not claim a load that is not there yet.
+			if !c.DNS.Fallback.EscalateRCodes {
+				w += "; dns.fallback.escalate_rcodes is off — the budget is idle until it is enabled"
+			}
+			warnings = append(warnings, w)
+		}
+	}
+	return warnings
 }
 
 // checkHostPort checks the host:port shape (the resolver addresses, redis,
