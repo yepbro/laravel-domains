@@ -1,6 +1,7 @@
 # Moli: the candidate render engine — the full history
 
-Settled 2026-11-16, updated 2026-11-18 (T-331). The short version:
+Settled 2026-11-16, updated 2026-11-18 (T-331, the upstream confirmation;
+T-332 in progress). The short version:
 **Moli is our second candidate render engine (stage 35). Functionally it
 reached full CDP parity with Chromium in v1.1.25 — the release that
 finally carried all the interception fixes we waited for — but the same
@@ -18,6 +19,10 @@ predates the memory regression; detection 2.38% — both divergences are
 the baseline's own channel losses, in moli's favor). Meanwhile our side
 is fully compensated: page-killer URLs are routed around the engine
 (T-285) and the worker survives engine restarts (T-283).**
+The follow-up: **T-332** — fresh paired runs (chromium → moli
+back-to-back, one channel window) with a per-domain divergence table —
+decides whether the quality gap is engine-attributable before any pin
+raise; the #3047 fix confirmation is posted upstream.
 
 ## Why Moli at all
 
@@ -220,9 +225,13 @@ pin reverted to v1.1.21; the artifacts `var/fixtures-l2/moli-v1.1.26-*`.
   regression window `f857b6651..v1.1.25`); confirmed by the maintainer.
 - [#3060](https://github.com/lexmount/moli/pull/3060) — the fix: bounded
   Inspector parser text mutation buffering (Closes #3047); **shipped in
-  v1.1.26 and verified fixed by the T-331 retest** — the follow-up
-  material (the confirmation + the remaining quality observations) is
-  in the T-331 report, not posted upstream yet.
+  v1.1.26 and verified fixed by the T-331 retest**. Our confirming
+  comment (the canary + smoke memory numbers) is posted:
+  [#3047 (comment)](https://github.com/lexmount/moli/issues/3047#issuecomment-6974108962).
+  The remaining quality observations (ERR_FAILED/tarpits) are
+  deliberately NOT upstream yet — first our own T-332 divergence
+  analysis (the operator's decision); a separate issue with per-URL
+  repros follows only if the engine side confirms.
 
 ## Current state and retrigger
 
@@ -235,12 +244,16 @@ pin reverted to v1.1.21; the artifacts `var/fixtures-l2/moli-v1.1.26-*`.
    2026-11-18. The remaining (and only) blocker is the §5.1 quality
    gap: tarpit finalizations 9 vs the baseline's 4 and 4×
    `net::ERR_FAILED` (the class persists since the 13.11 run, before
-   the memory regression). The next retest should run with a **fresh
-   same-day chromium baseline** (or in a channel-stable window): the
-   06.11 baseline's own channel losses produced both detection
-   divergences (laravel-com, forge-laravel-com — moli rendered and
-   detected them, the baseline did not) and 3 of the 8 success-gap
-   domains in the opposite direction.
+   the memory regression). The 06.11 baseline's own channel losses
+   produced both detection divergences (laravel-com,
+   forge-laravel-com — moli rendered and detected them, the baseline
+   did not) and 3 of the 8 success-gap domains in the opposite
+   direction — hence the follow-up **T-332** (2026-11-18, in
+   progress): fresh PAIRED runs, chromium first then moli
+   back-to-back in one channel window, plus the per-domain
+   divergence table (every error/detection row: chromium vs moli +
+   the cause hypothesis; the old runs as the reproducibility
+   control). The pin decision is deferred to its outcome.
 3. The canary protocol stands (D-026): every moli retest starts with
    hh.ru through the repro driver; with T-283 in place the engine may
    be killed mid-drain on purpose (note: an explicit `docker kill` is
