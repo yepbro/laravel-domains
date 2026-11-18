@@ -135,6 +135,13 @@ func (rt *Runtime) Run(ctx context.Context, _ *config.Config, pool Pool, domain 
 		if st, ok := apex.Status.DomainStatus(); ok {
 			res.Terminal = st.String()
 		}
+		// Stop is a terminal outcome of the DNS stage, not a
+		// cancellation (a ctx cancellation is an error return above):
+		// the phase ran up to the apex classification — possibly
+		// through the whole escalateResolver chain on SERVFAIL — so
+		// DNSMS records the elapsed time like in the branches below,
+		// not zero (T-324).
+		res.DNSMS = time.Since(dnsStart).Milliseconds()
 		res.TotalMS = time.Since(start).Milliseconds()
 		return res, nil
 	}

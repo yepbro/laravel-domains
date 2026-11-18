@@ -39,6 +39,13 @@ type chainSpy struct {
 	closes    atomic.Int32
 	poolSizes []int
 	exchanges atomic.Int32
+	// delay/rcode vary the fake answer for the DNSMS test (T-324);
+	// zero values keep the original behavior (an instant NXDOMAIN).
+	// rcode = 0 is the sentinel of that default, not RCodeNOERROR
+	// (which is 0 too): an NOERROR answer needs records — extend the
+	// spy differently, this field cannot express it.
+	delay time.Duration
+	rcode dnsclient.RCode
 }
 
 func (s *chainSpy) install(t *testing.T) {
@@ -54,8 +61,16 @@ func (s *chainSpy) install(t *testing.T) {
 
 // Exchange — "no such domain": the apex is NXDOMAIN right away (the
 // terminal branch of the pipeline, no HTTP stage); every call is counted.
-func (s *chainSpy) Exchange(context.Context, dnsclient.Question) (*dnsclient.Result, error) {
+// A nonzero rcode/delay (T-324) changes the answer and stretches the DNS
+// phase over a measurable time.
+func (s *chainSpy) Exchange(ctx context.Context, q dnsclient.Question) (*dnsclient.Result, error) {
 	s.exchanges.Add(1)
+	if s.delay > 0 {
+		time.Sleep(s.delay)
+	}
+	if s.rcode != 0 {
+		return &dnsclient.Result{RCode: s.rcode}, nil
+	}
 	return &dnsclient.Result{RCode: dnsclient.RCodeNXDOMAIN}, nil
 }
 
@@ -260,6 +275,44 @@ func TestRunOneShotBuildsAndCloses(t *testing.T) {
 	}
 	if got := spy.closes.Load(); got != 1 {
 		t.Fatalf("the chain was closed %d times, want 1 (defer Close)", got)
+	}
+}
+
+// TestRunApexStopSetsDNSMS — the terminal apex branch (Stop: NXDOMAIN →
+// not_delegated, SERVFAIL → temp_error) records the DNS phase duration
+// too (T-324): before, only Terminal/TotalMS were set there, and the
+// manual check printed DNS 0 ms for a domain whose DNS stage actually
+// ran (a SERVFAIL walk over the escalateResolver chain may take seconds).
+// The semantics is that of the neighboring branches: DNSMS is the wall
+// time of the DNS phase as far as it ran — up to and including the apex
+// classification; TotalMS ≥ DNSMS.
+func TestRunApexStopSetsDNSMS(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		rcode    dnsclient.RCode
+		terminal string
+	}{
+		{"nxdomain_not_delegated", dnsclient.RCodeNXDOMAIN, "not_delegated"},
+		{"servfail_temp_error", dnsclient.RCodeSERVFAIL, "temp_error"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spy := &chainSpy{delay: 15 * time.Millisecond, rcode: tc.rcode}
+			spy.install(t)
+
+			res, err := Run(context.Background(), testCfg(t), poolFake{}, "example.com", nil)
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if res.Terminal != tc.terminal {
+				t.Fatalf("Terminal = %q, want %q (the apex Stop branch)", res.Terminal, tc.terminal)
+			}
+			if res.DNSMS < 15 {
+				t.Fatalf("DNSMS = %d, want >= 15 ms (the DNS phase ran through the fake resolver delay)", res.DNSMS)
+			}
+			if res.TotalMS < res.DNSMS {
+				t.Fatalf("TotalMS = %d < DNSMS = %d: the whole check cannot be shorter than its DNS phase", res.TotalMS, res.DNSMS)
+			}
+		})
 	}
 }
 
