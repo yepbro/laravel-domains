@@ -2,7 +2,8 @@
 
 Settled 2026-11-16, updated 2026-11-18 (T-331, the upstream confirmation;
 T-332, the quality-gap decomposition; T-333, the fresh-window
-reproducibility re-check). The short version:
+reproducibility re-check; T-336, the third window — VPN off, the
+direct RU ISP channel). The short version:
 **Moli is our second candidate render engine (stage 35). Functionally it
 reached full CDP parity with Chromium in v1.1.25 — the release that
 finally carried all the interception fixes we waited for — but the same
@@ -31,7 +32,21 @@ post: the core HOLDS with amendments (heroku/netlify/fastly solid,
 cloudflare reframed from a ">60 s hang" to the 2–3× page-time
 regression class + a new ~30 s internal `net::ERR_TIMED_OUT` timer;
 ovh demoted as channel-fragile, rust-lang resolved as a flake) —
-item 2 below.
+item 2 below. **T-336** (2026-11-18, the same protocol on the
+DIRECT channel — the operator disabled the VPN before the window;
+egress 80.64.171.168 AS34757 RU, re-verified from the host and the
+engine net) overturned part of that: the direct channel is bimodal
+(3–10× faster where it works — the VPN exit was adding seconds of
+TLS to every .com; docker/python/nginx recovered) and masks nothing
+about the engine — but a new IP-blocked set (cloudflare/fastly/
+laravel-edge/django — SYN drops, proven IP-level) is dead for BOTH
+engines, heroku/netlify/nginx FLIPPED in moli's favor, and the
+~30 s timer proved engine-family-wide (chromium aborts SYN-dropped
+connects at 30.2–30.3 s too). The engine-specific residue after
+three windows: sport-express (4–5×, all three windows), ovh (~2×,
+two of three), the ERR_FAILED mapping gap. The upstream
+slowness-class draft is on HOLD — item 2 and the T-336 section of
+the divergence-analysis artifact.
 
 ## Why Moli at all
 
@@ -187,6 +202,7 @@ pin reverted to v1.1.21; the artifacts `var/fixtures-l2/moli-v1.1.26-*`.
 | v1.1.26 | slice 6/6; canary hh.ru GREEN (3/3, peak 177.7 MiB); smoke: **NOT READY (quality, not memory)** — memory 312 MiB PASSED, 0 crashes, T-283 battle check clean; success 87/100 vs 92, detection 2.38% (both divergences favor moli — the baseline's own channel losses) | #3060 in a release: **the #3047 memory burst is fixed**; the tarpit/ERR_FAILED quality gap persists |
 | v1.1.26 (T-332, fresh pair) | 85/100 vs fresh chromium 89/100; the gap decomposed per-domain (D-071): the ERR_FAILED quartet is channel-side, the engine core = the cloudflare.com **hang** + the ovh/heroku/sport-express slowness (39–44 s), moli wins forge (12.7 s vs ~21 s) | the quality residue is now a named reproducible domain set — the upstream follow-up material |
 | v1.1.26 (T-333, fresh-window re-check) | the engine core re-confirmed in a day window with amendments (D-072): heroku 0/2 @60 s vs chromium 26–28 s (the cleanest exhibit), netlify 35–60 s, fastly upgraded, sport-express ratio-only; cloudflare reframed: 55.95 s LOADED + ERR_TIMED_OUT @39 s — a 2–3× page-time regression, NOT a deterministic >60 s hang; NEW: moli's ~30 s internal net timer (7 attempts aborted before the budget); ovh demoted (both engines fail that window), rust-lang resolved (identical times); moli's forge win holds in direction | the upstream draft: needs changes (reframe to the slowness class + the 30 s timer, drop ovh/rust-lang), then ready — still not posted |
+| v1.1.26 (T-336, third window, VPN off/direct) | the direct channel overturned the T-333 core (D-073): heroku FLIPPED to a moli win (37 s LOADED vs chromium 0/2 @60 s), netlify sign-flipped (21–22 vs 33 s), nginx flipped (44–49 s LOADED vs chromium 60×2); docker/python recovered (3–15 s — the T-332/333 tarpit controls were VPN-exit losses, not page weight); a NEW IP-blocked set (cloudflare/fastly/laravel-edge/django — SYN drops at the true IPs, DoH clean) is dead for both engines — no comparison possible; the ~30 s abort proved engine-family-wide (chromium 30.2–30.3 s on SYN-dropped connects; the engine-specific part is only django's moli-30 s / chromium-60 s shape, twice reproduced); the surviving engine residue: sport-express 4–5× (all three windows), ovh ~2× (two of three), the ERR_FAILED mapping gap (forge TLS-eof → `ERR_FAILED` @15.7 s); memory clean as always (208 vs 533 MiB, ~2.6:1, 0 events) | the upstream slowness-class draft: **HOLD — do not post on this evidence** (the 2–3× class does not survive the direct channel; only the ERR_FAILED mapping gap is postable as a minor item); the pin decision unchanged |
 
 ## Our side: tasks and compensations
 
@@ -254,6 +270,20 @@ pin reverted to v1.1.21; the artifacts `var/fixtures-l2/moli-v1.1.26-*`.
    before posting - the slowness class + the 30 s timer as the
    headline, heroku as the lead exhibit, ovh/rust-lang dropped -
    see the T-333 section of the T-332 artifact.
+   **T-336 overtook that reframe** (2026-11-18, the third window,
+   VPN off — the direct RU ISP channel, D-073): heroku and netlify
+   FLIPPED in moli's favor on the direct channel (37 s LOADED vs
+   chromium 0/2 @60 s; 21–22 vs 33 s), nginx flipped too, and the
+   ~30 s abort proved engine-family-wide (chromium aborts
+   SYN-dropped connects at 30.2–30.3 s as well; engine-specific is
+   only django's moli-30 s / chromium-60 s shape). The slowness
+   class shrinks to sport-express (4–5×, all three windows) and
+   ovh (~2×, two of three) — too thin for the issue as drafted:
+   **the slowness-class draft is on HOLD**; the ERR_FAILED mapping
+   gap (channel-level failures collapsed into a generic error)
+   remains postable as a standalone minor item — the operator's
+   call, nothing posted. The full three-window table: the T-336
+   section of the divergence-analysis artifact.
 
 ## Current state and retrigger
 
@@ -295,7 +325,27 @@ pin reverted to v1.1.21; the artifacts `var/fixtures-l2/moli-v1.1.26-*`.
     The upstream draft: reframe (the slowness class + the 30 s
     timer, heroku as the lead exhibit, ovh/rust-lang dropped), then
     ready - the full T-333 table is in the divergence-analysis
-    artifact. The pin decision is unchanged.
+    artifact. The pin decision is unchanged. **T-336** (2026-11-18,
+    the third window — VPN off, the direct RU ISP channel; the same
+    driver/protocol, D-073) overturned that readiness: the direct
+    channel is bimodal — 3–10× FASTER than the VPN where it works
+    (ovh HEAD 0.93 s vs 9.3 s; docker/python recovered to 3–15 s:
+    the T-332/333 both-engine tarpit controls were VPN-exit losses,
+    not page weight) and a NEW IP-blocked set the VPN had been
+    masking (cloudflare.com/fastly.com/laravel-edge/django.com —
+    SYN drops at the true IPs, DoH clean; dead for both engines —
+    no comparison possible there). heroku FLIPPED to a moli win
+    (37 s LOADED vs chromium 0/2 @60 s), netlify sign-flipped
+    (21–22 vs 33 s), nginx flipped (44–49 s vs 60×2); the ~30 s
+    abort proved engine-FAMILY-wide (chromium aborts SYN-dropped
+    connects at 30.2–30.3 s; engine-specific is only django's
+    moli-30/chromium-60 shape, twice reproduced). The engine
+    residue after three windows: **sport-express 4–5× (all three
+    windows), ovh ~2× (two of three), the ERR_FAILED mapping gap**
+    — the upstream slowness-class draft is on **HOLD** (only the
+    mapping gap remains postable as a minor item); the pin decision
+    is unchanged. The full three-window table: the T-336 section of
+    the divergence-analysis artifact.
 3. The canary protocol stands (D-026): every moli retest starts with
    hh.ru through the repro driver; with T-283 in place the engine may
    be killed mid-drain on purpose (note: an explicit `docker kill` is
