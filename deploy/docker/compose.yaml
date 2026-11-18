@@ -197,6 +197,12 @@ services:
       # client (dns.fallback_resolvers, see docs/docker.md, the "Unbound"
       # section).
       UNBOUND_MODE: ${UNBOUND_MODE:-testbed}
+      # The healthcheck probe name (below): the $$-escape there makes it
+      # resolve inside the container, so it must be passed through here
+      # (compose interpolation). The default resolves only in the testbed
+      # (the coredns zones); make up-internet recreates unbound with a real
+      # resolvable name (UNBOUND_HEALTH_NAME, T-334).
+      UNBOUND_HEALTH_NAME: ${UNBOUND_HEALTH_NAME:-same-site.crawl.test}
     command: ["/bin/sh", "-c", "exec unbound -d -c /etc/unbound/unbound.$${UNBOUND_MODE:-testbed}.conf"]
     networks:
       crawler_net:

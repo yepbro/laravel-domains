@@ -39,7 +39,9 @@ make logs SERVICE=analyzer   # one service's logs (tail + follow)
 ### What the healthchecks check (T-110)
 
 - Infrastructure — the images' own checks: `pg_isready` (postgres),
-  `redis-cli ping` (redis), resolution of a test name (unbound).
+  `redis-cli ping` (redis), resolution of `UNBOUND_HEALTH_NAME` (unbound;
+  in the internet mode it must be a real resolvable name — see
+  the "Unbound" section below).
 - The app services (the app profile) — **liveness** `/livez` on the metrics
   port: the container is healthy as long as the process is alive and answers
   HTTP. The readiness `/healthz` (a PostgreSQL pool ping, 503 on failure) is
@@ -410,6 +412,19 @@ through `unbound-checkconf` when building the image. The mode is set by the
 |---|---|---|
 | `testbed` (default) | `unbound.testbed.conf` | all traffic is forwarded to coredns (172.28.100.11): the test zones answer authoritatively, everything else gets REFUSED, nothing leaves for the outside (integration tests of the DNS stage). One exception: the root NS answer is served locally from a `local-data` record (T-300) — the dns-worker startup probe requires NOERROR with records, and coredns would REFUSE/SERVFAIL the "." question like any other non-test name; `local-zone "." transparent` keeps the forward for all the other names unchanged |
 | `internet` (`make up-internet`) | `unbound.internet.conf` | full recursion from the root servers, prefetch, the cache within the spec §3.2 budget |
+
+The container healthcheck is an `nslookup` of `UNBOUND_HEALTH_NAME` against
+`127.0.0.1` inside the container, so the variable is passed through the
+unbound `environment:` block (compose interpolation). Without the passthrough
+the check always ran on the hardcoded default, which resolves only in the
+testbed (the coredns zones) — in the internet mode it was permanently red
+(cosmetic: the resolution itself worked; T-334). The default
+`same-site.crawl.test` fits the testbed; in the internet mode the name must
+be real and resolvable — `make up-internet` passes `example.com` for its
+unbound recreate (the shell env wins over `.env` in the interpolation), and a
+direct compose invocation takes it from `.env`
+(`UNBOUND_HEALTH_NAME=laravel.com`). A real name does not resolve in the
+testbed: keep the default there. The name is used only by the probe.
 
 Parameters of the `internet` mode (spec §5.4, §3.2):
 

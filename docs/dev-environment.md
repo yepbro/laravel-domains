@@ -406,6 +406,11 @@ a re-up brings it back) and analyze the cause.
    UNBOUND_MODE=internet UNBOUND_HEALTH_NAME=example.com ... unbound
    ```
 
+   (`UNBOUND_HEALTH_NAME` is the unbound healthcheck probe; in the internet
+   mode it must be a real resolvable name — the testbed default
+   `same-site.crawl.test` does not answer there. Details — the "Unbound"
+   section in [`docker.md`](docker.md).)
+
    ```bash
    dc run --use-aliases -e CRAWLER_RENDER_TEST=1 --rm tools \
        go test ./internal/render -run 'TestEnginesLiveCDPSlice/<engine>' -v -count=1
