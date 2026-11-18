@@ -1364,3 +1364,79 @@ why, and how to roll it back. Normal CD deploys are not recorded here
   `moli-hh-controls.log` (the A–E controls), the drivers in
   `moli-repro-driver/`. The stand canonical; the probe rebuilt the
   `crawler/moli:v1.1.21` image locally (kept — it matches the pin).
+
+### 2026-11-18 — T-331: the moli v1.1.26 retest — the #3047 memory fix VERIFIED, the pin stays v1.1.21 (the §5.1 quality gate)
+
+- The build: the release v1.1.26 (the tag `c8061786…`), the first
+  carrying #3060 ("fix(parser): batch tree-builder text before DOM
+  mutations" — the fix of our #3047). The standard pin flow: the asset
+  `moli-x86_64-unknown-linux-gnu.tar.gz`, SHA256
+  `b57b1b7a…93bb5` (cross-checked against the release digest), the
+  compose image `crawler/moli:v1.1.26`. A build nuance: two compose
+  builds died on curl exit 28 — with the host's VPN split-tunnel
+  active, github.com is routed via `amn0` and forwarded container
+  traffic to that route is dropped (example.com/laravel.com/hh.ru are
+  reachable from containers, github.com is not); the image was built
+  with `docker build --network=host` (the Dockerfile untouched, the
+  checksum verified inside the build). Provenance at the gate:
+  `Moli-Version: 1.1.26`, `WebKit-Version: @c8061786…`.
+- The canary (D-026, FIRST): hh.ru ×3 through the repro driver
+  (the exact worker CDP pattern), `MEM_MOLI=1gb` — **3/3 LOADED**
+  (DOM 2.25–2.32 MB, 19–23 s), peak RSS **177.7 MiB**, 0 kills,
+  RestartCount/OOMKilled zero, dmesg clean. v1.1.25 killed the engine
+  3/3 in 8–18 s; chromium 156 holds the same page at ~519 MiB — the
+  quadratic Inspector buffering is gone.
+- Layer 1 (the CDP slice): **6/6** — but only after an environment
+  correction: the first run (in the internet mode prepared for the
+  smoke) was 4/6 with `net::ERR_FAILED` on spa-shell/ssrf — **on the
+  chromium control identically**. Root cause: in internet mode unbound
+  answers `*.crawl.test` by root recursion → NXDOMAIN by design
+  (`unbound.internet.conf`); the engines' DNS is unbound. The slice is
+  a testbed procedure: recreate unbound in `UNBOUND_MODE=testbed` →
+  moli 6/6 + the chromium control 6/6 (D-069; a note added to the
+  FR-17 section of dev-environment.md).
+- Layer 2 (the smoke on the seed hundred, internet mode, baseline
+  chromium-1 of dump 242, the worker on the moli specimen with
+  `restart_every_pages: 50`): the drain completed in **26 min 16 s**
+  (cap 45), q:dead 0. The §5.1 report
+  (`var/fixtures-l2/report-moli-v1.1.26.txt`): success **87/100 vs
+  92/100** — FAILED (tarpit 9 vs 4, ERR_FAILED 4 vs HTTP2 1; of the 8
+  candidate-only failures 8 are international .com sites over the
+  night's channel — the baseline had its own 3); the Laravel detection
+  divergences **2.38%** (2 of 84) — FAILED, but both divergences
+  (laravel-com, forge-laravel-com) are rows where the baseline failed
+  to render and moli rendered + correctly detected Laravel — the
+  direction favors the candidate; **memory 312.0 MiB — PASSED**
+  (⅓ of the chromium budget = 682.7 MiB; the sampler missed ~3 min to
+  a session restart, the hard ceiling held — 0 memcg events); **0
+  engine-core crashes — PASSED**; pace NO DATA (the known q:analyze
+  trim shape; indicatively 0.063 rows/s vs the baseline 0.07). The DOM
+  structure is clean (the ratio medians ×1.00, 10.71% identical
+  hashes); the page time avg 17.08 s vs 14.69 s.
+- The T-283 battle check (mid-drain, a deliberate `docker kill`):
+  ~48 s of engine downtime. The claim gate held ("stalled delivery
+  recovery: the processing sensor reports not ready — claim skipped,
+  delivery attempts are not spent"), the reconnect was observed
+  (`crawler_render_browser_restarts_total{engine="moli"}` 0→1), all
+  delivery counts stayed 1 (0 burned attempts; the only task losses in
+  the window are ordinary page timeouts), the drain completed.
+  A methodology finding: an explicit `docker kill` is NOT restarted by
+  the `unless-stopped` policy (only kernel-side kills are, as in the
+  15.11 OOM cascades) — the engine was brought back with
+  `docker start`; future battle checks should use `docker restart` or
+  an in-container kill (D-069).
+- Consequences: **the migration blocker (the memory burst) is closed
+  upstream** — #3047's fix works. The pin, however, stays **v1.1.21**
+  (the FR-17 red path): the §5.1 quality thresholds are still red, and
+  the tarpit/ERR_FAILED class persists since 13.11 (before the memory
+  regression) — that, not memory, is now the only blocker. The next
+  retest: a fresh same-day chromium baseline (or a channel-stable
+  window) to separate the channel share from the engine share of the
+  success gap; the upstream follow-up material (the #3047 fix
+  confirmation + the quality observations) is prepared in the T-331
+  report, NOT posted. The `.env` pin reverted to the v1.1.21 pair;
+  the stand is back on chromium + the isolated DNS (SERVFAIL-verified),
+  moli stopped; the image `crawler/moli:v1.1.26` stays in the local
+  cache (a retest is a two-line flip). Artifacts:
+  `var/fixtures-l2/moli-v1.1.26-*` (canary/slice/import/drain/rss/
+  events/worker/snapshot/report/status), DECISIONS D-069.

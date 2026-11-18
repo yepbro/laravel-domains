@@ -391,7 +391,20 @@ a re-up brings it back) and analyze the cause.
 2. **Layer 1 — the testbed slice of the new engine** (`TestEnginesLiveCDPSlice`,
    `internal/render/engines_live_test.go`; the engine table: the addresses
    `CHROMIUM_WS_URL`/`MOLI_WS_URL`/`LIGHTPANDA_WS_URL`, the defaults — the
-   stack addresses, an unreachable engine — SKIP):
+   stack addresses, an unreachable engine — SKIP). **Runs in the default
+   (testbed) DNS mode**: the slice pages are `*.crawl.test`, and in the
+   internet mode unbound answers them by root recursion → NXDOMAIN by
+   design (`unbound.internet.conf`) — the engines (their DNS is unbound)
+   then fail spa-shell/ssrf with `net::ERR_FAILED` on ANY engine,
+   chromium included (the T-331 lesson, D-069). If the stand is already
+   in the internet mode for a subsequent smoke, recreate unbound alone:
+
+   ```bash
+   UNBOUND_MODE=testbed docker compose --project-directory . \
+     -f deploy/docker/compose.yaml --env-file .env \
+     up -d --no-deps --force-recreate unbound   # ... and back with
+   UNBOUND_MODE=internet UNBOUND_HEALTH_NAME=example.com ... unbound
+   ```
 
    ```bash
    dc run --use-aliases -e CRAWLER_RENDER_TEST=1 --rm tools \

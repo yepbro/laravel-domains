@@ -1,17 +1,23 @@
 # Moli: the candidate render engine — the full history
 
-Settled 2026-11-16. The short version: **Moli is our second candidate render
-engine (stage 35). Functionally it reached full CDP parity with Chromium in
-v1.1.25 — the release that finally carried all the interception fixes we
-waited for — but the same release introduced a memory regression: a single
-heavy streaming page (hh.ru) bursts the process to any memory ceiling in
-seconds. Upstream confirmed our issue
-([#3047](https://github.com/lexmount/moli/issues/3047)) and the fix
-([PR #3060](https://github.com/lexmount/moli/pull/3060)) is not in a release
-yet. The pin stays at v1.1.21; the retest target is the first release
-carrying #3060. Meanwhile our side is fully compensated: page-killer URLs
-are routed around the engine (T-285) and the worker survives engine
-restarts (T-283).**
+Settled 2026-11-16, updated 2026-11-18 (T-331). The short version:
+**Moli is our second candidate render engine (stage 35). Functionally it
+reached full CDP parity with Chromium in v1.1.25 — the release that
+finally carried all the interception fixes we waited for — but the same
+release introduced a memory regression: a single heavy streaming page
+(hh.ru) bursts the process to any memory ceiling in seconds. Upstream
+confirmed our issue
+([#3047](https://github.com/lexmount/moli/issues/3047)); the fix
+([PR #3060](https://github.com/lexmount/moli/pull/3060)) shipped in
+**v1.1.26** and is **verified fixed by the T-331 retest** (the canary
+holds hh.ru at 177.7 MiB; the smoke peak 312 MiB < ⅓ of the chromium
+budget; 0 crashes; the T-283 battle check clean). The pin, however,
+stays at v1.1.21: the §5.1 quality thresholds are still red (success
+87/100 vs the baseline 92/100 — the tarpit/ERR_FAILED class that
+predates the memory regression; detection 2.38% — both divergences are
+the baseline's own channel losses, in moli's favor). Meanwhile our side
+is fully compensated: page-killer URLs are routed around the engine
+(T-285) and the worker survives engine restarts (T-283).**
 
 ## Why Moli at all
 
@@ -127,6 +133,34 @@ explains our whole picture: the small testbed pages of the slice stayed
 green, the heavy streaming DOM of hh.ru burst, and it fires exactly on
 our DOM-capture path. Not in any release yet (open as of 2026-11-16).
 
+### v1.1.26 — the memory fix verified, the quality gate still red (T-331, 2026-11-18)
+
+The first release carrying #3060 (the tag `c8061786…`). Layer 0: the
+asset checksum `b57b1b7a…93bb5`, the compose image `crawler/moli:v1.1.26`,
+provenance checked at the gate (`Moli-Version: 1.1.26`,
+`WebKit-Version: @c8061786…`). The **canary (D-026) GREEN**: hh.ru ×3
+through the repro driver under the 1 GiB limit — 3/3 LOADED (DOM
+2.25–2.32 MB, 19–23 s), peak RSS **177.7 MiB**, 0 kills (v1.1.25: 3/3
+OOM in 8–18 s; chromium holds the same page at ~519 MiB). The CDP
+slice **6/6** (+ the chromium control 6/6 — after re-running both in
+the testbed DNS mode; in internet mode unbound NXDOMAINs `*.crawl.test`
+by design and any engine goes red on spa-shell/ssrf, see D-069). The
+smoke (the seed hundred, baseline chromium-1): **NOT READY — quality,
+not memory**: success **87/100** vs 92/100 (tarpit 9 vs 4, ERR_FAILED
+4 vs HTTP2 1; 8 candidate-only fails are internationals over the
+night's channel, 3 baseline-only — the baseline's losses), the Laravel
+detection divergences **2.38%** — both are laravel-com/forge-laravel-com
+where the baseline failed to render and moli detected them correctly;
+**memory 312.0 MiB PASSED** (< ⅓ of 2 GiB); **0 crashes PASSED** (0
+memcg events in dmesg); pace NO DATA (the q:analyze trim shape;
+indicatively the drain took 26 min 16 s ≈ 0.063 rows/s vs the baseline
+0.07). The **T-283 battle check** (a deliberate `docker kill` mid-drain,
+~48 s of engine downtime — the explicit kill is not policy-restarted,
+D-069): the claim gate held ("delivery attempts are not spent"),
+`crawler_render_browser_restarts_total{engine="moli"}` 0→1, all
+delivery counts stayed 1 (0 burned attempts), the drain completed. The
+pin reverted to v1.1.21; the artifacts `var/fixtures-l2/moli-v1.1.26-*`.
+
 ## What each version means for us
 
 | Version | State against our stage | What appeared |
@@ -136,7 +170,7 @@ our DOM-capture path. Not in any release yet (open as of 2026-11-16).
 | v1.1.24 | not tested — the release cut lacked ①④ | — |
 | main `f857b6651` ("1.1.24") | slice 6/6; smoke: not ready (quality) | ①#2704 ②#2696 ④#2729+#2883 |
 | **v1.1.25** | **slice 6/6 — full functional parity; smoke: NOT READY (the hh.ru memory burst)** | ①④ in a release; **the regression**: quadratic Inspector mutation buffering (#3047/#3060) |
-| next (TBD) | the retest target | #3060: bounded parser text mutation buffering |
+| v1.1.26 | slice 6/6; canary hh.ru GREEN (3/3, peak 177.7 MiB); smoke: **NOT READY (quality, not memory)** — memory 312 MiB PASSED, 0 crashes, T-283 battle check clean; success 87/100 vs 92, detection 2.38% (both divergences favor moli — the baseline's own channel losses) | #3060 in a release: **the #3047 memory burst is fixed**; the tarpit/ERR_FAILED quality gap persists |
 
 ## Our side: tasks and compensations
 
@@ -148,6 +182,8 @@ our DOM-capture path. Not in any release yet (open as of 2026-11-16).
   entries 2026-11-13/15/16 in [`../operations.md`](../operations.md); the
   artifacts in `var/fixtures-l2/`, the research doc
   `moli-v1.1.25-memory-research.md` and `moli-repro-summary.md`).
+  **T-331** — the v1.1.26 retest (the journal entry 2026-11-18; the
+  artifacts `moli-v1.1.26-*`).
 - **T-275/T-276** — the probe expectations aligned with the final #2729
   semantics.
 - **T-285** — `render.engine_skip_patterns`: a per-engine URL skip-list;
@@ -164,7 +200,8 @@ our DOM-capture path. Not in any release yet (open as of 2026-11-16).
 - Decisions: D-020 (the pin stays v1.1.21, v1.1.25 not ready), D-022
   (the regression confirmed by the clean-channel run), D-026 (hh.ru is
   the deterministic killer; every moli retest includes it as a canary
-  URL), D-028 (the engine-restart semantics).
+  URL), D-028 (the engine-restart semantics), D-069 (v1.1.26: the
+  memory fix verified; the pin stays v1.1.21 on the §5.1 quality gate).
 
 ## Upstream links (issues & PRs)
 
@@ -182,22 +219,34 @@ our DOM-capture path. Not in any release yet (open as of 2026-11-16).
   hh.ru memory burst report (the minimal repro, the controls, the
   regression window `f857b6651..v1.1.25`); confirmed by the maintainer.
 - [#3060](https://github.com/lexmount/moli/pull/3060) — the fix: bounded
-  Inspector parser text mutation buffering (Closes #3047); watch until
-  merge + release.
+  Inspector parser text mutation buffering (Closes #3047); **shipped in
+  v1.1.26 and verified fixed by the T-331 retest** — the follow-up
+  material (the confirmation + the remaining quality observations) is
+  in the T-331 report, not posted upstream yet.
 
 ## Current state and retrigger
 
 1. The pin: `.env.example` default **v1.1.21**, the local `.env` holds
-   the same pair; the images `crawler/moli:v1.1.23`/`v1.1.25` stay in
+   the same pair (reverted after the T-331 retest per the FR-17 red
+   path); the images `crawler/moli:v1.1.23`/`v1.1.25`/`v1.1.26` stay in
    the local cache (a retest is a two-line flip).
-2. Watch [PR #3060](https://github.com/lexmount/moli/pull/3060) until
-   merge + release; then bump `MOLI_VERSION`/`MOLI_SHA256` via the
-   FR-17 procedure (T-254 — [`../dev-environment.md`](../dev-environment.md),
-   "Switching the pinned engine version").
-3. The retest must include **hh.ru as a canary URL** (D-026) — with the
-   T-283 resilience in place the engine may even be killed mid-drain on
-   purpose to verify the worker survives it end-to-end.
+2. The v1.1.26 retest (T-331, 2026-11-18) closed the memory question —
+   see the table row above and [`../operations.md`](../operations.md),
+   2026-11-18. The remaining (and only) blocker is the §5.1 quality
+   gap: tarpit finalizations 9 vs the baseline's 4 and 4×
+   `net::ERR_FAILED` (the class persists since the 13.11 run, before
+   the memory regression). The next retest should run with a **fresh
+   same-day chromium baseline** (or in a channel-stable window): the
+   06.11 baseline's own channel losses produced both detection
+   divergences (laravel-com, forge-laravel-com — moli rendered and
+   detected them, the baseline did not) and 3 of the 8 success-gap
+   domains in the opposite direction.
+3. The canary protocol stands (D-026): every moli retest starts with
+   hh.ru through the repro driver; with T-283 in place the engine may
+   be killed mid-drain on purpose (note: an explicit `docker kill` is
+   NOT restarted by the `unless-stopped` policy — only kernel-side
+   kills are; use `docker restart` or an in-container kill to simulate,
+   D-069).
 4. A green retest (slice 6/6 + the smoke thresholds §5.1) → empty the
    `engine_skip_patterns` sample, raise the pin, and moli becomes a
-   canary candidate again; the tarpit/ERR_FAILED quality gap of the
-   13.11 run is the second thing to watch in the report.
+   canary candidate again.
