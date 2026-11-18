@@ -58,8 +58,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1110,6 +1112,77 @@ func TestResilience_RedisLossSchedulerRecovery(t *testing.T) {
 	}
 }
 
+// gatePauseLog — the deterministic indicator of the start of a gated
+// publication: a slog handler counting the records the gate emits when
+// it enters the wait (AwaitCapacity Warns "publication paused: queue
+// depth at threshold" — exactly one per call, on the first closed
+// check). One entry is a proof of three things at once: the publisher
+// goroutine got scheduled, it read the depth from Redis, and the depth
+// was at the threshold — the publication started and hangs in the gate.
+// The logger is private to the gate instance (BackpressureOptions.Log),
+// so every counted record belongs to it; only Warn records are counted
+// (the level of the pause entry) — a future Error site of the gate must
+// not inflate the indicator.
+type gatePauseLog struct {
+	paused atomic.Int64
+}
+
+func (l *gatePauseLog) Enabled(_ context.Context, level slog.Level) bool {
+	return level >= slog.LevelWarn
+}
+
+func (l *gatePauseLog) Handle(_ context.Context, r slog.Record) error {
+	if r.Level != slog.LevelWarn {
+		return nil
+	}
+	l.paused.Add(1)
+	return nil
+}
+
+func (l *gatePauseLog) WithAttrs(_ []slog.Attr) slog.Handler { return l }
+
+func (l *gatePauseLog) WithGroup(_ string) slog.Handler { return l }
+
+// waitGatePaused — wait until the gate reports entering the wait n
+// times: the stable "the publication has started and is paused"
+// indicator a negative wait must be grounded on (P3-6 of the hy4 bulk
+// review: a bare time.After window bets on the goroutine being
+// scheduled at all — on an overloaded runner a broken "unblocking"
+// gate would pass falsely; here, a gate that does not wait produces no
+// entry and fails this wait deterministically). Poll with a margin —
+// the style of waitPendingIdle.
+func waitGatePaused(t *testing.T, log *gatePauseLog, n int64) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for log.paused.Load() < n {
+		if time.Now().After(deadline) {
+			t.Fatalf("the gate did not report pausing %d time(s) within 5 s (reports: %d) — the publication either went through without waiting or was not scheduled", n, log.paused.Load())
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// waitStillBlocked — the negative wait of a publication hanging in the
+// gate: done must not produce a value within the window. A completion
+// that landed together with the timer fire is caught by a non-blocking
+// recheck — the select randomness (both cases ready, Go picks one at
+// random) does not mask a regression at the window edge.
+func waitStillBlocked(t *testing.T, done <-chan error, what string, window time.Duration) {
+	t.Helper()
+	timer := time.NewTimer(window)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		t.Fatalf("%s: went through without waiting: %v", what, err)
+	case <-timer.C:
+		select {
+		case err := <-done:
+			t.Fatalf("%s: went through without waiting (at the window edge): %v", what, err)
+		default:
+		}
+	}
+}
+
 // TestResilience_BackpressureGate — the capacity gate (T-026; the spec
 // 4.2/5.3 "strictly below the threshold"): below the threshold the
 // publication goes through, at the threshold — it blocks until the
@@ -1121,9 +1194,14 @@ func TestResilience_BackpressureGate(t *testing.T) {
 	skipUnlessIntegration(t)
 	rdb := resilienceRedisEnv(t)
 	const watermark = 5
+	// The pause indicator: the gate's wait entries are counted so that
+	// the negative waits below start only after the publication has
+	// provably entered the wait (see gatePauseLog).
+	pauseLog := &gatePauseLog{}
 	gate := queue.NewBackpressureGate(rdb, queue.BackpressureOptions{
 		Watermark: int64(watermark),
 		Interval:  50 * time.Millisecond,
+		Log:       slog.New(pauseLog),
 	})
 	q := queue.NewRedisQueue(rdb, queue.RedisOptions{Block: 150 * time.Millisecond})
 	pub := queue.NewWatermarkPublisher(q, gate)
@@ -1151,16 +1229,29 @@ func TestResilience_BackpressureGate(t *testing.T) {
 	}
 
 	// The threshold is reached (len == watermark): the next publication
-	// blocks — "strictly below the threshold".
+	// blocks — "strictly below the threshold". First the stable start
+	// indicator: the publication got scheduled, read the depth, found it
+	// at the threshold and entered the wait (one Warn of the gate). Only
+	// then the negative window — it measures "stays blocked having
+	// started", not "the goroutine had time to run at all" (a broken
+	// unblocking gate leaves no entry and fails the indicator wait).
+	// The base is taken right before the launch and the wait is for
+	// base+1 — a per-phase delta, not an absolute counter: a future Warn
+	// earlier in the test must not turn this wait into a no-op that
+	// silently returns the old flake.
 	blocked := make(chan error, 1)
+	pausedBase := pauseLog.paused.Load()
 	go func() {
 		_, err := pub.Publish(ctx, queue.StreamRender, task(watermark+1))
 		blocked <- err
 	}()
-	select {
-	case err := <-blocked:
-		t.Fatalf("the publication at the threshold went through without waiting: %v", err)
-	case <-time.After(250 * time.Millisecond):
+	waitGatePaused(t, pauseLog, pausedBase+1)
+	waitStillBlocked(t, blocked, "the publication at the threshold", 250*time.Millisecond)
+	// While the gate holds the publication, nothing is added to the
+	// stream: the length at the threshold is the same records, not a
+	// leaked (watermark+1)-th one.
+	if n := streamLen(t, rdb, queue.StreamRender); n != watermark {
+		t.Fatalf("the stream length while the gate holds the publication: %d, want %d", n, watermark)
 	}
 
 	// The capacity is freed (the records left the stream) — the
@@ -1189,17 +1280,27 @@ func TestResilience_BackpressureGate(t *testing.T) {
 			t.Fatalf("filling to the threshold: %v", err)
 		}
 	}
+	// The refill is a raw q.Publish (bypasses the gate — no Warn), but
+	// its result is verified, not trusted: at a depth below the
+	// threshold the publication would go through without a Warn, and
+	// the indicator wait below would blame the gate for a broken
+	// fixture instead of the refill.
+	if n := streamLen(t, rdb, queue.StreamRender); n != watermark {
+		t.Fatalf("the stream length before the second gated publication: %d, want %d (the threshold)", n, watermark)
+	}
 	cancelCtx, cancel := context.WithCancel(context.Background())
 	shutdown := make(chan error, 1)
+	pausedBase = pauseLog.paused.Load()
 	go func() {
 		_, err := pub.Publish(cancelCtx, queue.StreamRender, task(999))
 		shutdown <- err
 	}()
-	select {
-	case err := <-shutdown:
-		t.Fatalf("the publication went through before the cancel: %v", err)
-	case <-time.After(150 * time.Millisecond):
-	}
+	// The same grounding as above: the second publication provably
+	// entered the gate wait (a new Warn since the base — one per
+	// AwaitCapacity call), and only then the negative window before
+	// the cancel.
+	waitGatePaused(t, pauseLog, pausedBase+1)
+	waitStillBlocked(t, shutdown, "the publication before the cancel", 150*time.Millisecond)
 	cancel()
 	select {
 	case err := <-shutdown:
