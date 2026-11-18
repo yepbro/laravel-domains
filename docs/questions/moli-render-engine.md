@@ -1,7 +1,8 @@
 # Moli: the candidate render engine — the full history
 
 Settled 2026-11-16, updated 2026-11-18 (T-331, the upstream confirmation;
-T-332, the quality-gap decomposition). The short version:
+T-332, the quality-gap decomposition; T-333, the fresh-window
+reproducibility re-check). The short version:
 **Moli is our second candidate render engine (stage 35). Functionally it
 reached full CDP parity with Chromium in v1.1.25 — the release that
 finally carried all the interception fixes we waited for — but the same
@@ -24,6 +25,13 @@ The follow-up ran as **T-332** (2026-11-18): fresh paired runs
 divergence table — the gap is decomposed (see "Current state and
 retrigger" item 2 and the T-332 artifact); the pin decision stands at
 v1.1.21. The #3047 fix confirmation is posted upstream.
+**T-333** (2026-11-18, a fresh day window) re-checked the
+engine-attributable findings for reproducibility before any upstream
+post: the core HOLDS with amendments (heroku/netlify/fastly solid,
+cloudflare reframed from a ">60 s hang" to the 2–3× page-time
+regression class + a new ~30 s internal `net::ERR_TIMED_OUT` timer;
+ovh demoted as channel-fragile, rust-lang resolved as a flake) —
+item 2 below.
 
 ## Why Moli at all
 
@@ -178,6 +186,7 @@ pin reverted to v1.1.21; the artifacts `var/fixtures-l2/moli-v1.1.26-*`.
 | **v1.1.25** | **slice 6/6 — full functional parity; smoke: NOT READY (the hh.ru memory burst)** | ①④ in a release; **the regression**: quadratic Inspector mutation buffering (#3047/#3060) |
 | v1.1.26 | slice 6/6; canary hh.ru GREEN (3/3, peak 177.7 MiB); smoke: **NOT READY (quality, not memory)** — memory 312 MiB PASSED, 0 crashes, T-283 battle check clean; success 87/100 vs 92, detection 2.38% (both divergences favor moli — the baseline's own channel losses) | #3060 in a release: **the #3047 memory burst is fixed**; the tarpit/ERR_FAILED quality gap persists |
 | v1.1.26 (T-332, fresh pair) | 85/100 vs fresh chromium 89/100; the gap decomposed per-domain (D-071): the ERR_FAILED quartet is channel-side, the engine core = the cloudflare.com **hang** + the ovh/heroku/sport-express slowness (39–44 s), moli wins forge (12.7 s vs ~21 s) | the quality residue is now a named reproducible domain set — the upstream follow-up material |
+| v1.1.26 (T-333, fresh-window re-check) | the engine core re-confirmed in a day window with amendments (D-072): heroku 0/2 @60 s vs chromium 26–28 s (the cleanest exhibit), netlify 35–60 s, fastly upgraded, sport-express ratio-only; cloudflare reframed: 55.95 s LOADED + ERR_TIMED_OUT @39 s — a 2–3× page-time regression, NOT a deterministic >60 s hang; NEW: moli's ~30 s internal net timer (7 attempts aborted before the budget); ovh demoted (both engines fail that window), rust-lang resolved (identical times); moli's forge win holds in direction | the upstream draft: needs changes (reframe to the slowness class + the 30 s timer, drop ovh/rust-lang), then ready — still not posted |
 
 ## Our side: tasks and compensations
 
@@ -234,6 +243,17 @@ pin reverted to v1.1.21; the artifacts `var/fixtures-l2/moli-v1.1.26-*`.
   deliberately NOT upstream yet — first our own T-332 divergence
   analysis (the operator's decision); a separate issue with per-URL
   repros follows only if the engine side confirms.
+   **T-333 confirmed the engine side** (2026-11-18, a fresh day
+   window, D-072): the slowness class is reproducible (heroku 0/2
+   @60 s vs chromium 26-28 s; netlify 35-60 s; fastly 36.4 s + a
+   net error; the cloudflare gap real at 2-3x - but 55.95 s LOADED,
+   not a deterministic >60 s hang) and a second engine-side behavior
+   surfaced: moli aborts page loads on an internal ~30 s network
+   timer (`net::ERR_TIMED_OUT`, 7/24 attempts) that chromium never
+   has (it waits the budget out). The draft issue needs a reframe
+   before posting - the slowness class + the 30 s timer as the
+   headline, heroku as the lead exhibit, ovh/rust-lang dropped -
+   see the T-333 section of the T-332 artifact.
 
 ## Current state and retrigger
 
@@ -260,7 +280,22 @@ pin reverted to v1.1.21; the artifacts `var/fixtures-l2/moli-v1.1.26-*`.
    no headroom). The pin stays v1.1.21 (success 85<89, pace 0.13<0.14
    marginal, detection 1.22%>1% on the fresh pair); the upstream
    follow-up drafts (the hang + the ERR_FAILED mapping) live in the
-   T-332 artifact, not posted.
+   T-332 artifact, not posted. **T-333** (2026-11-18, a fresh day
+    window, same driver @60 s, moli ×2 → chromium ×2 per domain,
+    D-072) re-checked the core for reproducibility: heroku/netlify/
+    fastly HOLD as engine-attributable (heroku harder: 0/2 @60 s),
+    sport-express holds as a 4-5x ratio (the absolute passed this
+    window), cloudflare is reframed - a real 2-3x gap (55.95 s
+    LOADED + a 39 s net error vs chromium 28 s) but NOT a
+    deterministic >60 s hang; ovh demoted (both engines failed that
+    window - channel-fragile) and rust-lang resolved (identical
+    times - a night flake); moli's forge win holds in direction.
+    NEW: moli aborts loads on an internal ~30 s network timer
+    (`net::ERR_TIMED_OUT`, 7/24 attempts; chromium waits the budget).
+    The upstream draft: reframe (the slowness class + the 30 s
+    timer, heroku as the lead exhibit, ovh/rust-lang dropped), then
+    ready - the full T-333 table is in the divergence-analysis
+    artifact. The pin decision is unchanged.
 3. The canary protocol stands (D-026): every moli retest starts with
    hh.ru through the repro driver; with T-283 in place the engine may
    be killed mid-drain on purpose (note: an explicit `docker kill` is
