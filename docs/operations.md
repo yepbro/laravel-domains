@@ -1807,3 +1807,81 @@ why, and how to roll it back. Normal CD deploys are not recorded here
   — the operator's call.
 - The standing watch continues hourly (the quiet window open; the front
   is the operator's manual control — they toggled it 3 times overnight).
+
+### 2026-11-19 — T-340: репро и декодирование убийцы первой moli-ночи — НЕ ассет, а паттерн «живой Worker + клеймящий Service Worker»; детерминированный локальный репро 6/6, v1.1.21 чиста, фикс уже в main (D-077)
+
+- Шаг 1 (сделано до нас): полный триггер-сет ночи — tmp/t340/{trigger-set,
+  prod-journal-moli-raw}: 7 паник `runtime_state.rs:1207`, все с потоков
+  `worker:<url workers-5q4d0BQE.js>`, 5 хостов-зеркал одного
+  гемблинг-приложения (v7.6.79).
+- Ассет: скачан со всех 4 известных источников (cloudfront/178jt/
+  jinsana7hon/jinsanjero, egress 46.8.113.46 — VPN) — байтово идентичен,
+  sha256 `998b74bb…da34`, 2207 B, ETag один на всех (Aliyun OSS origin за
+  CloudFront + volc-dcdn у 178jt); `x-oss-meta-version: v7.6.79`,
+  last-modified расходятся (пере-выкладки одного объекта), суффикс
+  `5q4d0BQE` (Vite content-hash) стабилен — один артефакт одного
+  приложения. Провенанс — fetch-notes/fetch-provenance.md в пакете.
+- ОПРОВЕРЖЕНИЕ главного подозрения: минимальная страница с ТОЛЬКО этим
+  воркером на moli v1.1.26 работает идеально — воркер исполняется,
+  IndexedDB открывается, протокольный пинг DB_READY отвечает понгом,
+  полный путь транзакции (page-side посев store httpResponses →
+  DB_GET_BY_KEY читает строку), ×30 soak чистый, RSS плоский ~90 MiB,
+  12 воркеров сразу, terminate+recreate, module/blob/data-URL воркеры,
+  воркер из iframe, кросс-доменный (moli честно режет), исключения в
+  воркере (sync/async/rejection — движок логирует с backtrace, без
+  паники), регистрация САМОГО ассета как Service Worker — всё чисто
+  (полный список — ANALYSIS.md пакета; серия mA..mX).
+- НАСТОЯЩИЙ ТРИГГЕР найден через перехватывающий прокси на живую страницу
+  178jt.cc (caddy t340.real → 178jt.cc, выборочный перехват путей):
+  пустой воркер-файл и даже 404 на ассете НЕ отменяют панику (~50%
+  рендеров — гонка), значит убивает сам факт существования живого
+  воркер-реалма + что-то из окружения страницы. Стопка экспериментов
+  (SW зареган/активен/контролирует, benchmark worker с performance.now,
+  name-опции конструктора, 2 воркера, чёрн) — всё чисто; решающий след из
+  access-лога паникующего рендера: страница грузит ВТОРОЙ воркер
+  (benchmark.worker-BCVIEdOS.js) и sw-runtime-*.js. Финальная формула:
+  **живой dedicated Worker + клеймящий Service Worker в одном secure
+  context** — `new Worker(...)` затем `navigator.serviceWorker.register(
+  sw с skipWaiting+clients.claim)`: controllerchange-диспетч находит
+  клиента как «текущий глобал» на ПОТОКЕ ВОРКЕРА (service_worker_
+  container_for_owner: `Top => scope.get_current_context().global()`),
+  материализует на нём WINDOW-Navigator (ensure_window_lazy_surface_
+  object → cache_value → update_window_surface_detached_fallback),
+  реестра `__moliWindowSurfaceCallbackDataRegistry` на воркер-глобале нет
+  → паника «missing Window callback data for __moliWindowNavigator» →
+  panic=abort → смерть всего одно-процессного движка.
+- Детерминированный локальный репро (пакет
+  var/fixtures-l2/moli-worker-asset-repro/, БЕЗ интернета): repro.html +
+  worker.js + sw.js (порядок «воркер вперёд, мгновенный claim») — **6/6
+  гибелей процесса** v1.1.26; one-liner вариант (blob worker) — 4/6.
+  Контроли: chromium 156 на той же странице чист; страница только-SW и
+  только-воркер — 0 паник (учёт «до/после» строк лога — наивный
+  `--since 1m` ловит чужие паники, первые замеры были артефактом);
+  v1.1.21 — 0/3 (окно регрессии v1.1.22..v1.1.25); v1.1.25 — 3/3.
+- Апстрим: **фикс уже в main** — `2c4f149c3` (2026-11-18 07:18 +0800,
+  «Route Service Worker client notifications through WorkerNavigator in
+  worker realms», внутри «fix(devtools): close optional configuration
+  gates»): клиентский глобал с WORKER_NAVIGATOR_INSTALLED_SLOT уводится
+  на ensure_worker_navigator_in_current_realm вместо Window-пути.
+  Коммит на ~11 ч ПОЗЖЕ катa v1.1.26 (c8061786, 2026-11-17 12:06 UTC) —
+  движок прода катился на релизе без фикса. Эмпирическая проверка
+  main-сборки (dev-билд с символами из worktree 1c54ef122, провенанс
+  `WebKit-Version @1c54ef122` из /json/version, контейнер на ubuntu:26.04):
+  **0/6 паник, 6/6 страниц загружены чисто** на той же repro-странице,
+  убивающей v1.1.26 6/6 — фикс подтверждён и исходником, и прогоном.
+  Возврат на прод: следующий релиз + FR-17 ретест, канарейка дополняется
+  страницей класса SW+worker (D-077).
+- 4-часовой wedge (28→1023 MiB без паник) локально НЕ воспроизведён:
+  soak ×30 страниц с воркером — плоский RSS ~90 MiB; soak ×30 страниц
+  только-SW (один живой процесс, сессии подряд) — плоский RSS 2–13 MiB,
+  31/31 LOADED, 0 ошибок. Остаётся непонятым (при возврате движка —
+  обязательный контроль RSS-срезами, критерий отката).
+- Стенд: тестовые контейнеры (caddy t340-static/t340-proxy, движки
+  t340-moli-{secure,intet,bisect,bt,1121,1125}, t340-chromium) убраны,
+  .env возвращён на пару v1.1.21, ALLOW_INTERNET=0 не трогали, compose
+  moli (.17) остановлен, chromium-спекмен жив. Артефакты: пакет
+  var/fixtures-l2/moli-worker-asset-repro/ (репро, контроли, логи,
+  sha256-таблица, черновик апстрим-issue); исходники v1.1.26/main —
+  shallow в ~/projects/opensources/moli (тег v1.1.26-upstream, upstream/
+  main 77d5388dd). Docs-only — test/lint и review-цепочка пропущены по
+  правилам задачи. DECISIONS D-077.
