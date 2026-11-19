@@ -12,10 +12,12 @@
 package renderworker
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -1741,15 +1743,22 @@ func TestRenderWorker_RunSmoke(t *testing.T) {
 
 // TestRenderWorker_RunBrowserDead — an unavailable browser: the queue is not
 // read (the deliveries stay in the stream, not in the PEL), the loop waits and finishes
-// cleanly on the ctx cancellation.
+// cleanly on the ctx cancellation. The pause WARN is engine-neutral with the
+// build's engine as a field (T-339): a moli build must not log its outage as
+// a chromium event (the finding of the T-338 rollout night).
 func TestRenderWorker_RunBrowserDead(t *testing.T) {
 	f := newRWFixture(t)
 	f.q.deliveries = []queue.Delivery{rwDelivery("e1")}
 
+	var logs bytes.Buffer
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- Run(ctx, f.w, Options{Alive: func() bool { return false }})
+		done <- Run(ctx, f.w, Options{
+			Alive:  func() bool { return false },
+			Engine: config.EngineMoli,
+			Log:    slog.New(slog.NewTextHandler(&logs, nil)),
+		})
 	}()
 	time.Sleep(100 * time.Millisecond)
 	cancel()
@@ -1766,6 +1775,16 @@ func TestRenderWorker_RunBrowserDead(t *testing.T) {
 	}
 	if tasks := f.renderer.tasksSnapshot(); len(tasks) != 0 {
 		t.Errorf("the render must not run: %+v", tasks)
+	}
+	out := logs.String()
+	if !strings.Contains(out, `msg="browser unavailable — the consumption stream is not read`) {
+		t.Errorf("the pause WARN about the unread stream is missing:\n%s", out)
+	}
+	if !strings.Contains(out, "engine=moli") {
+		t.Errorf("the pause WARN must carry the build's engine as a field:\n%s", out)
+	}
+	if strings.Contains(out, "Chromium unavailable") {
+		t.Errorf("the pause WARN is still chromium-hardcoded on a moli build:\n%s", out)
 	}
 }
 

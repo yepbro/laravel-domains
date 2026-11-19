@@ -7,6 +7,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"crawler/internal/config"
 )
 
 // maxRestartsPerTask — the browser restart limit per task: the Chromium
@@ -317,9 +319,9 @@ func (m *Manager) restartLocked(reason string) error {
 	if !m.restartPending {
 		// The first start of the manager (no generation has ever been
 		// replaced) — not a restart.
-		// Logging of the chromium start (§4 docs/mutation-testing.md).
+		// Logging of the browser start (§4 docs/mutation-testing.md).
 		// mutator-disable-next-line statement/remove
-		slog.Info("chromium started", "mode", m.mode(), "pid", b.rootPID)
+		slog.Info("browser started", "engine", m.engine(), "mode", m.mode(), "pid", b.rootPID)
 		return nil
 	}
 	m.restartPending = false
@@ -331,9 +333,9 @@ func (m *Manager) restartLocked(reason string) error {
 		go old.Close()
 	}
 	n := m.restarts.Add(1)
-	// Logging of the chromium restart (§4 docs/mutation-testing.md).
+	// Logging of the browser restart (§4 docs/mutation-testing.md).
 	// mutator-disable-next-line statement/remove
-	slog.Info("chromium restarted", "reason", reason,
+	slog.Info("browser restarted", "engine", m.engine(), "reason", reason,
 		"restarts", n, "pid", b.rootPID)
 	return nil
 }
@@ -347,6 +349,23 @@ func (m *Manager) mode() string {
 		return "remote " + m.opts.RemoteURL
 	}
 	return "local process"
+}
+
+// engine — the build's engine for the start/restart logs of the
+// generation (T-339): the manager is engine-agnostic (FR-4), the message
+// is engine-neutral and the engine rides as a field — in a mixed-engine
+// deployment a moli/lightpanda recovery must not be logged as a chromium
+// event (the prod runbooks grep the journal lines). "" — chromium, the
+// normalization semantics of validation (render.Options.validate); the
+// field keeps the metric-label vocabulary of three engines (T-235).
+// The branch mutant (an unconfigured build would be logged with an empty
+// engine) is killed by TestManagerGenerationLogEngine — no mutator
+// suppression (§4 docs/mutation-testing.md).
+func (m *Manager) engine() string {
+	if m.opts.Engine == "" {
+		return config.EngineChromium
+	}
+	return m.opts.Engine
 }
 
 // Close stops the manager: new tasks are rejected (ErrClosed →

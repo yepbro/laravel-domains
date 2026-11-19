@@ -1,13 +1,18 @@
 package render
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"crawler/internal/config"
 )
 
 // liveBrowser — a "live" browser without Chromium: the context has no
@@ -232,6 +237,61 @@ func TestManagerRestartOnMemoryThreshold(t *testing.T) {
 	}
 	if got := m.Restarts(); got != 1 {
 		t.Errorf("restarts %d, want 1", got)
+	}
+}
+
+// TestManagerGenerationLogEngine — the start/restart log messages of a
+// generation are engine-neutral, the build's engine rides as a field
+// (T-339): in a mixed-engine deployment an engine_wait recovery of the
+// moli engine must not be logged as a chromium event (the finding of the
+// T-338 rollout night — the runbooks and the watch scripts grep the
+// journal lines). An empty Engine (a build without configuration) is
+// normalized to chromium — the semantics of validation; the log field
+// keeps the metric-label vocabulary of three engines (T-235).
+func TestManagerGenerationLogEngine(t *testing.T) {
+	for _, tc := range []struct {
+		engine string
+		remote string
+		want   string
+	}{
+		{"", "", config.EngineChromium}, // a build without configuration
+		{config.EngineMoli, "ws://moli:9224", config.EngineMoli},
+		{config.EngineLightpanda, "ws://lightpanda:9222", config.EngineLightpanda},
+	} {
+		t.Run("engine="+tc.want, func(t *testing.T) {
+			prev := slog.Default()
+			defer slog.SetDefault(prev)
+			var buf bytes.Buffer
+			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+
+			opts := managerOpts()
+			opts.Engine, opts.RemoteURL = tc.engine, tc.remote
+			b1, cancel1 := liveBrowser(1)
+			b2, _ := liveBrowser(1)
+			m, _, _ := managerFor(t, opts, b1, b2)
+			defer m.Close()
+
+			if _, err := m.Run(context.Background(), RenderTask{URL: "u1"}); err != nil {
+				t.Fatalf("Run 1: %v", err)
+			}
+			cancel1() // the engine died: the next task replaces the generation
+			if _, err := m.Run(context.Background(), RenderTask{URL: "u2"}); err != nil {
+				t.Fatalf("Run 2: %v", err)
+			}
+
+			logs := buf.String()
+			for _, want := range []string{
+				`msg="browser started"`, "engine=" + tc.want,
+				`msg="browser restarted"`, "browser unavailable",
+			} {
+				if !strings.Contains(logs, want) {
+					t.Errorf("the generation logs lack %q:\n%s", want, logs)
+				}
+			}
+			if tc.engine != "" && strings.Contains(logs, "chromium") {
+				t.Errorf("the %s build's logs must not attribute the generation events to chromium:\n%s", tc.want, logs)
+			}
+		})
 	}
 }
 

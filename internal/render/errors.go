@@ -98,4 +98,4 @@ var ErrClosed = errors.New("render stopped")
 
 // ErrBrowserDead — the browser session is not initialized or is lost
 // (checked before creating a session, so as not to run commands doomed to fail).
-var ErrBrowserDead = errors.New("the Chromium browser session is unavailable")
+var ErrBrowserDead = errors.New("the browser session is unavailable")

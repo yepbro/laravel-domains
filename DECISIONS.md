@@ -2918,3 +2918,46 @@ upstream-issue-draft.md в пакете. 4-часовой wedge (медленн�
 внутренний рендер-инфраструктуре ничего не меняет (движок и паттерн
 работы воркера не при чём — воспроизведено на чистом internal/render
 драйвере).
+
+### D-078 — T-339: журнал движково-нейтрален — «browser started/restarted» и «browser unavailable» с полем engine; слово chromium осталось только в движково-специфичных ветках
+Дата: 2026-11-19.
+Проблема: ночь T-338 показала — в mixed-engine деплое
+engine_wait-восстановление moli (Rust-паника ABRT) залогировалось как
+`msg="chromium restarted" reason="browser unavailable"`, а WARN
+"Chromium unavailable — the consumption stream is not read" (renderworker)
+сработал на moli-воркере: журнал неверно атрибутирует движок и уводит
+грепы прод-runbook'ов и watch-скриптов.
+Решение: словарь нейтральных сообщений — «browser» (пакетный термин:
+Browser/ClassBrowser/crawler_render_browser_restarts_total):
+"chromium started"→"browser started" и "chromium restarted"→"browser
+restarted" с полем engine (Manager.engine, нормализация ""→chromium по
+семантике валидации render.Options.validate — словарь меток T-235 из
+трёх движков); WARN "Chromium unavailable…"→"browser unavailable…" с
+полем engine (o.Engine уже нормализован в withDefaults). Нейтрализованы
+и ошибки generic-путей: "chromium initialization"→"browser
+initialization", "chromium browser unavailable"→"browser unavailable"
+(browser.go ×2, session.go ×2), ErrBrowserDead "the Chromium browser
+session is unavailable"→"the browser session is unavailable" и — по
+находке ревью (P2-1) — строки аллокатора внешнего CDP, обслуживающего
+все движки (remotealloc.go ×3): "connecting to Chromium %s"→"connecting
+to the browser at %s", "the Chromium address %q"→"the browser address
+%q", "resolving the Chromium host %s"→"resolving the browser host %s".
+Движково-специфичное оставлено: WARN о неопределённом PID (local-режим —
+только chromium), "chromium worker B reworks it" (worker B всегда
+chromium, спек §4.5), Help-тексты метрик. Историческая запись
+operations.md §2026-11-19 не правится — журнал той ночи действительно
+говорил "Chromium unavailable", запись отражает его.
+Следствия: греп-паттерны наблюдения переключать на "browser
+restarted"/"browser unavailable" (или поле engine=); matching по старым
+строкам нигде в коде/тестах не выполнялся (классификация — errors.Is и
+Class, не тексты) — тестов со старыми строками не было, добавлены
+новые: TestManagerGenerationLogEngine (""→chromium, moli, lightpanda),
+расширение TestRenderWorker_RunBrowserDead (moli: engine=moli в WARN) и
+TestStartBrowserRemoteDialPerEngine (диал-ошибка нейтральна для всех
+движков). Документные атрибуции паузы потребления chromium →
+engine/browser (services.md, пакетный комментарий cmd/render-worker).
+make test-race: тачки задачи (render, renderworker) зелёные во всех
+прогонах; internal/content под -race нестабилен — TestPackGetBombFrame
+иногда «signal: killed» (память бомб-кадра × детектор гонок),
+воспроизведено и на базовом коммите 54dc3f0 (вне зоны T-339), финальный
+прогон после правок — зелёный.

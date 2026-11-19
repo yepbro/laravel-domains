@@ -495,7 +495,7 @@ All package errors are `*render.Error` with a class (`render.ClassOf`):
 |---|---|---|
 | `task` | page timeout, task context cancellation, `net::ERR_*` | redelivery — the queue level (T-066) |
 | `context` | the isolated context died (the tab/renderer crashed, the profile is unresponsive) | `Pool` retries once on a new context |
-| `browser` | Chromium unavailable / connection lost | `Manager` (T-065) restarts the browser and retries the task (up to two times), the pool does not retry |
+| `browser` | browser unavailable / connection lost | `Manager` (T-065) restarts the browser and retries the task (up to two times), the pool does not retry |
 
 Classification goes by the state of the contexts and the connection (not by
 error texts): task context cancellation and timeout — by the contexts;

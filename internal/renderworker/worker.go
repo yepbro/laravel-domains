@@ -1898,7 +1898,7 @@ func recoverOptions(o Options, log *slog.Logger) queue.RecoverOptions {
 // render.timeout, 20–25 s) would keep the slots idle and cut the
 // stage's ceiling over the Chromium bottleneck (the T-092 §4 measurement: 5.1 s/page).
 // The browser's liveness (Options.Alive) is checked before every read:
-// an unavailable Chromium — a consumption pause, the deliveries stay in the stream
+// an unavailable engine — a consumption pause, the deliveries stay in the stream
 // unread (not in the PEL), the browser restart is T-065. The same sensor
 // gates the stalled-delivery claim of RecoverLoop (recoverOptions.Ready,
 // T-283): while the engine is down the claim passes are skipped —
@@ -2054,7 +2054,7 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 			switch readerDecide(obs) {
 			case modePauseBrowser:
 				// The browser's liveness — before every read: a dead
-				// Chromium accepts no tasks, new reads
+				// engine accepts no tasks, new reads
 				// stop — the unread deliveries stay
 				// in the stream (not in the PEL — claims do not burn attempts,
 				// T-025); the already read ones in the prefetch buffer
@@ -2062,8 +2062,8 @@ func Run(ctx context.Context, w *Worker, opts Options) error {
 				// in the PEL until a claim — like the window of the former barrier
 				// loop, the behavior is no worse. The manager's probes replace the generations
 				// themselves (a reconnect, T-065).
-				log.Warn("Chromium unavailable — the consumption stream is not read (the restart is the manager's job, T-065)",
-					"stream", o.Stream)
+				log.Warn("browser unavailable — the consumption stream is not read (the restart is the manager's job, T-065)",
+					"engine", o.Engine, "stream", o.Stream)
 				wait(DefaultErrorWait)
 				if ctx.Err() != nil {
 					return // graceful shutdown

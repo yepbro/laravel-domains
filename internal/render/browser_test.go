@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/chromedp/chromedp"
+
+	"crawler/internal/config"
 )
 
 // Start errors are classified as ClassBrowser — without a live Chromium:
@@ -23,7 +25,7 @@ func TestStartBrowserRemoteUnreachable(t *testing.T) {
 		RestartEveryPages: 1,
 	})
 	if err == nil {
-		t.Fatal("an unavailable-Chromium error was expected")
+		t.Fatal("an unavailable-browser error was expected")
 	}
 	var e *Error
 	if !errors.As(err, &e) {
@@ -31,6 +33,44 @@ func TestStartBrowserRemoteUnreachable(t *testing.T) {
 	}
 	if e.Class != ClassBrowser {
 		t.Errorf("the class %v, want browser", e.Class)
+	}
+}
+
+// TestStartBrowserRemoteDialPerEngine — the dial failure of the remote
+// allocator is engine-neutral for every engine (T-339): the ready
+// /devtools/browser/ address skips the /json/version refinement, so the
+// failure is the WebSocket dial itself — on a moli/lightpanda build the
+// error text must not attribute the outage to chromium (the finding
+// class of the T-338 rollout night; review P2-1).
+func TestStartBrowserRemoteDialPerEngine(t *testing.T) {
+	for _, engine := range []string{"", config.EngineChromium, config.EngineMoli, config.EngineLightpanda} {
+		name := engine
+		if name == "" {
+			name = "(unconfigured)"
+		}
+		t.Run(name, func(t *testing.T) {
+			_, err := StartBrowser(context.Background(), Options{
+				Engine:            engine,
+				RemoteURL:         "ws://127.0.0.1:1/devtools/browser/x",
+				DialTimeout:       500 * time.Millisecond,
+				Contexts:          1,
+				Timeout:           time.Second,
+				RestartEveryPages: 1,
+			})
+			if err == nil {
+				t.Fatal("a dial failure error was expected")
+			}
+			var e *Error
+			if !errors.As(err, &e) {
+				t.Fatalf("the error is not *render.Error: %v", err)
+			}
+			if e.Class != ClassBrowser {
+				t.Errorf("the class %v, want browser", e.Class)
+			}
+			if strings.Contains(strings.ToLower(err.Error()), "chromium") {
+				t.Errorf("the %q build's dial error must not mention chromium: %v", engine, err)
+			}
+		})
 	}
 }
 

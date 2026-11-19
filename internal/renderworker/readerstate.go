@@ -19,7 +19,7 @@
 //	C  reading         a chunk of deliveries is read by XREADGROUP (trimmed
 //	                   to the rate window's slots); delivery attempts
 //	                   are spent by the read (T1 of deliverystate.go)
-//	B  browser pause   Chromium is dead (Options.Alive): the stream is NOT
+//	B  browser pause   the engine is dead (Options.Alive): the stream is NOT
 //	                   read — deliveries stay in the stream (not in the
 //	                   PEL), attempts are not burned; the restart — the manager
 //	                   (T-065: it also waits out an engine container restart
@@ -113,7 +113,7 @@ type readerMode int8
 
 const (
 	modeConsume      readerMode = iota // C: a chunk of deliveries is read
-	modePauseBrowser                   // B: dead Chromium, the stream is not read
+	modePauseBrowser                   // B: the engine is dead, the stream is not read
 	modePauseInfra                     // I: an InfraError of publishing, the stream is not read
 	modePauseFail                      // F: the fuse, after the pause it reads
 	modePauseRate                      // R: the rate cap, the stream is not read

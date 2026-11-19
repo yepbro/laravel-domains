@@ -133,7 +133,7 @@ func (a *remoteAllocator) Allocate(ctx context.Context, opts ...chromedp.Browser
 	}
 	tr, err := remoteDial(ctx, wsURL, a.dialTimeout)
 	if err != nil {
-		return nil, fmt.Errorf("connecting to Chromium %s: %w", a.wsURL, err)
+		return nil, fmt.Errorf("connecting to the browser at %s: %w", a.wsURL, err)
 	}
 	// wctx — the session lifetime context, separate from ctx (as in
 	// remote.Allocator): cancelling the client context must not tear
@@ -252,12 +252,12 @@ func resolveRemoteWSURL(ctx context.Context, raw string, timeout time.Duration) 
 	defer cancel()
 	u, err := url.Parse(raw)
 	if err != nil {
-		return "", fmt.Errorf("the Chromium address %q: %w", raw, err)
+		return "", fmt.Errorf("the browser address %q: %w", raw, err)
 	}
 	if host := u.Hostname(); host != "localhost" && net.ParseIP(host) == nil {
 		addrs, err := remoteResolve(rctx, host)
 		if err != nil {
-			return "", fmt.Errorf("resolving the Chromium host %s: %w", host, err)
+			return "", fmt.Errorf("resolving the browser host %s: %w", host, err)
 		}
 		ip := preferIPv4(addrs)
 		if port := u.Port(); port != "" {

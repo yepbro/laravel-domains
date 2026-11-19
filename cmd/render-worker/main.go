@@ -27,7 +27,7 @@
 // render.fallback.worker_rate over the sliding window
 // renderworker.RateWindow (FR-13); the deployment — docs/deploy.md §2.3.
 // The browser restart — the manager T-065;
-// with Chromium unavailable the loop only pauses the consumption (the
+// with the browser unavailable the loop only pauses the consumption (the
 // Manager.Alive probe — the reconnect and the restart are done by the
 // probe itself).
 // The framework is internal/service: migrations, the DB pool (OnDBPool),

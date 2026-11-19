@@ -891,11 +891,11 @@ the `renderworker.Run` loop (`internal/renderworker`):
   content and refcount (the T-058 balance); the race with the recheck is
   closed with an optimistic UPDATE guard on `content_hash` — a changed
   row is not overwritten, the `Put` reference is removed;
-- unavailable Chromium (the `Manager.Alive` probe) — stopping new reads
+- unavailable engine (the `Manager.Alive` probe) — stopping new reads
   (undelivered deliveries stay in the stream, not in the PEL);
   deliveries read into the prefetch buffer are finished and returned via
   claim on failure; the probe restarts a dead generation itself
-  (reconnect after a Chromium restart, including a half-closed connection
+  (reconnect after an engine restart, including a half-closed connection
   — the live probe `Browser.probeConn`, T-218); a browser restart every
   N pages and by memory — T-065.
 
