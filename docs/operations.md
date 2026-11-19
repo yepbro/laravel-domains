@@ -1752,3 +1752,58 @@ why, and how to roll it back. Normal CD deploys are not recorded here
   deliberate). The v1.1.26 release identity re-verified online (the
   tag, the commit c806178, #3060 in the changelog; the asset digest is
   JS-loaded — the script's sha256sum -c stays the enforcement gate).
+
+### 2026-11-19 — T-338 (cont.): the first moli night on prod — panics, a 4-hour wedge, a crash-loop; the ROLLBACK to chromium (D-076)
+
+- The rollout (2026-11-18 23:26, D-075) went clean through every
+  runbook step; the first ~30 min moli rendered at ~34/min with the
+  fallback share exactly at the T-335 prediction (18–19%, B rescuing
+  ~70% of the tail), memory 28–60 MiB, zero queue impact. Then the
+  night decomposed in three stages:
+  1. **Panic crashes ×3/h** — `runtime_state.rs:1207 "missing Window
+     callback data for __moliWindowNavigator"`, each triggered by a
+     page embedding the same hash-named worker asset
+     `workers-5q4d0BQE.js` (seen from `178jt.cc` and
+     `d8z9ctydrwj4s.cloudfront.net` — a common builder chunk, MANY
+     crawled sites carry it); each crash survived by systemd +
+     engine_wait (T-283 — 0 burned attempts, the gate never latched on
+     crashes).
+  2. **The 4-hour wedge (01:35–05:57)**: the engine degraded 34/min →
+     8/min → 0/min while its RSS climbed 28→691→967→1023 MiB (99.98%
+     of the MemoryMax cap) — the protocol server alive (`/json/version`
+     answering), the browser core silent; the kernel SWAPPED the wedged
+     process instead of killing it (no memcg OOM — the self-clear never
+     came); worker A held the claim gate the whole time
+     ("unavailable — the stream is not read"), chromium @9109 alone
+     carried the flow (Δ~5.5k renders/h throughout). The memory squeeze
+     contributed to 3 PG OOM restarts (the retention catch-up select,
+     4 passes, rows_done=0 every time — a restart loop all night).
+  3. **The crash-loop (after the operator-ordered restart 05:57)**: the
+     poison delivery sat in the redelivery ladder — every fresh engine
+     process re-rendered the SAME task with the SAME asset and ABRT'd
+     every ~6 s (06:00:40/51/03:00:51/06:01:03), rendering a few pages
+     between deaths.
+- **The rollback (the operator's command, 06:05)**: the quiet window
+  (`systemctl stop crawler-scheduler`), `crawler.env` restored from the
+  `crawler.env.pre-moli-T338` backup (A → chromium :9222, the fallback
+  block gone), `restart crawler-render-worker` (engine=chromium
+  verified by the metric label), `systemctl stop crawler-moli` +
+  `reset-failed` (Result=success, the unit stays ENABLED for the
+  return — the enabled+inactive state does not gate deploy
+  healthchecks, only failed/activating do). B and @9109 untouched
+  (chromium all along). The swap thrash ended with the restart (so
+  9.7 MB/s → noise).
+- The verdict for D-075's "full program": moli 1.1.26 is NOT viable as
+  a prod primary until the upstream fix — one common web worker asset
+  deterministically kills the single-process engine (an instant ABRT or
+  a slow leak-to-wedge — both observed); the compensation machinery
+  (fallback+gate+engine_wait) kept the pipeline whole all night (0 task
+  losses attributable, q:render at the watermark on chromium alone).
+- The upstream case is now ironclad: the deterministic asset
+  (`workers-5q4d0BQE.js` — publicly reachable), the exact panic line,
+  the crash-loop reproduction (a redelivered task kills the engine
+  every ~6 s), the RSS-to-cap wedge curve (the artifacts in
+  prod-reports/2026-11-19-023440.md and the hourly slices). Not posted
+  — the operator's call.
+- The standing watch continues hourly (the quiet window open; the front
+  is the operator's manual control — they toggled it 3 times overnight).
